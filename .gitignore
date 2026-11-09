@@ -1,0 +1,14 @@
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+*.tgz
+
+# Keeper config and secrets: never commit them
+.env
+.env.*
+!.env.example
+bazaar-keeper.yaml
+/state/
+/keys/

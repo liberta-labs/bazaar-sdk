@@ -1,0 +1,80 @@
+# Example keeper configuration. `bazaar keeper init` writes one of these for you.
+# Copy to bazaar-keeper.yaml; secrets go in .env next to it, referenced as ${NAME}.
+
+# ---- Where ----
+network: arbitrum-sepolia           # arbitrum-one | arbitrum-sepolia | anvil | custom
+factory: "0x0000000000000000000000000000000000000000"   # needed until the network's preset has one
+# chainId: 42161                    # custom networks only
+# startBlock: 0                     # the factory's deployment block, for indexing from logs
+
+rpc:
+  http: ${RPC_HTTP_URL}             # a provider's URL usually holds its key, so it lives in .env
+  # send: sequencer                 # Arbitrum One: submit straight to the sequencer; or any URL
+
+subgraph:
+  url: none                         # default | none | a GraphQL URL
+
+prices:
+  endpoint: pyth                    # pyth | bazaar (not available yet) | any Hermes-compatible URL
+  apiKey: ${PYTH_API_KEY}
+
+# ---- Who ----
+wallets:
+  default:
+    type: keystore                  # keystore | privateKey | mnemonic | remote
+    path: ~/.bazaar/keys/default.json
+    password: ${KEEPER_KEYSTORE_PASSWORD}   # leave out to be asked at start
+  # fast:                           # a second wallet keeps latency-critical sends off the first's queue
+  #   type: privateKey
+  #   key: ${KEEPER_FAST_KEY}
+
+# ---- What ----
+jobs:
+  liquidation:
+    markets: all                    # all, or a list: ["0xPair…", BTC/USD]; an address names one market, a label every market carrying it
+    # Liquidations keep the market solvent. To liquidate even when gas costs more than the reward:
+    # allowLoss: true
+    # maxLossUsdPerCall: 0.10
+    # lossBudgetUsdPerDay: 2
+  triggers:
+    markets: all
+    minBountyUsd: 0.01
+  unload:
+    markets: all
+  adl:
+    markets: all
+  refresh:
+    markets: all
+    # healthPokes: true             # also pay for refreshes that open or end an ADL window
+  terminalSettlement:
+    markets: all
+    finalize: true                  # unpaid, but it releases everyone's payout
+  collect:
+    thresholdUsd: 5
+    # forwardTo: "0xYourColdWallet"
+  # sweepExpired:                   # unpaid public service: every call is a loss within its budget
+  #   markets: all
+  #   lossBudgetUsdPerDay: 0.25
+
+# ---- How much ----
+profit:
+  minProfitUsd: 0.001
+  gasSafetyMultiplier: 1.25
+budget:
+  maxSpendUsdPerDay: 10
+  # maxSpendEthPerDay: 0.01         # the same cap in ETH, checked on wei so no price feed can lift it
+  #                                 # (default: maxSpendUsdPerDay at gas.ethUsdFloor)
+  maxLossUsdPerDay: 2
+  minEthBalance: 0.002
+# gas:
+#   maxFeeGwei: 1                   # hard ceiling on the fee per gas (maxFeePerGas is capped at it)
+#   ethUsdFallback: 3000            # prices gas when no fresh, plausible ETH/USD print is available
+#   ethUsdFloor: 1000               # gas is never priced below this, so a bad feed cannot make calls look free
+#   ethUsdMaxAgeSeconds: 60         # an older ETH/USD print is not used; ethUsdFallback is
+
+# state:
+#   dir: ~/.bazaar                  # the snapshot, the earnings ledger and the status file (`init` puts them next to this file)
+
+# alerts:
+#   telegram: { botToken: ${TG_BOT_TOKEN}, chatId: "123456" }
+#   notify: [lowBalance, jobPaused, endpointDown, opportunity, dailySummary]

@@ -1,0 +1,15 @@
+{
+  // The SDK must run in browsers: typecheck its sources with DOM types and no Node types, so a stray
+  // `node:` import or Buffer fails here. `npx tsc -p tsconfig.check-sdk.json`
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "incremental": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["packages/sdk/src/**/*.ts"]
+}

@@ -1,0 +1,29 @@
+{
+  "name": "bazaar-sdk-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/sdk",
+    "packages/keeper"
+  ],
+  "scripts": {
+    "build": "tsc -b packages/sdk packages/keeper",
+    "typecheck": "tsc -b packages/sdk packages/keeper",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "typecheck:check": "tsc -p tsconfig.check.json && tsc -p tsconfig.check-sdk.json",
+    "sync-abis": "node scripts/sync-abis.mjs",
+    "build-probe": "node scripts/build-probe.mjs",
+    "gen-bindings": "node scripts/gen-bindings.mjs",
+    "clean": "tsc -b --clean packages/sdk packages/keeper"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@liberta-labs/bazaar-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Bazaar protocol: markets, accounts, prices, trading, gasless signing, insurance, termination, governance and listings, for browsers and Node",
+  "license": "MIT",
+  "author": "Liberta Labs Research, Inc.",
+  "type": "module",
+  "sideEffects": [
+    "./dist/errors/messages.js"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "tsc -b"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "viem": "^2.57.17"
+  }
+}

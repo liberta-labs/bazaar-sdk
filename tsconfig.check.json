@@ -1,0 +1,19 @@
+{
+  // Typecheck everything (both packages' sources and tests) without emitting anything, resolving the
+  // SDK from its sources. Safe to run while other builds are going: `npx tsc -p tsconfig.check.json`.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "incremental": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@liberta-labs/bazaar-sdk": ["packages/sdk/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "vitest.config.ts", "vitest.e2e.config.ts"]
+}
