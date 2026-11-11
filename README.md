@@ -10,6 +10,9 @@ TypeScript tools for the [Bazaar](https://github.com/liberta-labs/bazaar) protoc
 The keeper is built on the SDK: the chain, ABI, price, formula and market layers are the same code a
 frontend uses.
 
+**Documentation:** [sdk-docs.bazaar.finance](https://sdk-docs.bazaar.finance): guides, examples and
+the full API reference for both packages.
+
 ## The keeper
 
 | Job | What it does | Who pays you |

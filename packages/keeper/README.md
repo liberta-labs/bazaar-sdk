@@ -4,6 +4,9 @@ The Bazaar **keeper**: the protocol's permissionless upkeep, for its bounties. I
 you choose, works out which calls pay, simulates each one against the chain, and sends it from your own
 wallet. Built on [`@liberta-labs/bazaar-sdk`](../sdk).
 
+**Documentation:** [sdk-docs.bazaar.finance/keeper](https://sdk-docs.bazaar.finance/keeper/overview.html):
+setup, configuration, budgets, jobs and running in production.
+
 | Job | What it does | Who pays you |
 |---|---|---|
 | `liquidation` | seizes positions below their maintenance margin | insurance fund: $0.05 per account, or 2 bp of what a netting retires |

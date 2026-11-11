@@ -9,6 +9,9 @@ It runs in browsers and in Node, depends only on [viem](https://viem.sh), and ne
 npm install @liberta-labs/bazaar-sdk
 ```
 
+**Documentation:** [sdk-docs.bazaar.finance](https://sdk-docs.bazaar.finance): guides, examples and
+the full API reference.
+
 ## Connect
 
 ```ts
