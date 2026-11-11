@@ -15,3 +15,11 @@ bazaar-keeper.yaml
 
 # The built docs site
 docs/book/
+
+# Claude Code
+.claude/skills/
+skills-lock.json
+CLAUDE.md
+.claude/settings.local.json
+.claude/worktrees/
+.claude/launch.json
