@@ -92,10 +92,17 @@ export interface ActionInit {
   /**
    * The second the price the call relies on was generated in (the update it carries) or stored in
    * (the pair's own price, when it carries none), for a call that reverts once that price is more
-   * than 3 s from the block's time; null or left out for a call that does not. Checked again just
-   * before the call is signed.
+   * than 3 s from the block's time; with `priceIssued`, the second the earliest update it carries was
+   * issued in, for a call that reverts once that update is. Null or left out for a call that relies
+   * on no price. Checked again just before the call is signed.
    */
   priceTime?: number | null;
+  /**
+   * `priceTime` is an update's issue time: the call carries Pyth's latest price, which the oracle
+   * accepts for a liquidation on a market with trading hours while every update carrying it was
+   * issued within 3 s of the block.
+   */
+  priceIssued?: boolean;
 }
 
 export class Action {
@@ -116,6 +123,7 @@ export class Action {
   minGas: bigint;
   probe: boolean;
   priceTime: number | null;
+  priceIssued: boolean;
 
   constructor(a: ActionInit) {
     this.job = a.job;
@@ -135,6 +143,7 @@ export class Action {
     this.minGas = a.minGas ?? 0n;
     this.probe = a.probe ?? true;
     this.priceTime = a.priceTime ?? null;
+    this.priceIssued = a.priceIssued ?? false;
   }
 }
 
@@ -589,7 +598,8 @@ export class Executor {
       if (wait) await wait;
       try {
         // The last moment before the call is signed: planning, the simulation and the wallet's queue
-        // all took time, and a price outside the pair's window on inclusion reverts the call.
+        // all took time, and a price (or a latest update's issue time) outside the pair's window on
+        // inclusion reverts the call.
         const aged = this.priceAge(a);
         if (aged !== null) {
           res.status = "skipped";
@@ -725,17 +735,18 @@ export class Executor {
   }
 
   /**
-   * Why `a` must not be signed now, or null: the price it relies on is older, at the chain's time
-   * now, than the pair's 3 s window less `prices.sendMarginSeconds`, the margin left for the call to
-   * be included.
+   * Why `a` must not be signed now, or null: its `priceTime` (the price it relies on, or the issue
+   * time of the latest update it carries) is older, at the chain's time now, than the pair's 3 s
+   * window less `prices.sendMarginSeconds`, the margin left for the call to be included.
    */
   private priceAge(a: Action): string | null {
     if (a.priceTime === null) return null;
     const limit = MAX_PRICE_STALENESS - this.cfg.prices.sendMarginSeconds;
     const age = this.clock() - a.priceTime;
     if (age <= limit) return null;
+    const what = a.priceIssued ? `the price update it carries was issued in second ${a.priceTime}` : `the price it relies on is from second ${a.priceTime}`;
     return (
-      `not sent: the price it relies on is from second ${a.priceTime}, ${age.toFixed(1)} s before the chain's time now, past the ` +
+      `not sent: ${what}, ${age.toFixed(1)} s before the chain's time now, past the ` +
       `${fmtG(limit)} s a call may carry (the pair's 3 s window less prices.sendMarginSeconds); planned again with a newer price`
     );
   }

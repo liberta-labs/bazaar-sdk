@@ -59,9 +59,10 @@ regenerated.
 | [`requirePair`](security.md) | function | `pair`, checksummed, once the context's factory confirms it is one of its pairs (`factory.isPair`); an `InputError` on `pair` otherwise. |
 | [`NetworkPreset`](../sdk/connecting.md) | interface | A built-in network: name, chain id, factory (null until launch), start block, subgraph URL, whether official, and the sequencer URL. |
 | [`NETWORKS`](../sdk/connecting.md) | const | The built-in networks: `arbitrum-one`, `arbitrum-sepolia` and `anvil`. |
-| [`PRICE_ENDPOINTS`](../sdk/connecting.md) | const | `prices.endpoint` shortcuts, each a set of Pyth Pro endpoints (or null until the service exists). |
+| [`PRICE_ENDPOINTS`](../sdk/connecting.md) | const | `prices.endpoint` shortcuts, each a set of Pyth Pro endpoints: `pyth`, Pyth's own, which need a Pyth Pro API key. |
 | [`ProEndpoints`](../sdk/connecting.md) | interface | Where Pyth Pro is served: its stream endpoints, its request API, and its symbols registry. |
-| [`PYTH_PRO`](../sdk/connecting.md) | const | Pyth's own Pyth Pro endpoints. |
+| [`PYTH_PRO`](../sdk/connecting.md) | const | Pyth's own Pyth Pro endpoints: their request API and stream serve only the holder of a Pyth Pro API key. |
+| [`isPythProPriceEndpoint`](../sdk/connecting.md) | function | Whether a URL is one of Pyth's own price endpoints (the host of `PYTH_PRO`'s request API or of one of its stream endpoints), which a `ProClient` serves only with a token. |
 | [`PYTH_PRO_TOKEN_URL`](../sdk/connecting.md) | const | Where a Pyth Pro API key is exchanged for a short-lived token. |
 | [`connect`](../sdk/connecting.md) | function | Read the deployment's wiring from its factory and return a context bound to it. |
 | [`requirePrices`](../sdk/connecting.md) | function | The context's price source; throws `ConnectError` when the context was connected without one. |
@@ -93,6 +94,13 @@ regenerated.
 | [`updateFee`](../sdk/sending.md) | function | The ETH fee the oracle charges to verify a price update (`getUpdateFee`); 0 for an empty update. |
 | [`PairFeeds`](../sdk/sending.md) | interface | A pair's price id and its raw Pyth legs (one, or base then quote for a composite) and whether the quote is inverted. |
 | [`FreshUpdate`](../sdk/sending.md) | interface | What `priceUpdateFor` returns: the update bytes, the Pyth fee to send as value, and the oldest publish time among the legs. |
+| [`liquidationUpdateFor`](../sdk/sending.md) | function | The update a liquidation attaches and its fee: a fresh price, or on a market with trading hours Pyth's latest one; never an empty update. |
+| [`updateProblem`](../sdk/sending.md) | function | Why BazaarOracle would refuse an update for these legs whenever the call carrying it lands, or null when it would accept it in a block close enough to when its prices were generated. |
+| [`pairContinuous`](../sdk/sending.md) | function | Whether the pair is continuously traded (`isContinuouslyTraded`), cached per context. |
+| [`LiquidationPriceUpdate`](../sdk/sending.md) | interface | What `liquidationUpdateFor` returns: the update, the fee, `kind` (`"fresh"` or `"latest"`), the price's generation second and the second the call must land within 3 s of (`priceTime`). |
+| [`NoLiquidationPriceError`](../sdk/errors.md) | class | A `ProError`: no update can decide a liquidation on a market with trading hours now (no fresh price, and Pyth's latest is too old or would be refused). `pair` and `reason` say which and why. |
+| [`NoFreshPriceError`](../sdk/errors.md) | class | No update the oracle would accept is available for a continuously traded market, which has no stored-price fallback: a call that needs a price would revert now. |
+| [`NoLivePriceError`](../sdk/errors.md) | class | A `ProError`: the endpoint answered, but its update holds no price a live call could use for a feed asked for. |
 | [`toUsdcUnits`](units.md) | function | BAZAAR precision -&gt; USDC units, floored as the pair floors it. |
 | [`fromUsdcUnits`](units.md) | function | USDC units -&gt; BAZAAR precision. |
 | [`toUsdcUnitsCeil`](units.md) | function | BAZAAR precision rounded up to the next whole USDC unit (for allowances and permits that must cover it). |
@@ -328,6 +336,7 @@ Every trading write, and the price and hint helpers they use.
 | [`trade.PreparedOrder`](../sdk/orders.md) | interface | An order checked against the chain: the spec to send or sign, and what it was checked against. |
 | [`trade.CreateOrderOptions`](../sdk/orders.md) | interface | Options of `createOrder`: `hints` to use instead of the ones the SDK finds, the walk budget `maxSteps`, and `permitData`. |
 | [`trade.PreparedAmends`](../sdk/managing-orders.md) | interface | Amendments checked against the orders, the book and the price, with insertion hints filled in. |
+| [`trade.priceFields`](../sdk/sending.md) | function | A call's price fields: when its update's price was generated, or why it carries none for want of a fresh one. |
 
 ### `insurance`
 
@@ -746,11 +755,14 @@ Ending a market, fixing its settlement price, finalizing it and withdrawing afte
 | [`termination.SettlementPrint`](../sdk/termination.md) | interface | One of Pyth's one-second updates, read for one feed, as settlement evidence. |
 | [`termination.TickFetcher`](../sdk/termination.md) | type | Pyth's one-second update stamped on a second, carrying the feeds asked for, or null when the archive has none. |
 | [`termination.SettlementPrintError`](../sdk/termination.md) | class | A settlement update that could not be fetched, or a sample that cannot be proven. |
+| [`termination.SettlementPrintFailure`](../sdk/termination.md) | type | Why a settlement update could not be had: `absent` (the archive answered, and no proven settlement exists now) or `unreachable` (the archive could not be asked, or its answer could not be used, so one may well exist). |
 | [`termination.TickProof`](../sdk/termination.md) | interface | What UMA's rule settles a market with: the cutoff's update for every leg. |
 | [`termination.ChainProof`](../sdk/termination.md) | interface | What the chain rule settles a market with: the updates in calldata order, the targets and the samples' seconds. |
 | [`termination.ChainSearchBounds`](../sdk/termination.md) | interface | How far a chain sample may be searched for: the latest second allowed, and the present. |
 | [`termination.SettleUnder`](../sdk/termination.md) | type | Which rule a terminateScheduledPair call settles under: UMA's cutoff update (`tick`), the chain's median, or the stored-price last resort. |
 | [`termination.SettlementAttempt`](../sdk/termination.md) | interface | One candidate the builder tried. |
+| [`termination.SettlementFailure`](../sdk/termination.md) | type | Why a candidate failed: no usable update exists (`absent`), the archive could not be asked or relied on (`unreachable`), or the oracle or the contract refused the set (`refused`). |
+| [`termination.StoredPricePolicy`](../sdk/termination.md) | type | When `terminateScheduledPair` offers the irreversible stored-price call once its last resort is open: `whenAbsent` (every proven set failed as absent and the archive answered a control request), `always`, or `never`. |
 | [`termination.ScheduledSettlementPlan`](../sdk/termination.md) | interface | What terminateScheduledPair needs now. |
 | [`termination.TERMINATOR_EVENT_TEXT`](../sdk/termination.md) | const | What each terminator event means, for an activity feed. |
 
@@ -895,6 +907,7 @@ The error messages and the display formatters (`errors/messages.ts`).
 | [`format.formatEth`](../sdk/errors.md) | function | Wei as ETH: "0.0001 ETH". |
 | [`format.formatDuration`](../sdk/errors.md) | function | A duration in seconds, roughly: "45 s", "12 min", "3 h", "13 days". |
 | [`format.formatTime`](../sdk/errors.md) | function | A Unix time (seconds) as "2026-11-08 14:00 UTC (in 3 h)". |
+| [`format.formatUtc`](../sdk/errors.md) | function | A Unix time (seconds) as "2026-11-08 14:00:05 UTC", with no hint relative to this machine's clock: for a time judged against the chain's clock. |
 | [`format.installUserMessages`](../sdk/errors.md) | function | Register `USER_MESSAGES` so `DecodedError.message` returns them. |
 | [`format.userMessage`](../sdk/errors.md) | function | The user-facing message for a custom error by name, with its arguments; the name itself when unknown. |
 | [`format.walletErrorMessage`](../sdk/errors.md) | function | A message for a failure the wallet raised rather than the contract. |
@@ -930,7 +943,7 @@ The chain, ABI, price, formula and market layers the keeper and the areas are bu
 | [`ADL_AUCTION_DURATION`](units.md) | const | Seconds the ADL score threshold takes to decay: 600. |
 | [`ADL_MAX_SCORE`](units.md) | const | The ADL score threshold at the start of the auction: 25 (BAZAAR precision). |
 | [`ADL_TERMINATION_GRACE`](units.md) | const | Seconds after the first price stored past an ADL timeout before the market winds down: 1,800. |
-| [`MAX_LIQUIDATION_PRICE_AGE`](units.md) | const | Oldest stored price (seconds) `liquidate` judges solvency against without a fresh `priceUpdate`: 600. |
+| [`MAX_LIQUIDATION_PRICE_AGE`](units.md) | const | Seconds before the block a liquidation's price may have been generated (Pyth's latest price, on a market with trading hours): 60. A call without an update needs a stored price at most 3 s old. |
 | [`ADL_TIMEOUT_DURATION`](units.md) | const | Seconds after which an open ADL window times out: 1 day. |
 | [`MAX_ADL_WINNERS_PER_BATCH`](units.md) | const | Most entries each winner list of an ADL batch may hold: 25. |
 | [`REFRESH_BOUNTY`](units.md) | const | What a paid `refreshPrice` earns: $0.10. |
@@ -1093,6 +1106,8 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 |---|---|---|
 | [`lazer.parseUpdate`](../sdk/low-level.md) | function | Reads a Pyth Pro update and recovers its signer: `{ signer, timestampUs, channel, feeds, payload }`. |
 | [`lazer.readUpdate`](../sdk/low-level.md) | function | Reads an update without recovering its signer. |
+| [`lazer.canonicalUpdate`](../sdk/low-level.md) | function | An update exactly as the verifier reads it: the envelope's header and the payload its size field names, as lowercase hex, without any bytes after them. |
+| [`lazer.legEntries`](../sdk/low-level.md) | function | Each leg as BazaarOracle reads it out of a call's updates: the leg's entry in the update holding its most recently generated price (the earlier update on a tie); null for a leg no update carries. |
 | [`lazer.parsePayload`](../sdk/low-level.md) | function | Reads a signed payload as LazerPayloadLib.readFeeds does; throws where the contract reverts as malformed. |
 | [`lazer.splitUpdate`](../sdk/low-level.md) | function | Splits an update into its signature and its payload, as Pyth's verifier does. |
 | [`lazer.recoverSigner`](../sdk/low-level.md) | function | The address that signed an update. |
@@ -1108,6 +1123,8 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`lazer.ENVELOPE_HEADER_BYTES`](../sdk/low-level.md) | const | Envelope bytes before the payload: 71. |
 | [`lazer.MAX_PAYLOAD_BYTES`](../sdk/low-level.md) | const | The longest payload an envelope can frame. |
 | [`lazer.MICROS_PER_SECOND`](../sdk/low-level.md) | const | 1,000,000n. |
+| [`lazer.MAX_UPDATE_BYTES`](../sdk/low-level.md) | const | The largest update there can be: the envelope's header and the longest payload it can frame. |
+| [`lazer.MAX_FEEDS_PER_UPDATE`](../sdk/low-level.md) | const | The most feeds one payload carries: its feed count is one byte. |
 | [`lazer.HAS_PRICE`](../sdk/low-level.md) | const | Bit of `LazerFeed.included`: the payload carries the price. |
 | [`lazer.HAS_EXPONENT`](../sdk/low-level.md) | const | Bit of `LazerFeed.included`: the payload carries the exponent. |
 | [`lazer.HAS_CONFIDENCE`](../sdk/low-level.md) | const | Bit of `LazerFeed.included`: the payload carries the confidence. |
@@ -1116,6 +1133,7 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`lazer.TICK_PROPERTIES`](../sdk/low-level.md) | const | What a one-second update must carry for a feed to settle a pair at it. |
 | [`lazer.CHAIN_PROPERTIES`](../sdk/low-level.md) | const | What a one-second update must carry to prove a chain sample. |
 | [`lazer.Envelope`](../sdk/low-level.md) | interface | An update's envelope, split: `r`, `s`, the recovery id and the payload. |
+| [`lazer.LegEntry`](../sdk/low-level.md) | interface | One leg as BazaarOracle reads it out of a call's updates. |
 | [`CHANNEL_IDS`](../sdk/low-level.md) | const | Each channel's number in a payload. |
 | [`CHANNEL_FIXED_RATE_1000`](../sdk/low-level.md) | const | The number of the channel whose updates are stamped once per second, on whole seconds. |
 | [`Channel`](../sdk/low-level.md) | type | The channels Pyth Pro produces updates on: `real_time`, `fixed_rate@50ms`, `fixed_rate@200ms`, `fixed_rate@1000ms`. |
@@ -1147,6 +1165,8 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`PRO_PROPERTIES`](../sdk/low-level.md) | const | The properties every request asks for. |
 | [`MAX_RESPONSE_BYTES`](../sdk/low-level.md) | const | The largest response body a request may return, in bytes (16 MiB). |
 | [`MAX_STREAM_MESSAGE`](../sdk/low-level.md) | const | The longest message a price stream may send, in characters (1 MiB). |
+| [`MAX_STRAY_MESSAGES`](../sdk/low-level.md) | const | How many messages in a row that are not price updates drop the stream endpoint sending them; it is reconnected with a growing delay. |
+| [`MAX_UPDATE_AHEAD`](../sdk/low-level.md) | const | Seconds an update's own timestamp may lie ahead of the client's clock before the endpoint that sent it is dropped (60). |
 | [`MAX_STREAM_NOTICES`](../sdk/low-level.md) | const | How many distinct notices one stream passes to its `onNotice` before it drops the rest. |
 | [`STREAM_IDLE_TIMEOUT`](../sdk/low-level.md) | const | Seconds a price stream may bring no new update before it is abandoned and reconnected. |
 | [`StreamOptions`](../sdk/low-level.md) | interface | Options of `ProClient.stream`: `idleTimeout` and `onNotice`. |
@@ -1156,8 +1176,12 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`ETH_USD_BOUNDS`](../sdk/low-level.md) | const | Default `PriceServiceOptions.ethUsdBounds`. |
 | [`ETH_USD_MAX_AGE`](../sdk/low-level.md) | const | Default `PriceServiceOptions.ethUsdMaxAge`. |
 | [`MAX_FUTURE_SKEW`](../sdk/low-level.md) | const | Default `PriceServiceOptions.maxFutureSkew`. |
+| [`MAX_LATEST_PRICE_LAG`](../sdk/low-level.md) | const | The most seconds before its update was issued that a liquidation's price may have been generated: 57 (`MAX_LIQUIDATION_PRICE_AGE` less the 3 s window). |
+| [`LatestPrice`](../sdk/low-level.md) | interface | Pyth's latest price for a market's legs as the oracle's latest-price path reads it: the updates, when the earliest was issued, each leg's generation second, and the composed price. |
+| [`LiquidationUpdate`](../sdk/low-level.md) | interface | What `PriceService.liquidationUpdate` returns: `kind` (`"fresh"`, `"latest"` or null), the update, the price, each leg's generation second, `priceTime` and, when nothing can be attached, `reason`. |
+| [`readLatestPrice`](../sdk/low-level.md) | function | Pyth's latest price for a market's legs as `BazaarOracle.verifyAndFetchLatestPrice` reads it out of a call's updates, or why the oracle would refuse it in any block. |
 | [`PriceLogger`](../sdk/low-level.md) | interface | Where a `PriceService` reports warnings. |
-| [`PriceService`](../sdk/low-level.md) | class | Live prints for every watched feed (streamed, or polled as a fallback), and per-market prices and updates. |
+| [`PriceService`](../sdk/low-level.md) | class | Live prints for every watched feed (streamed, or polled as a fallback), and per-market prices and updates, including what a liquidation can attach (`liquidationUpdate`, `latestFor`). |
 | [`PriceServiceOptions`](../sdk/low-level.md) | interface | Options of `PriceService`: streaming, idle timeout, poll interval, clock, send margin, future skew, ETH/USD age and bounds, and logger. |
 | [`PriceSource`](../sdk/low-level.md) | interface | Where a PriceService gets its prints: a `ProClient`, or anything shaped like one (`latest`, and `stream` over sets of feeds). |
 | [`PrintListener`](../sdk/low-level.md) | type | Called after each batch of prints with the feeds that got a newer print in it. |
@@ -1174,6 +1198,8 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`isUrl`](../sdk/low-level.md) | function | Whether `value` is an http(s) or ws(s) URL, as fetch would read it. |
 | [`urlCredential`](../sdk/low-level.md) | function | Where a URL may carry a credential, as a phrase (`a key in its path`, ...), or null when it carries none. |
 | [`redactUrl`](../sdk/low-level.md) | function | The URL with every part not known to be public replaced by `mask`, safe to print or log (see the module's rules). |
+| [`redactUrls`](../sdk/low-level.md) | function | Text with every http(s) or ws(s) URL inside it passed through `redactUrl`. |
+| [`urlSecrets`](../sdk/low-level.md) | function | The parts of a URL that `redactUrl` masks (a user name and password, a host label, a path segment, a query value or item, the fragment), each once. |
 | [`PATH_WORDS`](../sdk/low-level.md) | const | Path segments that are never secret (compared without case). |
 | [`PUBLIC_PARAMS`](../sdk/low-level.md) | const | Query parameters whose (plain) values are never secret (compared without case). |
 
@@ -1216,6 +1242,16 @@ See [The Keeper as a Library](../keeper/library.md) for how the pieces fit.
 | [`parseConfig`](../keeper/library.md) | function | Validate an already-interpolated config object. |
 | [`enabledJobs`](../keeper/configuration.md) | function | The jobs switched on, by name. |
 | [`priceEndpoints`](../keeper/configuration.md) | function | Where the keeper reads prices: the stream URLs, the request API and the symbols registry `prices.endpoint` names, each replaced by `prices.streamUrls`, `prices.restUrl` or `prices.symbolsUrl` when set. |
+| [`StreamSocket`](../keeper/configuration.md) | class | `ws`'s WebSocket opened with `STREAM_SOCKET_OPTIONS`, which override any options passed. |
+| [`streamSocket`](../keeper/configuration.md) | const | `StreamSocket` as the price client's `WebSocket` option takes it. |
+| [`STREAM_SOCKET_OPTIONS`](../keeper/configuration.md) | const | What every stream connection is opened with: the frame bound, no compression, no redirects, and the handshake timeout. |
+| [`MAX_STREAM_FRAME_BYTES`](../keeper/configuration.md) | const | The largest frame a stream connection accepts, in bytes: no message the price client would take is refused. |
+| [`STREAM_HANDSHAKE_TIMEOUT_MS`](../keeper/configuration.md) | const | Milliseconds a stream connection may take to open before it counts as failed. |
+| [`missingProKey`](../keeper/configuration.md) | function | `PRO_KEY_REQUIRED` when a `prices` section reads from Pyth's own request API or stream endpoints without a token, else null: what config validation refuses under `prices.token`. |
+| [`PRO_KEY_REQUIRED`](../keeper/configuration.md) | const | What a config that reads prices from Pyth's own endpoints without a Pyth Pro API key is told. |
+| [`PRICES_API_KEY_MESSAGE`](../keeper/troubleshooting.md) | const | What a config that still holds `prices.apiKey` is told: the setting, the key it takes and the endpoints it may go to. |
+| [`hermesEndpointProblem`](../keeper/troubleshooting.md) | function | Why a price endpoint setting's URL must not be used (it names Hermes, a Pyth Core service the Pyth Pro token must not go to), or null. |
+| [`UNCHECKED_SIGNERS_WARNING`](../keeper/configuration.md) | const | What the keeper logs at start, and doctor shows, while `prices.checkSigners` is off. |
 | [`resolvedNetwork`](../keeper/configuration.md) | function | The network a config names, with its preset applied: chain id, factory, start block, subgraph and whether official. |
 | [`subgraphUrl`](../keeper/configuration.md) | function | The subgraph URL a config resolves to, or null for `none`. |
 | [`RpcConfig`](../keeper/configuration.md) | const + type | The `rpc` section's zod schema and type. |
@@ -1318,6 +1354,7 @@ The job classes are also on the `jobs` namespace (`import { jobs } from "@libert
 | [`jobs.CollectJob`](../keeper/jobs.md) | class | The `collect` job. |
 | [`jobs.LiquidationJob`](../keeper/jobs.md) | class | The `liquidation` job. |
 | [`jobs.belowMaintenance`](../keeper/jobs.md) | function | Whether `p` is below its maintenance requirement at `price` and `fundingIndex`. |
+| [`jobs.NoLiquidationPrice`](../keeper/jobs.md) | interface | Why no price can decide a liquidation on a market now: what `LiquidationJob.liquidationPrice` returns in place of a `PricedCall`. |
 | [`jobs.RefreshJob`](../keeper/jobs.md) | class | The `refresh` job. |
 | [`jobs.SweepExpiredJob`](../keeper/jobs.md) | class | The `sweepExpired` job. |
 | [`jobs.TerminalSettlementJob`](../keeper/jobs.md) | class | The `terminalSettlement` job. |
@@ -1334,6 +1371,8 @@ The job classes are also on the `jobs` namespace (`import { jobs } from "@libert
 | [`FactoryOperations`](../keeper/manual-operations.md) | class | The factory's permissionless operations: listings and identifier upgrades. |
 | [`LiquidateOptions`](../keeper/manual-operations.md) | interface | Options of `keeper.run.liquidate`: the accounts to liquidate. |
 | [`ManualOptions`](../keeper/manual-operations.md) | interface | How a manual operation goes. |
+| [`ScheduledTermination`](../keeper/manual-operations.md#terminate-scheduled) | interface | A scheduled termination as planned: the call, and what it fixes. |
+| [`ScheduledTerminationOptions`](../keeper/manual-operations.md#terminate-scheduled) | interface | How a scheduled termination is planned and sent. |
 | [`OpOptions`](../keeper/manual-operations.md) | interface | How a one-shot run of an automatic job goes. |
 | [`Operations`](../keeper/manual-operations.md) | class | `keeper.run`: every job once, on one market, and the manual operations. |
 | [`SettleOptions`](../keeper/manual-operations.md) | interface | Options of `keeper.run.settleTerminal`: the accounts to settle. |

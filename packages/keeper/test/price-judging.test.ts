@@ -3,20 +3,26 @@
  *
  * A pair judges a call at the update it carries only when that price was generated in a later second
  * than the price the pair holds; otherwise at the price it holds. The planners judge the same way,
- * and a call judged at the price the pair holds carries no update. A candidate the chain refuses
- * waits out engine.simCooldownSeconds and nothing else; one whose price aged before the send was not
- * refused. A print without a confidence is never attached. Fake clock throughout.
+ * and a call judged at a fresh price the pair holds carries no update. A liquidation on a market with
+ * trading hours and no fresh print carries Pyth's latest update instead, which the pair judges it at
+ * unless the price it holds is strictly newer, and which must land within 3 s of when it was issued
+ * (there a fresh print's update must too); one without an update is never judged at a stored price
+ * older than that window. A candidate the chain refuses waits out engine.simCooldownSeconds and
+ * nothing else; one whose price aged before the send was not refused. A print without a confidence is
+ * never attached. Fake clock throughout.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bazaarPairAbi } from "@liberta-labs/bazaar-sdk";
-import { decodeFunctionData, encodeAbiParameters } from "viem";
+import { type Chain, type ProbeResult, type Receipt, bazaarPairAbi } from "@liberta-labs/bazaar-sdk";
+import { type Hex, decodeFunctionData, encodeAbiParameters, keccak256 } from "viem";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { type Action, ActionResult } from "../src/exec/executor.js";
+import { type Action, ActionResult, Executor, Lane } from "../src/exec/executor.js";
+import { Ledger } from "../src/exec/ledger.js";
+import { LocalSigner } from "../src/exec/wallets.js";
 import { setupLogging } from "../src/observe/index.js";
-import { FEE, FEED, FEED2, S, acct, fake, marketAt, marketState, order, position, print } from "./keeper-harness.js";
+import { DEP, FEE, FEED, FEED2, KEY, ME, S, acct, fake, marketAt, marketState, order, position, print, update } from "./keeper-harness.js";
 
 const T0 = 1_800_000_000; // a whole second
 const ALICE = acct(1);
@@ -281,14 +287,21 @@ describe("a print without a confidence", () => {
     expect(args(a!)).toEqual([[ALICE], ["0xaa"]]);
   });
 
-  it("leaves a closed session market on its stored price, with no update attached", async () => {
+  it("leaves a liquidation on a market with trading hours to a stored price still inside the window, with no update attached", async () => {
     const f = fake(dir, { jobs: { liquidation: {} } }, { continuous: false });
+    const liq = f.k.jobs.get("liquidation")!;
     f.k.store.positionsOf(f.m.address).set(ALICE, position(ALICE, 150));
-    f.m.state = { ...f.m.state!, spot: 1_940n * S, updateTs: T0 - 100 };
     f.k.prices.ingest([print(FEED, 2_000, T0, { conf: 0n })]);
-    const [a] = await f.k.jobs.get("liquidation")!.plan(f.m);
-    expect(args(a!)).toEqual([[ALICE], []]); // judged at the stored 1940, as with no print at all
+    // A stored 1940 a minute and a half old decides nothing, and the print cannot be attached.
+    f.m.state = { ...f.m.state!, spot: 1_940n * S, updateTs: T0 - 100 };
+    expect(await liq.plan(f.m)).toEqual([]);
+    expect(f.calls.fees).toEqual([]);
+    // Stored a second ago, it decides the call without an update, as with no print at all.
+    f.m.state = { ...f.m.state, updateTs: T0 - 1 };
+    const [a] = await liq.plan(f.m);
+    expect(args(a!)).toEqual([[ALICE], []]);
     expect(a!.value).toBe(0n);
+    expect([a!.priceTime, a!.priceIssued]).toEqual([T0 - 1, false]);
   });
 
   it("on one leg rules out the composite it prices", async () => {
@@ -299,5 +312,214 @@ describe("a print without a confidence", () => {
     f.k.prices.ingest([print(FEED, 1_940, T0), print(FEED2, 1, T0, { conf: 0n })]);
     expect(f.k.jobs.get("liquidation")!.priced(m)).toBeNull();
     expect(debug()).toEqual([`M2: the print for feed ${FEED2} carries no confidence, and the oracle refuses a live price without one; skipping it`]);
+  });
+});
+
+/** A chain on which every call simulates as paying $0.10 and every transaction sent confirms. */
+class SendingChain {
+  readonly overridesSupported = true;
+  readonly sent: Hex[] = [];
+  async probe(): Promise<ProbeResult> {
+    return { ok: true, ret: "0x", claimBefore: 0n, claimAfter: S / 10n, gasUsed: 100_000n, adlPendingAfter: false, settlementFixedAfter: 0n, reward: S / 10n };
+  }
+  async estimateGas(): Promise<bigint> {
+    return 200_000n;
+  }
+  async gasPrice(): Promise<bigint> {
+    return 100_000_000n;
+  }
+  async balance(): Promise<bigint> {
+    return S;
+  }
+  async nonce(): Promise<number> {
+    return 0;
+  }
+  async sendRaw(raw: Hex): Promise<Hex> {
+    this.sent.push(raw);
+    return keccak256(raw);
+  }
+  async receipt(hash: Hex): Promise<Receipt | null> {
+    return { transactionHash: hash, blockNumber: 1, status: "success", gasUsed: 150_000n, effectiveGasPrice: 100_000_000n, from: ME, to: DEP.lens, logs: [] };
+  }
+}
+
+describe("a liquidation without a fresh print", () => {
+  const debug = () => logged.filter((l) => l.level === "debug" && l.logger === "bazaar_sdk.prices").map((l) => l.msg);
+
+  /** ETH/USD with a position under at 1940 and not at 2000, and the price the pair holds. */
+  function liquidation(stored: { spot: number; updateTs: number }, continuous = false) {
+    const f = fake(dir, { jobs: { liquidation: {} } }, { continuous });
+    f.k.store.positionsOf(f.m.address).set(ALICE, position(ALICE, 150));
+    f.m.state = { ...f.m.state!, spot: BigInt(stored.spot) * S, updateTs: stored.updateTs };
+    return Object.assign(f, { liq: f.k.jobs.get("liquidation")! });
+  }
+
+  it("on a market with trading hours carries Pyth's latest update and is judged at its price, timed by its issue second", async () => {
+    const f = liquidation({ spot: 2_000, updateTs: T0 - 100 });
+    // The venue closed 30 s ago at 1940: the update issued then, and the one issued this second carrying that price forward.
+    f.k.prices.ingest(update(T0 - 30, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]).prints);
+    const latest = update(T0, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]);
+    f.k.prices.ingest(latest.prints);
+    expect(f.k.prices.fresh(f.m)).toBe(false);
+    const [a] = await f.liq.plan(f.m);
+    expect(args(a!)).toEqual([[ALICE], [latest.blob]]);
+    expect(a!.value).toBe(FEE);
+    expect(a!.summary).toBe("liquidate 1 account(s), $1,940 notional");
+    expect([a!.priceTime, a!.priceIssued]).toEqual([T0, true]);
+  });
+
+  it("is judged at the latest update's price in the stored price's own second", async () => {
+    // The pair stored 2000 in second T0 - 30; 1940, generated later in that second, is Pyth's latest price.
+    const f = liquidation({ spot: 2_000, updateTs: T0 - 30 });
+    const latest = update(T0, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]);
+    f.k.prices.ingest(latest.prints);
+    const [a] = await f.liq.plan(f.m);
+    expect(args(a!)).toEqual([[ALICE], [latest.blob]]);
+    expect(a!.summary).toBe("liquidate 1 account(s), $1,940 notional");
+  });
+
+  it("is judged at the stored price when that is strictly newer, and still carries the update", async () => {
+    // The pair stored 1940 in second T0 - 20; Pyth's latest price, 2000, is from T0 - 30.
+    const f = liquidation({ spot: 1_940, updateTs: T0 - 20 });
+    const latest = update(T0, [{ feed: FEED, usd: 2_000, generated: T0 - 30 }]);
+    f.k.prices.ingest(latest.prints);
+    const [a] = await f.liq.plan(f.m);
+    // Without the update the call reverts: the stored price is 20 s old.
+    expect(args(a!)).toEqual([[ALICE], [latest.blob]]);
+    expect(a!.summary).toBe("liquidate 1 account(s), $1,940 notional");
+    expect([a!.priceTime, a!.priceIssued]).toEqual([T0, true]);
+    // The other way round: 2000 stored in T0 - 20 outranks a latest 1940 from T0 - 30, so nothing crosses.
+    const g = liquidation({ spot: 2_000, updateTs: T0 - 20 });
+    g.k.prices.ingest(update(T0, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]).prints);
+    expect(await g.liq.plan(g.m)).toEqual([]);
+    expect(g.calls.buckets).toEqual([]);
+  });
+
+  it("on a composite dated by its quiet leg, is judged at a stored price strictly newer though older than 3 s", async () => {
+    const f = fake(dir, { jobs: { liquidation: {} } });
+    const m = marketAt(2, [FEED, FEED2], false);
+    f.k.store.addMarket(m);
+    f.k.store.positionsOf(m.address).set(ALICE, position(ALICE, 150));
+    // The pair stored 1940 in second T0 - 20. Pyth's latest update, issued now, has the base at 2000 a
+    // second ago, but its price is dated by the quote leg, quiet at 1.0 since T0 - 30.
+    m.state = marketState(T0, { spot: 1_940n * S, updateTs: T0 - 20 });
+    const latest = update(T0, [
+      { feed: FEED, usd: 2_000, generated: T0 - 1 },
+      { feed: FEED2, usd: 1, generated: T0 - 30, conf: 1_000n },
+    ]);
+    f.k.prices.ingest(latest.prints);
+    expect(f.k.prices.liquidationUpdate(m)).toMatchObject({ kind: "latest", price: { spot: 2_000n * S, publishTime: T0 - 30 } });
+    const [a] = await f.k.jobs.get("liquidation")!.plan(m);
+    // Judged at the stored 1940, with the update attached: without one the call reverts, the stored
+    // price being 20 s old.
+    expect(args(a!)).toEqual([[ALICE], [latest.blob]]);
+    expect(a!.summary).toBe("liquidate 1 account(s), $1,940 notional");
+    expect([a!.priceTime, a!.priceIssued]).toEqual([T0, true]);
+  });
+
+  it("plans nothing when no update can be attached, and logs why at debug level", async () => {
+    const f = liquidation({ spot: 1_940, updateTs: T0 - 100 });
+    // Pyth's newest update was issued 5 s ago, past the 2 s a call may carry at the default margin.
+    f.k.prices.ingest(update(T0 - 5, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]).prints);
+    expect(await f.liq.plan(f.m)).toEqual([]);
+    expect(f.calls.buckets).toEqual([]);
+    expect(f.calls.fees).toEqual([]);
+    expect(debug()).toEqual([
+      "ETH/USD: no price can decide a liquidation now (the newest update the price source holds was issued 5 s before the clock, " +
+        "past the pair's 3 s window less the 1 s send margin); skipping it",
+    ]);
+    // A minute on, an update issued now whose price was generated 58 s before it: older than a minute in
+    // a block 3 s later.
+    await vi.advanceTimersByTimeAsync(61_000);
+    f.k.prices.ingest(update(T0 + 61, [{ feed: FEED, usd: 1_940, generated: T0 + 3 }]).prints);
+    expect(await f.liq.plan(f.m)).toEqual([]);
+    expect(debug()[1]).toBe(
+      "ETH/USD: no price can decide a liquidation now (feed 101's latest price was generated 58 s before the update carrying it was issued, " +
+        "more than the 57 s that keeps it within the 60 s a liquidation's price may be old); skipping it",
+    );
+  });
+
+  it("never plans a call without an update on a stored price older than the window less the send margin", async () => {
+    const f = liquidation({ spot: 1_940, updateTs: T0 - 4 }); // and no print at all
+    expect(await f.liq.plan(f.m)).toEqual([]);
+    f.m.state = { ...f.m.state!, updateTs: T0 - 3 };
+    expect(await f.liq.plan(f.m)).toEqual([]);
+    expect(f.calls.buckets).toEqual([]);
+    // Two seconds old at the default 1 s margin: still within the pair's 3 s as the call lands.
+    f.m.state = { ...f.m.state, updateTs: T0 - 2 };
+    const [a] = await f.liq.plan(f.m);
+    expect(args(a!)).toEqual([[ALICE], []]);
+    expect(a!.value).toBe(0n);
+    expect([a!.priceTime, a!.priceIssued]).toEqual([T0 - 2, false]);
+  });
+
+  it("on a continuously traded market plans nothing, whatever update Pyth issued", async () => {
+    const f = liquidation({ spot: 1_940, updateTs: T0 - 4 }, true);
+    f.k.prices.ingest(update(T0, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]).prints);
+    expect(await f.liq.plan(f.m)).toEqual([]);
+    expect(f.calls.buckets).toEqual([]);
+    expect(debug()).toEqual([
+      "ETH/USD: no price can decide a liquidation now (no fresh price: a continuously traded market is liquidated only at a price " +
+        "generated within the pair's 3 s window less the send margin, inside the oracle's confidence cap); skipping it",
+    ]);
+  });
+
+  it("is checked again just before signing against when the update was issued, not how old its price is", async () => {
+    const f = liquidation({ spot: 2_000, updateTs: T0 - 100 });
+    f.k.prices.ingest(update(T0, [{ feed: FEED, usd: 1_940, generated: T0 - 30 }]).prints);
+    const [a] = await f.liq.plan(f.m);
+    const chain = new SendingChain();
+    const lanes = new Map([["default", new Lane("default", new LocalSigner(KEY))]]);
+    const ex = new Executor(chain as unknown as Chain, f.k.cfg, new Ledger(null), lanes, 31337, DEP.lens, () => 2_000);
+    const jobCfg = f.k.cfg.jobs.liquidation;
+    // 1.5 s after the update was issued (its price is 31.5 s old): signed.
+    ex.clock = () => T0 + 1.5;
+    expect((await ex.run(a!, { jobCfg })).status).toBe("confirmed");
+    // 2.5 s after: past the 2 s a call may carry at the default margin, where the oracle would refuse it.
+    ex.clock = () => T0 + 2.5;
+    const r = await ex.run(a!, { jobCfg });
+    expect([r.status, r.priceAged]).toEqual(["skipped", true]);
+    expect(r.reason).toBe(
+      `not sent: the price update it carries was issued in second ${T0}, 2.5 s before the chain's time now, past the 2 s a call may carry ` +
+        "(the pair's 3 s window less prices.sendMarginSeconds); planned again with a newer price",
+    );
+    expect(chain.sent).toHaveLength(1);
+  });
+});
+
+describe("a fresh print a liquidation carries", () => {
+  const debug = () => logged.filter((l) => l.level === "debug" && l.logger === "bazaar_sdk.prices").map((l) => l.msg);
+
+  it("on a market with trading hours, only while each update carrying it was issued within the window", async () => {
+    // Issued 5 s ahead of the chain's clock (an endpoint running ahead, inside the price service's 5 s
+    // skew), its price generated 2 s ahead: fresh by its price, but there the oracle reads a
+    // liquidation's update as Pyth's latest price and refuses one issued that far from the block
+    // (BazaarOracle__StaleUpdate).
+    const ahead = update(T0 + 5, [{ feed: FEED, usd: 1_940, generated: T0 + 2 }]);
+    const f = fake(dir, { jobs: { liquidation: {} } }, { continuous: false });
+    const liq = f.k.jobs.get("liquidation")!;
+    f.k.store.positionsOf(f.m.address).set(ALICE, position(ALICE, 150));
+    f.m.state = { ...f.m.state!, spot: 2_000n * S, updateTs: T0 - 100 };
+    f.k.prices.ingest(ahead.prints);
+    expect(f.k.prices.fresh(f.m)).toBe(true);
+    expect(await liq.plan(f.m)).toEqual([]);
+    expect(f.calls.buckets).toEqual([]);
+    expect(debug()).toEqual([
+      "ETH/USD: no price can decide a liquidation now (an update the price source holds was issued 5 s ahead of the clock, " +
+        "past the pair's 3 s window less the 1 s send margin); skipping it",
+    ]);
+    // A continuously traded market's oracle reads the price alone: the same print is attached at once.
+    const g = fake(dir, { jobs: { liquidation: {} } });
+    g.k.store.positionsOf(g.m.address).set(ALICE, position(ALICE, 150));
+    g.m.state = { ...g.m.state!, spot: 2_000n * S, updateTs: T0 - 100 };
+    g.k.prices.ingest(ahead.prints);
+    const [b] = await g.k.jobs.get("liquidation")!.plan(g.m);
+    expect(args(b!)).toEqual([[ALICE], [ahead.blob]]);
+    expect([b!.priceTime, b!.priceIssued]).toEqual([T0 + 2, false]);
+    // Three seconds on, the update was issued 2 s ahead, inside the window: attached, timed by its price.
+    await vi.advanceTimersByTimeAsync(3_000);
+    const [a] = await liq.plan(f.m);
+    expect(args(a!)).toEqual([[ALICE], [ahead.blob]]);
+    expect([a!.priceTime, a!.priceIssued]).toEqual([T0 + 2, false]);
   });
 });

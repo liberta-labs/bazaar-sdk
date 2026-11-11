@@ -40,8 +40,9 @@ import {
 import { Action, ActionResult, lockKey } from "../../exec/executor.js";
 import { getLogger } from "../../observe/logs.js";
 import type { Keeper } from "../engine.js";
-import { JOBS, type Job } from "../jobs/index.js";
+import { JOBS, type Job, PricedCall } from "../jobs/index.js";
 import type { CollectJob } from "../jobs/collect.js";
+import type { LiquidationJob } from "../jobs/liquidation.js";
 
 const log = getLogger("bazaar_sdk.ops");
 
@@ -356,7 +357,14 @@ export class Operations {
     return this.locked(a, { dryRun, force: true });
   }
 
-  private async planned(name: JobName, ref: string, dryRun: boolean, force: boolean, empty: string): Promise<ActionResult[]> {
+  /** `empty` is the skip reason when the plan finds nothing, or a function of the market giving it. */
+  private async planned(
+    name: JobName,
+    ref: string,
+    dryRun: boolean,
+    force: boolean,
+    empty: string | ((m: Market) => string),
+  ): Promise<ActionResult[]> {
     const m = await this.market(ref);
     const job = this.job(name);
     if (m.state === null) return [skipped(name, m.label, name, "could not read the market's state")];
@@ -366,7 +374,7 @@ export class Operations {
       return [skipped(name, m.label, name, `the market is ${status}; this job runs while it is ${allowed}`)];
     }
     const actions = await job.plan(m);
-    if (actions.length === 0) return [skipped(name, m.label, name, empty)];
+    if (actions.length === 0) return [skipped(name, m.label, name, typeof empty === "string" ? empty : empty(m))];
     return this.runActions(job, actions, dryRun, force);
   }
 
@@ -383,18 +391,27 @@ export class Operations {
     const [accounts, o] = listAndOptions<readonly string[], LiquidateOptions>(arg, more, "accounts");
     const dryRun = o.dryRun ?? false;
     const force = o.force ?? false;
+    const noPrice = (reason: string) => `no price can decide a liquidation now (${reason}): positions wait for the market's next price`;
     if (!accounts || accounts.length === 0) {
-      return this.planned("liquidation", market, dryRun, force, "no position is below its maintenance margin");
+      return this.planned("liquidation", market, dryRun, force, (m) => {
+        const held = this.k.store.positions.get(m.address)?.size ?? 0;
+        const pc = held > 0 ? (this.job("liquidation") as LiquidationJob).liquidationPrice(m) : null;
+        return pc === null || pc instanceof PricedCall ? "no position is below its maintenance margin" : noPrice(pc.reason);
+      });
     }
     const accts = addresses(accounts);
     const m = await this.market(market);
-    const job = this.job("liquidation");
-    const pc = job.priced(m, true);
-    const updates = pc ? pc.updates : [];
+    const job = this.job("liquidation") as LiquidationJob;
+    // Priced as the job prices: a call the pair could only refuse (no update, on a stored price more
+    // than 3 s old) is not simulated.
+    const pc = job.liquidationPrice(m);
+    if (!(pc instanceof PricedCall)) return [skipped("liquidation", m.label, "liquidate", noPrice(pc.reason))];
+    const updates = pc.updates;
     const fee = await this.k.reader.updateFee(updates);
     const a = job.action(m, m.address, PAIR.encode("liquidate", accts, updates), `liquidate ${accts.length} account(s)`, {
       value: fee,
-      priceTime: pc?.priceTime ?? null,
+      priceTime: pc.priceTime,
+      priceIssued: pc.issued,
       locks: accts.map((acct) => lockKey("liq", m.address, acct)), // the liquidation job's keys
       rewardPair: m.address,
     });

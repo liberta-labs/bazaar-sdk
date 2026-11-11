@@ -276,6 +276,55 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "function",
+    "name": "verifyAndFetchLatestPrice",
+    "inputs": [
+      {
+        "name": "baseFeedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "priceUpdate",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      },
+      {
+        "name": "maxIssueAge",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "maxPriceAge",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "spotPrice",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "lowPrice",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "highPrice",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "publishTime",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "payable"
+  },
+  {
+    "type": "function",
     "name": "verifyAndFetchPrice",
     "inputs": [
       {
@@ -522,6 +571,17 @@ export const bazaarOracleAbi = [
         "name": "generatedTs",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BazaarOracle__StaleUpdate",
+    "inputs": [
+      {
+        "name": "timestampUs",
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ]
   },

@@ -113,7 +113,7 @@ describe("the secrets rule", () => {
 
   it("tells a file that still holds prices.apiKey what the setting is now, before any variable is filled, never quoting it", () => {
     const message =
-      "prices.apiKey is not a setting: the Pyth Pro access token goes in prices.token (a Pyth Core or Hermes key does not work), " +
+      "prices.apiKey is not a setting: the Pyth Pro API key goes in prices.token (a Pyth Core or Hermes key does not work), " +
       "and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service";
     delete process.env.GONE_PYTH_API_KEY;
     // The variable it names is gone: the rename is what is reported, not the missing variable.

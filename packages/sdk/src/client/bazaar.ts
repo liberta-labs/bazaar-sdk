@@ -66,7 +66,9 @@ export interface BazaarOptions extends Omit<ConnectOptions, "prices" | "subgraph
   /**
    * Where signed Pyth Pro updates come from: options for a client of the SDK's own (`{ token }`, the
    * token a string or a function that returns short-lived ones), a {@link ProClient}, or any
-   * PriceUpdateSource. A browser must not hold the API key: give it tokens its backend mints.
+   * PriceUpdateSource. A browser must not hold the API key: give it tokens its backend mints. A client
+   * for Pyth's own endpoints, the default ones, needs the token: options without one throw an
+   * InputError on `prices.token`.
    */
   prices?: PriceUpdateSource | ProClient | ProClientOptions | null;
   /** Bazaar's subgraph (URL, or { url, apiKey }), or any SubgraphSource. Needed only for history. */

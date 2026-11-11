@@ -139,7 +139,9 @@ curl -X POST localhost:8787/mock/price -H 'content-type: application/json' \
 
 Add `"paused": true` to stop the feed generating prices, as a market closing for the night would: its
 updates keep coming and carry its last price forward with the time that price was generated, so they
-read as stale, as Pyth's do. `"paused": false` resumes it. `"confidence": 0` makes its updates carry no
+read as stale, as Pyth's do (a liquidation on a market with trading hours may still carry the newest
+of them for a minute after that price, as it may Pyth's: [Liquidation](jobs.md#liquidation)).
+`"paused": false` resumes it. `"confidence": 0` makes its updates carry no
 confidence (the oracle refuses those, and the keeper never attaches them); `"confidence": null` goes
 back to the default.
 

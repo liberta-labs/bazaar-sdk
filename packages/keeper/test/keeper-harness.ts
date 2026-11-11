@@ -16,6 +16,9 @@ import {
   ZERO_ADDRESS,
   emptyInventory,
   feedIdHex,
+  lazer,
+  printsOf,
+  proFeedId,
 } from "@liberta-labs/bazaar-sdk";
 import { type Address, type Hex, getAddress } from "viem";
 import { parseConfig } from "../src/config/index.js";
@@ -172,6 +175,43 @@ export function print(feed: Hex, usd: number, publishTime: number, over: Partial
     received: 0,
     ...over,
   };
+}
+
+/**
+ * One leg of {@link update}: its feed, its price in USD (expo -8) generated in second `generated`, and
+ * its confidence (expo -8; default the one {@link print} gives).
+ */
+export interface UpdateLeg {
+  feed: Hex;
+  usd: number;
+  generated: number;
+  conf?: bigint;
+}
+
+/**
+ * A Pyth Pro update issued in second `issued`, carrying each leg's price as generated in its own
+ * second (a quiet feed's updates carry its last price forward this way), and the prints a price source
+ * takes from it. The envelope holds a placeholder signature: nothing here recovers the signer, and no
+ * oracle verifies it.
+ */
+export function update(issued: number, legs: readonly UpdateLeg[]): { blob: Hex; prints: Print[] } {
+  const payload = lazer
+    .encodePayload({
+      timestampUs: BigInt(issued) * 1_000_000n,
+      channel: "fixed_rate@200ms",
+      feeds: legs.map((l) => ({
+        id: proFeedId(l.feed),
+        price: BigInt(Math.round(l.usd * 1e8)),
+        exponent: -8,
+        confidence: l.conf ?? 10_000_000n,
+        feedUpdateTimestamp: BigInt(l.generated) * 1_000_000n,
+      })),
+    })
+    .slice(2);
+  const magic = lazer.ENVELOPE_MAGIC.toString(16).padStart(8, "0");
+  const size = (payload.length / 2).toString(16).padStart(4, "0");
+  const blob: Hex = `0x${magic}${"11".repeat(32)}${"22".repeat(32)}00${size}${payload}`;
+  return { blob, prints: printsOf(lazer.readUpdate(blob), blob, null, 0) };
 }
 
 export interface Calls {

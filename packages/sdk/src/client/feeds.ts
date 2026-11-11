@@ -11,6 +11,10 @@
  * at any age where the call accepts an old price. So an update is attached only when the oracle would
  * accept it; otherwise a market that keeps trading hours gets none, and a continuously traded one,
  * which has no such fallback, fails here rather than in a transaction that must revert.
+ *
+ * A liquidation without an update never accepts a stored price older than 3 s. On a market that keeps
+ * trading hours it reads an attached update as Pyth's latest price instead, so its update comes from
+ * {@link liquidationUpdateFor}.
  */
 
 import type { Address, Hex } from "viem";
@@ -19,6 +23,7 @@ import { MAX_PRICE_STALENESS } from "../constants.js";
 import { pairPrice } from "../formulas/index.js";
 import { MICROS_PER_SECOND, isRawFeedId, legEntries, proFeedId } from "../prices/lazer.js";
 import { NoLivePriceError, ProError, whyNotLive } from "../prices/pro.js";
+import { readLatestPrice } from "../prices/service.js";
 import { type BazaarContext, requirePrices } from "./context.js";
 
 export interface PairFeeds {
@@ -103,6 +108,23 @@ export class NoFreshPriceError extends ProError {
   }
 }
 
+/**
+ * No update can decide a liquidation on a market that keeps trading hours now: there is no fresh
+ * price, and Pyth's latest one is older than a liquidation accepts or would be refused by the oracle.
+ * A call without an update runs only on a stored price at most 3 s old, which a market without a
+ * fresh price seldom has: positions wait for the market's next price.
+ */
+export class NoLiquidationPriceError extends ProError {
+  override readonly name: string = "NoLiquidationPriceError";
+  constructor(
+    readonly pair: Address,
+    /** Why no update can be attached. */
+    readonly reason: string,
+  ) {
+    super(`No price can decide a liquidation on market ${pair} now (${reason}): positions wait for its next price.`);
+  }
+}
+
 /** A feed for a message: a raw Pyth Pro id as its number, anything else as its short hex. */
 const feedText = (f: Hex) => (isRawFeedId(f) ? String(proFeedId(f)) : `${f.slice(0, 10)}…`);
 
@@ -157,7 +179,8 @@ export function updateProblem(update: readonly Hex[], feeds: Pick<PairFeeds, "le
  * has no live price for a feed): on a market that is not continuously traded, no update (`attached`
  * false, fee 0, `reason` saying why), so the call runs on the pair's stored price; on a continuously
  * traded market, a {@link NoFreshPriceError}. Any other failure of the source (unreachable, refused)
- * is thrown as it is.
+ * is thrown as it is. Not for a liquidation, which without an update never runs on a stored price older than 3 s:
+ * {@link liquidationUpdateFor}.
  */
 export async function priceUpdateFor(ctx: BazaarContext, pair: Address): Promise<FreshUpdate> {
   const source = requirePrices(ctx);
@@ -174,6 +197,68 @@ export async function priceUpdateFor(ctx: BazaarContext, pair: Address): Promise
   }
   if (await pairContinuous(ctx, pair)) throw new NoFreshPriceError(pair, reason);
   return { update: [], fee: 0n, publishTime: null, attached: false, reason };
+}
+
+/** The update a liquidation attaches ({@link liquidationUpdateFor}). */
+export interface LiquidationPriceUpdate {
+  /** What the call's `priceUpdate: bytes[]` takes: never empty. */
+  readonly update: Hex[];
+  /** Pyth's verification fee to send as the call's value (wei). */
+  readonly fee: bigint;
+  /**
+   * "fresh": each leg's price was generated at most 3 s before the update carrying it was issued.
+   * "latest": Pyth's latest price, older than that, on a market that keeps trading hours.
+   */
+  readonly kind: "fresh" | "latest";
+  /** The second the older leg's price was generated in. */
+  readonly publishTime: number;
+  /**
+   * The second the call must land within 3 s of: on a continuously traded market `publishTime`; on one
+   * that keeps trading hours the second the update was issued in, fresh price or not, since the oracle
+   * judges every update a liquidation there carries by when it was issued. Rebuild a call that would
+   * land later.
+   */
+  readonly priceTime: number;
+}
+
+/**
+ * The update a liquidation on `pair` attaches, and the ETH fee to verify it, as BazaarPair resolves a
+ * liquidation's price. On a continuously traded market the price source's latest update for the pair's
+ * feeds is attached when its price is fresh ({@link updateProblem} finds nothing). On a market that
+ * keeps trading hours the oracle reads any update a liquidation carries as Pyth's latest price
+ * (prices/service.ts `readLatestPrice`), fresh or not: it accepts the update when it was issued within
+ * 3 s of the block and its price was generated at most a minute before it, which a price generated
+ * MAX_LATEST_PRICE_LAG seconds or less before the update meets in any such block.
+ *
+ * A liquidation without an update never runs on a stored price older than 3 s, so this never returns an empty update. It
+ * throws a {@link NoFreshPriceError} on a continuously traded market without a fresh price, a
+ * {@link NoLiquidationPriceError} on one that keeps trading hours when Pyth's latest price cannot
+ * decide the call either, and any other failure of the source as it is.
+ */
+export async function liquidationUpdateFor(ctx: BazaarContext, pair: Address): Promise<LiquidationPriceUpdate> {
+  const source = requirePrices(ctx);
+  const feeds = await pairFeeds(ctx, pair);
+  const continuous = await pairContinuous(ctx, pair);
+  let update: Hex[] = [];
+  let fresh: { publishTime: number } | null = null;
+  let reason = "";
+  try {
+    update = (await source.latest(feeds.legs)).update;
+    const a = assess(update, feeds);
+    if ("publishTime" in a) fresh = a;
+    else reason = a.problem;
+  } catch (e) {
+    if (!(e instanceof NoLivePriceError)) throw e;
+    reason = e.message;
+  }
+  if (continuous) {
+    if (fresh === null) throw new NoFreshPriceError(pair, reason);
+    return { update, fee: await updateFee(ctx, update), kind: "fresh", publishTime: fresh.publishTime, priceTime: fresh.publishTime };
+  }
+  if (update.length === 0) throw new NoLiquidationPriceError(pair, reason);
+  const latest = readLatestPrice(update, feeds.legs, feeds.invertQuote);
+  if ("problem" in latest) throw new NoLiquidationPriceError(pair, latest.problem);
+  return { update, fee: await updateFee(ctx, update), kind: fresh === null ? "latest" : "fresh", publishTime: latest.price.publishTime, priceTime: latest.issuedAt };
 }
 
 /**

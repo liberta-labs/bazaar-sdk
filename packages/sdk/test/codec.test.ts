@@ -72,7 +72,8 @@ describe("codec", () => {
   it("decodes custom errors with hints and times", () => {
     const e = decodeError(sel("BazaarPair__LiquidationPriceTooOld()"));
     expect(e.name).toBe("BazaarPair__LiquidationPriceTooOld");
-    expect(e.hint).toContain("10 minutes");
+    expect(e.hint).toContain("the pair's stored price is more than 3 seconds old, which never decides a liquidation. Attach Pyth's latest update");
+    expect(e.hint).toContain("at most a minute old");
     const e2 = decodeError(concatHex([sel("Factory__DeploymentNotExpired(uint256)"), encodeAbiParameters([{ type: "uint256" }], [1_800_000_000n])]));
     expect(e2.opensAt()).toBe(1_800_000_000);
     const e3 = decodeError(concatHex(["0x08c379a0", encodeAbiParameters([{ type: "string" }], ["nope"])]));

@@ -5,7 +5,16 @@ import { dirname, join, resolve } from "node:path";
 import { ETH_USD_FEED, JsonRpc, NETWORKS, ProClient } from "@liberta-labs/bazaar-sdk";
 import { type Hex, getAddress, isAddress } from "viem";
 import { parse as parseYaml } from "yaml";
-import { type JobName, type KeeperConfig, PricesConfig, expandHome, hermesEndpointProblem, parseConfig, priceEndpoints } from "../config/index.js";
+import {
+  type JobName,
+  type KeeperConfig,
+  PricesConfig,
+  expandHome,
+  hermesEndpointProblem,
+  missingProKey,
+  parseConfig,
+  priceEndpoints,
+} from "../config/index.js";
 import { LocalSigner, newKey, writeKeystore } from "../exec/wallets.js";
 import { safeLabel } from "../observe/logs.js";
 import { CliExit, FAIL, OK, type Output, WARN, c, consoleOutput, errorText, groupedFixed } from "./format.js";
@@ -131,6 +140,7 @@ const nonEmpty: Validate = (s) => s.trim().length > 0 || "enter a URL";
 const usdAmount: Validate = (s) => /^(?:\.\d+|\d+(?:\.\d*)?)$/.test(s.trim()) || "enter an amount in USD, such as 0.05";
 const anAddress: Validate = (s) => isAddress(s.trim()) || "not an address";
 const aToken: Validate = (s) => s.trim().length > 0 || "enter the token";
+const aProKey: Validate = (s) => s.trim().length > 0 || "enter your Pyth Pro API key: Pyth's own endpoints serve prices to no one without one";
 /** A Pyth Pro compatible endpoint's URL: the token is sent there, so a Hermes service is refused. */
 const aPriceUrl: Validate = (s) => (nonEmpty(s) === true ? (hermesEndpointProblem("prices.endpoint", s) ?? true) : nonEmpty(s));
 const aKey: Validate = (s) => {
@@ -319,16 +329,18 @@ async function wizard(configPath: string, d: WizardDeps, state: { keystore: stri
   const pchoice = await p.select({
     message: "Price endpoint (Pyth Pro)",
     choices: [
-      { name: "Pyth Pro, with my own access token", value: "pyth" },
+      { name: "Pyth Pro, with my Pyth Pro API key", value: "pyth" },
       { name: "Custom Pyth Pro compatible URL (bazaar mock-prices, a proxy)", value: "custom" },
-      { name: "Bazaar shared endpoint (not available yet)", value: "bazaar", disabled: "coming later" },
     ],
   });
   lines.push("", "prices:");
   let token: string | null = null;
   let endpoint: string;
+  // Pyth's own endpoints serve prices only to the holder of a Pyth Pro API key, and the config refuses
+  // to load without one, so the key is asked for wherever the endpoint is Pyth's.
+  const proKey = async (): Promise<string> => (await p.password({ message: "Pyth Pro API key", validate: aProKey })).trim();
   if (pchoice === "pyth") {
-    token = (await p.password({ message: "Pyth Pro access token", validate: aToken })).trim();
+    token = await proKey();
     endpoint = "pyth";
     lines.push("  endpoint: pyth", `  token: ${setEnv("PYTH_PRO_TOKEN", token)}`);
   } else {
@@ -336,7 +348,10 @@ async function wizard(configPath: string, d: WizardDeps, state: { keystore: stri
       await p.input({ message: "Price endpoint URL", default: net === "anvil" ? "http://127.0.0.1:8787" : undefined, validate: aPriceUrl })
     ).trim();
     lines.push(`  endpoint: ${setEnv("PRICE_ENDPOINT_URL", endpoint)}`);
-    if (await p.confirm({ message: "Does it need an access token?", default: false })) {
+    if (missingProKey(PricesConfig.parse({ endpoint })) !== null) {
+      token = await proKey();
+      lines.push(`  token: ${setEnv("PYTH_PRO_TOKEN", token)}`);
+    } else if (await p.confirm({ message: "Does it need an access token?", default: false })) {
       token = (await p.password({ message: "Access token", validate: aToken })).trim();
       lines.push(`  token: ${setEnv("PRICE_TOKEN", token)}`);
     }

@@ -153,7 +153,7 @@ export const USER_MESSAGES: Readonly<Record<string, Message>> = {
     "While the market holds liquidated positions, an insurance deposit needs a live price, and the market is closed. Try again when it reopens.",
   BazaarPair__InsuranceWithdrawalRequiresFreshPrice: "An insurance withdrawal needs a live price, and the market is closed. Try again when it reopens.",
   BazaarPair__LiquidationPriceTooOld:
-    "The market is closed and its last price is more than 10 minutes old, so nobody can be liquidated on it. Liquidations resume when the market reopens.",
+    "This market's stored price is more than 3 seconds old, so a liquidation must bring Pyth's latest price update. Attach it and send again. A price more than a minute old cannot liquidate anyone: on a closed market, liquidations wait for its next price.",
   BazaarPair__NoPriceUpdatesProvided: "No fresh price was available for this market. Rebuild the transaction with a current price update and send it right away.",
   BazaarPair__OnlyUma: "Only Bazaar's termination contract can do this.",
   BazaarPair__PairScheduledForTermination: LIMBO,
@@ -402,7 +402,9 @@ export const USER_MESSAGES: Readonly<Record<string, Message>> = {
   BazaarOracle__SampleTooLate: (a) =>
     `A settlement price update is for ${when(a.tick)}, after the latest time this settlement accepts (${when(a.maxPublishTime)}).`,
   BazaarOracle__StalePrice: (a) =>
-    `The price in this transaction was generated at ${formatUtc(a.generatedTs)}, more than 3 seconds from the block's time when it ran. Rebuild the transaction and send it right away; a closed market has no fresh price until it reopens.`,
+    `The price in this transaction was generated at ${formatUtc(a.generatedTs)}, too far from the block's time when it ran: more than 3 seconds, or, for a liquidation on a market with trading hours, more than a minute before it. Rebuild the transaction and send it right away; a closed market has no fresh price until it reopens.`,
+  BazaarOracle__StaleUpdate: (a) =>
+    `The price update in this transaction was issued at ${formatUtc(big(a.timestampUs) / 1_000_000n)}, more than 3 seconds from the block's time when it ran. Fetch Pyth's latest update and send again right away.`,
   BazaarOracle__WrongTick: "A settlement price update is not Pyth's one-second update for the required second.",
   BazaarOracle__ZeroAddress: ZERO_ADDRESS,
   LazerPayloadLib__Malformed: "The price update could not be read. Rebuild the transaction with a current price update.",
@@ -460,6 +462,7 @@ const INSUFFICIENT_GAS = "Your wallet does not have enough ETH for gas (plus any
 const NONCE = "Your wallet's transaction count is out of date: another transaction already used it. Wait for pending transactions to confirm (or reset the account in your wallet) and try again.";
 const CHAIN = "Your wallet is on a different network than this app. Switch networks in your wallet and try again.";
 const NO_FRESH_PRICE = "No fresh price is available for this market right now, and this action needs one. Try again in a moment.";
+const NO_LIQUIDATION_PRICE = "This market has no price that can decide a liquidation right now. Liquidations wait for its next price.";
 
 /**
  * A message for a failure the wallet raised rather than the contract: the EIP-1193 provider errors
@@ -494,8 +497,9 @@ export function walletErrorMessage(e: unknown): string | null {
 /**
  * The text to show a user for any error a Bazaar call can throw: a wallet-side failure, a decoded
  * revert (from a `CallError`, a simulation's `DecodedError`, or revert data inside an RPC error), an
- * input the SDK refused before building, or a market with no fresh price for a call that needs one
- * (feeds.ts `NoFreshPriceError`). Falls back to a generic sentence, never a raw URL.
+ * input the SDK refused before building, a market with no fresh price for a call that needs one
+ * (feeds.ts `NoFreshPriceError`), or none recent enough for a liquidation (`NoLiquidationPriceError`).
+ * Falls back to a generic sentence, never a raw URL.
  */
 export function errorMessage(e: unknown): string {
   if (e instanceof DecodedError) return e.message;
@@ -503,6 +507,7 @@ export function errorMessage(e: unknown): string {
     const o = e as { name?: unknown; message?: unknown; decoded?: unknown };
     if (o.name === "InputError" && typeof o.message === "string") return o.message;
     if (o.name === "NoFreshPriceError") return NO_FRESH_PRICE;
+    if (o.name === "NoLiquidationPriceError") return NO_LIQUIDATION_PRICE;
     if (o.decoded instanceof DecodedError) return o.decoded.message;
   }
   const wallet = walletErrorMessage(e);

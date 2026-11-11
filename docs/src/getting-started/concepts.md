@@ -134,7 +134,9 @@ Pyth Pro update in its calldata, and the pair accepts a price generated at most 
 block's time (`MAX_PRICE_STALENESS`). The pair has the attached update verified and uses its price; a
 call that carries none runs on the pair's own stored price while that is at most 3 seconds old, and
 otherwise reverts (or, on a market with trading hours, runs on its stored price where that call allows
-it). See
+it). A liquidation without an update never runs on a stored price older than 3 seconds: on a market with trading hours it
+carries Pyth's latest update instead, issued within 3 seconds of the block, whose price may be up to a
+minute old ([Sending Transactions](../sdk/sending.md#preparedcall)). See
 [Oracle](https://docs.bazaar.finance/protocol/oracle.html).
 
 What this means in code:

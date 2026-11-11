@@ -50,14 +50,24 @@ Add the wallet under `wallets`, or change the job's `wallet`.
 A job key with nothing under it (`liquidation:`) is null, which turns the job off. Write
 `liquidation: {}`. `doctor`'s `Jobs` line lists the jobs that are on.
 
-**`prices.endpoint: the 'bazaar' price endpoint has no URLs yet; …`**
-`bazaar` is the default endpoint, and it does not exist yet. Set `prices.endpoint: pyth` with your own
-Pyth Pro access token in `prices.token`, or the URL of a Pyth Pro compatible service.
+**`prices.token: Pyth's own price endpoints serve prices only to the holder of a Pyth Pro API key: …`**
+(Under `the config is not valid:`, from `start`, `doctor` and every other command that loads the
+config.) `prices.endpoint` is `pyth`, the default, or one of Pyth's own URLs (a custom `restUrl` beside
+Pyth's stream URLs counts), and no key is given: an empty or blank `token` counts as none, as when
+`${PYTH_PRO_TOKEN:-}` finds the variable unset. Get a Pyth Pro API key from Pyth, put it in `.env` as
+`PYTH_PRO_TOKEN=…` and write `token: ${PYTH_PRO_TOKEN}` under `prices`; or point `prices.endpoint` at a
+Pyth Pro compatible service that needs none (a proxy that adds the key, `bazaar mock-prices` on a local
+chain).
 
-**`prices.apiKey is not a setting: the Pyth Pro access token goes in prices.token (a Pyth Core or Hermes key does not work), and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service`**
+**`prices.endpoint: expected pyth or an http(s) URL`**
+The endpoint is neither the `pyth` preset nor a base URL (`bazaar` is no endpoint: Bazaar runs no
+shared one). Set it to `pyth` with your Pyth Pro API key, or to the URL of a Pyth Pro compatible
+service.
+
+**`prices.apiKey is not a setting: the Pyth Pro API key goes in prices.token (a Pyth Core or Hermes key does not work), and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service`**
 A config written for Pyth Core. It is reported before any `${NAME}` is filled, so an old variable
-that is gone from `.env` does not hide it. Replace `apiKey` with `token: ${PYTH_PRO_TOKEN}` (a Pyth
-Pro access token, in `.env`), and set `prices.endpoint` to `pyth` or a Pyth Pro compatible URL.
+that is gone from `.env` does not hide it. Replace `apiKey` with `token: ${PYTH_PRO_TOKEN}` (your Pyth
+Pro API key, in `.env`), and set `prices.endpoint` to `pyth` or a Pyth Pro compatible URL.
 
 **`prices.endpoint names a Hermes (Pyth Core) service, and the keeper sends its Pyth Pro token wherever prices are asked for: …`**
 (Or `prices.restUrl`, `prices.streamUrls`.) An endpoint left from a Pyth Core setup: the keeper would
@@ -140,8 +150,9 @@ instead (which needs `startBlock` or historical state); later starts do not use 
 
 **`✘ Prices …`**
 The price endpoint failed: a bad or missing token (`prices.token`; `price endpoint refused the request
-(HTTP 401)` or `403`), a wrong URL, or a service down. A token that does not cover a feed or the
-channel can be refused the same way.
+(HTTP 401)` or `403`), a wrong URL, or a service down. A token that covers none of the feeds, or not
+the channel, is refused the same way; one that leaves out only some feeds shows as markets without a
+print instead (below).
 
 **`⚠ Prices the fixed_rate@200ms stream is not delivering (…): the keeper would poll the request API every 1 s instead`**
 The request API answered but the WebSocket stream did not: a stream URL is wrong (`prices.streamUrls`),
@@ -171,9 +182,15 @@ up with the stream.
 **`⚠ Prices N/M markets have a print`**, or at runtime **`price endpoint sent no print for feed 0x…: markets on it get no price until it does …`**
 The endpoint serves no print for some markets' feeds: it does not carry that feed, the token does not
 cover it, Pyth has no price or no confidence for it (the oracle refuses a price without one, so the
-keeper never attaches it), or the feed is closed (a market with trading hours outside them). Markets on it get no fresh price: liquidation still
-works from a stored price up to 9.5 minutes old, other price-driven jobs wait. Check the endpoint
-serves the feed.
+keeper never attaches it), or the feed is closed (a market with trading hours outside them). Markets on it get no fresh price, and the
+price-driven jobs wait, liquidation included: it never runs on a stored price more than 3 s old. Check
+the endpoint serves the feed.
+
+**`price endpoint refused feed N while serving the others: left out of its requests for 5 min (…)`**
+Pyth's request API refuses a whole request that names a feed it does not know or your token does not
+cover. The keeper asked again in parts, so the other feeds were served, and it leaves that feed out of
+its requests for 5 minutes before asking again. Markets on it get no price meanwhile. Check the feed
+id, or ask Pyth to add the feed to your key.
 
 **`… not fresh right now (AAPL/USD, …)`**
 Those markets have a print, but not one recent enough to send: usually a session market outside its
@@ -263,6 +280,8 @@ info level). The common ones:
 | `the book has nothing the vault may sell into at this price` | unload: no bid within reach yet |
 | `the refresh would not change the vault's health state` | a health poke that would change nothing |
 | a decoded revert (`BazaarPair__…`) | the call reverts in simulation: another keeper got there first, or the state is not what the index thought. Retried after a cooldown |
+| `not sent: the price it relies on is from second …` / `not sent: the price update it carries was issued in second …` | checked just before signing: the price, or for a liquidation carrying Pyth's latest update the second that update was issued, aged past the pair's 3 s window less `prices.sendMarginSeconds`. Nothing refused the candidate: the next plan takes a newer price, with no cooldown |
+| `no price can decide a liquidation now (…): positions wait for the market's next price` | a one-shot `liquidate`: no fresh print, no latest update the pair would accept, and a stored price older than the window. The running job logs the same reason at debug level, at most once a minute per market ([Liquidation](jobs.md#liquidation)) |
 | `already in flight: the keeper is sending this call; try again once it lands` | a one-shot run of a call the keeper in the same process is sending |
 
 ### Paused Jobs

@@ -27,11 +27,9 @@ spare (unused gas is refunded), and never above EIP-7825's cap, so the replay ru
 
 ## Where they come from
 
-- The Bazaar working tree at commit `e48b93d9d311bda9e40251271c8be50d9f3ed234` with the Pyth Pro
-  contracts uncommitted on top of it (`src/`, `script/`, `test/mocks/MockPythLazer.sol`), built by
-  Foundry 1.4.3 with solc 0.8.34 and Bazaar's `foundry.toml` (via-IR, 150 optimizer runs, cancun).
-  The SDK's ABIs were synced from the same tree (`packages/sdk/src/abi/source.ts` records it as
-  dirty). Regenerate both once those contracts are committed, and record the commit here.
+- Bazaar at commit `4d4e8a699e0ba09cf5e19df06c6929dfb37632e4`, built by Foundry with solc 0.8.34
+  and Bazaar's `foundry.toml` (via-IR, 150 optimizer runs, cancun). The SDK's ABIs were synced from
+  the same commit (`packages/sdk/src/abi/source.ts` records it).
 
 ## Regenerating
 

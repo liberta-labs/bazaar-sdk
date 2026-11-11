@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import { PYTH_PRO } from "@liberta-labs/bazaar-sdk";
-import { ConfigError, enabledJobs, loadConfig, parseConfig, priceEndpoints, resolvedNetwork } from "../src/config/index.js";
+import { ConfigError, PRO_KEY_REQUIRED, enabledJobs, loadConfig, parseConfig, priceEndpoints, resolvedNetwork } from "../src/config/index.js";
 import { Entry, Ledger } from "../src/exec/ledger.js";
 import { Quote, SpendPolicy, maxSpendEthPerDay } from "../src/exec/policy.js";
 import { Keeper } from "../src/keeper/engine.js";
@@ -101,17 +101,68 @@ describe("config", () => {
     expect(() => parseConfig(base({ prices: { endpoint: "pyth", streamUrls: [] } }))).toThrow(/prices\.streamUrls/);
     // The setting that holds the token is named, and where it belongs.
     expect(() => parseConfig(base({ prices: { endpoint: "pyth", apiKey: "made-up-token" } }))).toThrow(
-      "prices: Unrecognized key(s) in object: 'apiKey' (prices.apiKey is not a setting: the Pyth Pro access token goes in prices.token " +
+      "prices: Unrecognized key(s) in object: 'apiKey' (prices.apiKey is not a setting: the Pyth Pro API key goes in prices.token " +
         "(a Pyth Core or Hermes key does not work), and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service)",
     );
-    // The default endpoint has no URLs: the keeper says what to set.
-    const shared = parseConfig({ network: "anvil", factory: FACTORY, rpc: { http: "http://x" } });
-    expect(shared.prices.endpoint).toBe("bazaar");
-    expect(() => priceEndpoints(shared.prices)).toThrow(/^prices\.endpoint: the 'bazaar' price endpoint has no URLs yet; set prices\.endpoint to 'pyth' with your own Pyth Pro token/);
-    expect(() => new Keeper(shared, { loadWallets: false })).toThrow(/^prices\.endpoint: the 'bazaar' price endpoint has no URLs yet/);
-    for (const endpoint of ["hermes", "ftp://p.example", "ws://p.example"]) {
-      expect(() => priceEndpoints(parseConfig(base({ prices: { endpoint } })).prices), endpoint).toThrow(/^prices\.endpoint: expected pyth, bazaar or an http\(s\) URL/);
+    // The default endpoint is Pyth's own, which serves prices only to the holder of a Pyth Pro API key.
+    const bare = { network: "anvil", factory: FACTORY, rpc: { http: "http://x" } };
+    expect(() => parseConfig(bare)).toThrow(`the config is not valid:\n  prices.token: ${PRO_KEY_REQUIRED}`);
+    const keyed = parseConfig({ ...bare, prices: { token: "fake-pyth-pro-key" } });
+    expect(keyed.prices.endpoint).toBe("pyth");
+    expect(priceEndpoints(keyed.prices)).toEqual(PYTH_PRO);
+    // No preset but pyth: anything else must be an http(s) URL.
+    for (const endpoint of ["bazaar", "hermes", "ftp://p.example", "ws://p.example"]) {
+      expect(() => priceEndpoints(parseConfig(base({ prices: { endpoint } })).prices), endpoint).toThrow(/^prices\.endpoint: expected pyth or an http\(s\) URL$/);
     }
+  });
+
+  it("prices: Pyth's own endpoints need a Pyth Pro API key wherever the config names them; a compatible service may run without", () => {
+    const refusal = (prices: Record<string, unknown>) => {
+      try {
+        parseConfig(base({ prices }));
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+      return null;
+    };
+    const why = `the config is not valid:\n  prices.token: ${PRO_KEY_REQUIRED}`;
+    expect(PRO_KEY_REQUIRED).toMatch(/^Pyth's own price endpoints serve prices only to the holder of a Pyth Pro API key: give yours as prices\.token/);
+    // The preset; Pyth's request API as a base URL; a custom request API beside Pyth's default streams;
+    // a custom base URL with one of Pyth's streams.
+    expect(refusal({ endpoint: "pyth" })).toBe(why);
+    expect(refusal({ endpoint: PYTH_PRO.restUrl })).toBe(why);
+    expect(refusal({ endpoint: "pyth", restUrl: "https://proxy.example" })).toBe(why);
+    expect(refusal({ endpoint: "https://proxy.example", streamUrls: [PYTH_PRO.streamUrls[0]] })).toBe(why);
+    // An empty or blank token is none.
+    expect(refusal({ endpoint: "pyth", token: "" })).toBe(why);
+    expect(refusal({ endpoint: "pyth", token: "   " })).toBe(why);
+    // With a token; or with Pyth's symbols registry alone, which needs none; or another service throughout.
+    expect(refusal({ endpoint: "pyth", token: "fake-pyth-pro-key" })).toBeNull();
+    expect(refusal({ endpoint: "pyth", restUrl: "https://proxy.example", streamUrls: ["wss://proxy.example/v1/stream"] })).toBeNull();
+    expect(refusal({ endpoint: "http://127.0.0.1:8787" })).toBeNull();
+    // A config that skipped validation is refused by the keeper in the same words: never the price
+    // client's own InputError.
+    const cfg = parseConfig(base({ state: { dir }, prices: { endpoint: "pyth", token: "fake-pyth-pro-key" } }));
+    let err: unknown;
+    try {
+      void new Keeper({ ...cfg, prices: { ...cfg.prices, token: null } }, { loadWallets: false });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    expect((err as Error).message).toBe(`prices.token: ${PRO_KEY_REQUIRED}`);
+    expect(new Keeper(cfg, { loadWallets: false }).pro.restUrl).toBe(PYTH_PRO.restUrl);
+  });
+
+  it("prices: a file whose key reference fills in empty is told about the key", () => {
+    // ${NAME:-} with the variable unset gives an empty token: refused as a missing key, not as an empty token.
+    const f = join(dir, "k.yaml");
+    writeFileSync(f, `network: anvil\nfactory: '${FACTORY}'\nrpc:\n  http: http://x\nprices:\n  endpoint: pyth\n  token: \${KEEPER_TEST_UNSET_PYTH_KEY:-}\n`);
+    delete process.env.KEEPER_TEST_UNSET_PYTH_KEY;
+    expect(() => loadConfig(f)).toThrow(`the config is not valid:\n  prices.token: ${PRO_KEY_REQUIRED}`);
+    process.env.KEEPER_TEST_UNSET_PYTH_KEY = "fake-pyth-pro-key";
+    expect(loadConfig(f).prices.token).toBe("fake-pyth-pro-key");
   });
 
   it("prices: a Hermes service left over from a Pyth Core setup is refused wherever the token would go", () => {
@@ -153,9 +204,11 @@ describe("config", () => {
     const msg = bad({ endpoint: "pyth", token });
     expect(msg).toBe("prices: the price token (prices.token) holds a line break or another character a request header cannot carry: re-enter it");
     expect(msg).not.toContain("made-up");
-    expect(bad({ endpoint: "pyth", token: "" })).toBe("prices: the price token is empty: set it (prices.token)");
-    expect(bad({ endpoint: "pyth", restUrl: "pyth-lazer.example" })).toBe("prices: the price request URL is not an http(s) or ws(s) URL");
-    expect(bad({ endpoint: "pyth", streamUrls: ["not a url"] })).toBe("prices: a price stream URL is not an http(s) or ws(s) URL");
+    // An empty token for Pyth's own endpoints is refused as a missing key first; for another service the client refuses it.
+    expect(bad({ endpoint: "https://pro.example", token: "" })).toBe("prices: the price token is empty: set it (prices.token)");
+    const key = "fake-pyth-pro-key";
+    expect(bad({ endpoint: "pyth", token: key, restUrl: "pyth-lazer.example" })).toBe("prices: the price request URL is not an http(s) or ws(s) URL");
+    expect(bad({ endpoint: "pyth", token: key, streamUrls: ["not a url"] })).toBe("prices: a price stream URL is not an http(s) or ws(s) URL");
   });
 
   it("prices: a token goes over plain http or ws only to this machine, unless allowInsecure says otherwise", () => {
@@ -202,7 +255,9 @@ describe("config", () => {
       expect(msg).not.toContain("made-up-pass");
       expect(msg).not.toContain("pro.example");
     }
-    expect(refusal({ endpoint: "pyth", symbolsUrl: "http://user:made-up-pass@registry.example" })).toMatch(/^prices: the symbols registry URL holds a user name/);
+    expect(refusal({ endpoint: "pyth", token: "fake-pyth-pro-key", symbolsUrl: "http://user:made-up-pass@registry.example" })).toMatch(
+      /^prices: the symbols registry URL holds a user name/,
+    );
     expect(build({ endpoint: "http://user:made-up-pass@pro.example", allowInsecure: true }).pro.restUrl).toBe("http://user:made-up-pass@pro.example");
     expect(build({ endpoint: "http://user:made-up-pass@127.0.0.1:8787" }).pro.restUrl).toBe("http://user:made-up-pass@127.0.0.1:8787");
   });

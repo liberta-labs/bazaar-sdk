@@ -22,7 +22,7 @@ never returns a raw URL or a stack trace. Use it as the default, and add the cas
 
 | Error | From | Means |
 |---|---|---|
-| `InputError` | Every builder, `buildOrderSpec`, `parseRelayed` | An argument the SDK refused before building or signing anything. `field` names it. |
+| `InputError` | Every builder, `buildOrderSpec`, `parseRelayed`; `ProClient`, `proPriceSource` and `Bazaar.connect` for Pyth's own endpoints without a token | An argument the SDK refused before building or signing anything. `field` names it (`prices.token` for a missing Pyth Pro API key). |
 | `DecodedError` | `Simulation.error`, `CallError.decoded`, `decodeError(data)` | A revert, decoded: the custom error's name, arguments and user message. Not thrown by the SDK itself; a simulation returns it. |
 | `CallError` | `sendCall` (`bz.send`), `buildAndSend`, `waitForReceipt`, `batching.sendCalls` | A send the wallet refused or that reverted, with `decoded` when the revert data came back. |
 | `SigningError` | `signTypedDataV4`, `signPermit`, `signRelayed` | The wallet declined to sign, or returned a signature Bazaar cannot verify (a smart-contract wallet's, a high-s one). |
@@ -32,7 +32,8 @@ never returns a raw URL or a stack trace. Use it as the default, and add the cas
 | `PriceUpdateError` | `trade.parsePriceUpdate`, `livePairPrice` | A price update that is not a Pyth Pro update, or one missing a leg of the market. |
 | `ProError` | The Pyth Pro client, price sources, `livePrices` | Pyth Pro could not be reached or refused the request (`status` holds the HTTP status), sent an update that cannot be read or is not signed by a trusted signer, or has no usable live price for a feed. The message never holds a token, and every URL in it is redacted. |
 | `NoLivePriceError` | `proPriceSource().latest`, `LivePrices.latest` | A `ProError`: the endpoint answered, but has no usable live price for a feed asked for (the message says why). |
-| `NoFreshPriceError` | Builders that need a price (`createOrder`, a withdrawal with exposure, ...) | A `ProError`: no update the oracle would accept is available for a continuously traded market, so the call would revert. `reason` says why; `errorMessage` gives a sentence for users. |
+| `NoFreshPriceError` | Builders that need a price (`createOrder`, a withdrawal with exposure, ...), and `liquidationUpdateFor` on a continuously traded market | A `ProError`: no update the oracle would accept is available for a continuously traded market, so the call would revert. `reason` says why; `errorMessage` gives a sentence for users. |
+| `NoLiquidationPriceError` | `liquidationUpdateFor` | A `ProError`: on a market with trading hours there is no fresh price, and Pyth's latest one is more than a minute old (or the oracle would refuse it), so no liquidation is possible until the market prices again. `pair` and `reason` say which and why. |
 | `LazerError` | `lazer.parseUpdate` and the other codec functions, `feedIdHex`, `proFeedId` | Bytes that are not a valid Pyth Pro update, or a value that is not a Pyth Pro feed ID. |
 | `RpcError`, `HttpError`, `SendError` | The JSON-RPC client | The node's error, an HTTP failure, or a send whose outcome is unknown. See [Low-Level Building Blocks](low-level.md). |
 
@@ -44,13 +45,15 @@ never returns a raw URL or a stack trace. Use it as the default, and add the cas
 2. An `InputError`: its `message` (which starts with the field: `"amount: The minimum deposit is 5 USDC."`).
 3. A `NoFreshPriceError`: "No fresh price is available for this market right now, and this action
    needs one. Try again in a moment."
-4. An error carrying a `decoded` `DecodedError` (a `CallError`): that error's message.
-5. A wallet-side failure (`walletErrorMessage`, below).
-6. An RPC error carrying revert data: the decoded revert's message; with empty revert data, "The call
+4. A `NoLiquidationPriceError`: "This market has no price that can decide a liquidation right now.
+   Liquidations wait for its next price."
+5. An error carrying a `decoded` `DecodedError` (a `CallError`): that error's message.
+6. A wallet-side failure (`walletErrorMessage`, below).
+7. An RPC error carrying revert data: the decoded revert's message; with empty revert data, "The call
    reverted without a reason (often out of gas)."
-7. Anything else: "Something went wrong. Please try again."
+8. Anything else: "Something went wrong. Please try again."
 
-Step 7 catches more than it should: a `SigningError` or `ClockSkewError` (including "You declined the
+Step 8 catches more than it should: a `SigningError` or `ClockSkewError` (including "You declined the
 signature."), a `ConnectError`, and a `CallError` without decoded data (a reverted receipt, a timeout)
 all come out as the generic sentence, although each carries a good message of its own. Handle them
 before calling `errorMessage`, as the handler below does.
@@ -156,9 +159,9 @@ update automatically or to connect through another RPC.
 
 A few reverts come from contracts outside the five ABIs:
 
-- **Pyth's `StalePrice()`** (`Unknown(0x19abf40e)`): a direct call's price update aged past the 3-second
-  window before the transaction landed. The most common failure of a slow direct send. Rebuild the call
-  and send it again ([Sending Transactions](sending.md#the-3-second-price-window)).
+- **Pyth's verifier** (`Error`): a plain reason string, such as `invalid signature` or
+  `Insufficient fee provided`. The ones listed under [Decoded Reverts](#decoded-reverts) get a sentence
+  from `REASON_MESSAGES`; any other is shown as the string itself.
 - **USDC's `require` messages** (`Error`): "ERC20: transfer amount exceeds allowance" or "... balance".
   Check funding first with `usdcFunding` ([Collateral](collateral.md#checking-balance-and-allowance)).
 - **The example trading account's** `BazaarTradingAccount__NotOwner` (an `Unknown(...)` selector): the

@@ -20,7 +20,7 @@ browsers). Install it as in [Setting Up a Keeper](setup.md#1-install); the sampl
 |---|---|
 | `loadConfig(path?)` | reads the YAML file (default `bazaar-keeper.yaml`), the `.env` beside it and the environment, applies the [secrets rules](wallets.md#the-secrets-rules), fills `${NAME}` references and validates. Throws `ConfigError` |
 | `parseConfig(object)` | validates an object against the same schema, with the same defaults. Throws `ConfigError` |
-| `Keeper.create(cfg, { loadWallets? })` | builds the keeper and loads its wallets (a keystore may prompt for its password when stdin is a terminal). `loadWallets: false` makes a watch-only keeper. Throws `ConfigError` for a config it cannot run with (`rpc.send: sequencer` on a network without one, `prices.endpoint: bazaar`), `WalletError` for a wallet it cannot load |
+| `Keeper.create(cfg, { loadWallets? })` | builds the keeper and loads its wallets (a keystore may prompt for its password when stdin is a terminal). `loadWallets: false` makes a watch-only keeper. Throws `ConfigError` for a config it cannot run with (`rpc.send: sequencer` on a network without one, a `prices.endpoint` that is neither `pyth` nor a URL, Pyth's own endpoints without `prices.token`), `WalletError` for a wallet it cannot load |
 | `setupLogging(level, format, write?)` | configures the keeper's log output: `level` `debug`/`info`/`warning`/`error`, `format` `pretty`/`json`, lines to stdout or to `write`. Until it is called, warnings and errors go to stderr as bare messages and the rest is dropped |
 
 `ConfigError` and `WalletError` messages are written for the person fixing the problem and never

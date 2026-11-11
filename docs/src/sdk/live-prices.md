@@ -27,7 +27,7 @@ every market shows a price at once; `ready` settles when that request has answer
 the stream fails three times in a row, it polls for a minute, then tries the stream again.
 
 The stream runs over a WebSocket. Browsers and Node 22 and later have one; on Node 20 give the client
-a constructor (`new ProClient({ WebSocket })`, with the `ws` package's, say).
+a constructor (`new ProClient({ token, WebSocket })`, with the `ws` package's, say).
 
 Everything a render needs is read from memory:
 
@@ -186,7 +186,7 @@ little (custom freshness margins).
 | `new PriceService(source, options?)` | `source` is a `ProClient` or any `PriceSource` (`latest` and `stream`). Options as in the table above, plus `sendMargin` (default 1). The default `maxFutureSkew` here is 5 seconds. |
 | `watchMarkets(markets)`, `watchSets(sets)`, `watch(feeds)` | Watch each market's legs (or each set) as one subscription, or each feed on its own; the stream resubscribes at once. ETH/USD is always watched (the keeper prices gas with it). |
 | `run()` | Follow the stream (or poll) until `stop()`, through any failure: three in a row mark it unhealthy and switch to polling for a minute. Never rejects. |
-| `fetch(feeds?)` | One request for the latest prints, outside the loop. |
+| `fetch(feeds?)` | The latest prints, outside the loop: one request per 255 feeds, and a request the endpoint refuses (HTTP 403) asked again in parts, so a feed the token does not cover fails only the markets on it. |
 | `ingest(prints)` | Take in prints from anywhere. |
 | `onPrints(listener)` | Called after each batch with the feeds that got a newly generated price; returns the remover. |
 | `nextPrints()` | Waits for the next newly generated price (one consumer only). |
@@ -195,6 +195,8 @@ little (custom freshness margins).
 | `closed(market, now?, after?)` | No price generated for `after` seconds (default 15) while the service is healthy. |
 | `updateFor(market)` | The signed update a call on the market attaches: the one update that carries its legs. |
 | `printsFor(feeds)` | The prints a call reading these feeds together would attach. |
+| `latestFor(market)` | The prints of the most recently issued update the service holds for the market's legs, however old their prices (each print's `timestampUs` is when its update was issued), or `null`. |
+| `liquidationUpdate(market, now?, margin?)` | What a liquidation on the market attaches now: a fresh price's update (`kind: "fresh"`), else on a market with trading hours Pyth's latest one when it was issued within `3 − margin` seconds of `now` and its price at most 57 seconds before that (`kind: "latest"`), else nothing (`kind: null`) and `reason`. See [Low-Level Building Blocks](low-level.md#priceservice). |
 | `ethUsd(now?)` | USD per ETH from the newest ETH/USD print, or `null` when stale or out of bounds. |
 | `missing()` | Watched feeds with no print yet. |
 | `healthy`, `lastError`, `lastUpdate`, `latest` | State, readable. |
@@ -215,6 +217,7 @@ The per-market methods take the SDK's `Market` model: `marketFromStatic(info)` m
 | `ProError`: `this runtime has no WebSocket ...` | Node before 22: give the client a WebSocket constructor. |
 | `price()` stays `null` | A feed has no print: Pyth has no usable price for it (a warning names the feed), or `ready` has not settled. |
 | Warning: `price endpoint sent no print for feed 0x...` | The feed ID is wrong, the token does not cover the feed, the feed is not served on the channel, or Pyth has no price or no confidence for it. Other feeds are unaffected. |
+| Warning: `price endpoint refused feed N while serving the others: left out of its requests for 5 min (...)` | Pyth's request API refuses a whole request that names a feed it does not know or the token does not cover. The service asked again in parts and leaves that feed out of its requests for 5 minutes; markets on it get no price meanwhile, and the others are unaffected. |
 | Warning: `price stream refused the subscription for feed(s) ...` | What Pyth answered to a subscription, passed on once. |
 | Warning: `price stream endpoint ... dropped (...): reconnecting` | One endpoint went away; the others keep delivering. |
 | Warning: `ignored a print for feed 0x... dated N s ahead of the clock` | This device's clock is behind, or the endpoint is wrong. |

@@ -428,7 +428,7 @@ per-market prices and updates from them. It is what the keeper runs; frontends u
 | `watchMarkets(markets)`, `watchSets(sets)`, `watch(feeds)` | Watch each market's legs (or each set) as one subscription, or each feed on its own. ETH/USD (`ETH_USD_FEED`, Pyth Pro feed 2) is always watched, for gas. A new set restarts the stream. |
 | `run()` | Follow the stream (or poll) until `stop()`, through any failure: three in a row mark the service unhealthy and switch a streaming service to polling for a minute. Never rejects. |
 | `stop()` | End `run` at once and release `nextPrints`. |
-| `fetch(feeds?)` | One request for the latest prints, outside the loop. |
+| `fetch(feeds?)` | The latest prints, outside the loop: one request per 255 feeds, and a request the endpoint refuses (HTTP 403) asked again in parts, so a feed the token does not cover fails only the markets on it. |
 | `ingest(prints)` | Take in prints from a source of your own. |
 | `onPrints(listener)` | Call `listener(feeds)` after each batch that brings a newly generated price; returns the function that removes it. |
 | `nextPrints()` | Wait for newly generated prices and return their feeds; for one consumer. |
@@ -438,13 +438,43 @@ per-market prices and updates from them. It is what the keeper runs; frontends u
 | `legs(market)` | The prints the market prices from, or null. |
 | `updateFor(market)` | The signed update a call on the market attaches: the one update that carries exactly its legs (one per leg only while its own subscription has delivered none or lags). |
 | `printsFor(feeds)` | The prints a call reading these feeds together would attach. |
+| `latestFor(market)` | The prints of the most recently issued update the service holds for the market's legs, however old their prices: the market's own update, unless another carrying one of its legs was issued a second or more later. Each print's `timestampUs` is when its update was issued, `generatedUs` when its price was generated. |
+| `liquidationUpdate(market, now?, margin?)` | What a liquidation on the market attaches now, as a `LiquidationUpdate` (below). |
 | `ethUsd(now?)` | USD per ETH for pricing gas, or null when missing, too old or out of bounds. |
 | `missing()` | Watched feeds without a print yet. |
 | `latest`, `healthy`, `lastError`, `lastUpdate` | The prints by feed, and the endpoint's health. |
 
 A print is newer when its price was *generated* later (`generatedUs`), several times a second on a
 fast channel. An update that only carries the same price forward under a later timestamp, as Pyth
-sends for a quiet feed, changes nothing, and its price stays as old as when it was generated.
+sends for a quiet feed, changes nothing, and its price stays as old as when it was generated. The
+service still keeps it as the feed's most recently issued update (`latestFor`), which is what a
+liquidation on a closed market carries. A print whose price or update is dated more than
+`maxFutureSkew` seconds ahead of the clock is ignored, so it can hold neither.
+
+**Liquidations.** A liquidation without an update runs only on a stored price at most 3 seconds old. On
+a market with trading hours it reads an attached update as Pyth's latest price instead
+(`BazaarOracle.verifyAndFetchLatestPrice`): every update must have been issued within 3 seconds of the
+block, and each leg's price generated at most a minute (`MAX_LIQUIDATION_PRICE_AGE`, 60 s) before it.
+An update carries each feed's most recent price as of when it was issued, so one issued that close to
+the block proves no newer price existed. `liquidationUpdate(market, now?, margin?)` returns:
+
+| `kind` | When | `update` | `priceTime` |
+|---|---|---|---|
+| `"fresh"` | `fresh(market, now, margin)`, and on a market with trading hours every update issued within `3 − margin` seconds of `now` | `updateFor(market)` | The older leg's generation second. |
+| `"latest"` | A market with trading hours whose `latestFor` updates were all issued within `3 − margin` seconds of `now` and pass `readLatestPrice` | Those updates | The earliest update's issue second. |
+| `null` | Anything else; `reason` says why | `[]` | `null` |
+
+The result also has `price` (the `PairPrice` the oracle reads from the update; the pair stores it when
+it is newer than its own) and `generated` (each leg's generation second). The call must land within
+3 seconds of `priceTime`: check it again just before signing. `readLatestPrice(update, legs,
+invertQuote)` is the reading itself, without a clock: updates issued no more than 3 seconds apart, each
+leg from the update holding its most
+recently generated price, a usable live price, generated no more than `MAX_LATEST_PRICE_LAG` (57)
+seconds before the earliest update was issued and no later than the newest was, inside the 2%
+confidence cap (a wider latest price is refused, never passed over for an older one). It returns a
+`LatestPrice` (`update`, `issuedAt`, `generated`, `price`) or `{ problem }`. With `kind` null, a call
+without an update runs only while the pair stored a price within the last 3 seconds, which the
+service cannot see.
 
 ```ts
 {{#include ../../examples/advanced/low-level-prices.ts:service}}

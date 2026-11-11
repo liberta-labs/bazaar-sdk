@@ -134,23 +134,23 @@ describe("connect", () => {
   it("has the price source check signers against the deployment's verifier", async () => {
     const good = await signed({ at: 100, feeds: [{ id: 1 }] });
     const { fetch } = fakeFetch(() => json(evm(good)));
-    const prices = proPriceSource({ fetch });
+    const prices = proPriceSource({ token: "fake-pyth-pro-key", fetch });
     const ctx = await connect({ transport: deployment(new Set([SIGNER])), factory: ADDR.factory, prices });
     expect(ctx.oracle).toBe(ADDR.oracle);
     expect(prices.client.isTrustedSigner).not.toBeNull();
     expect((await prices.latest([fid(1)])).update).toEqual([good]);
     // the same update against a verifier that does not trust its signer never becomes a price
-    const prices2 = proPriceSource({ fetch });
+    const prices2 = proPriceSource({ token: "fake-pyth-pro-key", fetch });
     await connect({ transport: deployment(new Set()), factory: ADDR.factory, prices: prices2 });
     await expect(prices2.latest([fid(1)])).rejects.toThrow(`a price update is signed by ${SIGNER}, which is not a signer Pyth's verifier trusts: refusing it`);
   });
 
   it("leaves the source alone when told to, when it has a check of its own, and when it cannot check", async () => {
-    const off = proPriceSource({ fetch: fakeFetch(() => json({})).fetch });
+    const off = proPriceSource({ token: "fake-pyth-pro-key", fetch: fakeFetch(() => json({})).fetch });
     await connect({ transport: deployment(new Set()), factory: ADDR.factory, prices: off, checkSigners: false });
     expect(off.client.isTrustedSigner).toBeNull();
     const own: SignerCheck = () => true;
-    const mine = proPriceSource(new ProClient({ isTrustedSigner: own }));
+    const mine = proPriceSource(new ProClient({ token: "fake-pyth-pro-key", isTrustedSigner: own }));
     await connect({ transport: deployment(new Set()), factory: ADDR.factory, prices: mine });
     expect(mine.client.isTrustedSigner).toBe(own);
     const plain: PriceUpdateSource = { latest: async () => ({ update: [], publishTime: 0 }) };

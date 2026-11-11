@@ -54,7 +54,10 @@ export {
 export {
   ETH_USD_BOUNDS,
   ETH_USD_MAX_AGE,
+  type LatestPrice,
+  type LiquidationUpdate,
   MAX_FUTURE_SKEW,
+  MAX_LATEST_PRICE_LAG,
   type PriceLogger,
   PriceService,
   type PriceServiceOptions,
@@ -65,4 +68,5 @@ export {
   fetchFeedInfo,
   fetchSymbols,
   marketLabel,
+  readLatestPrice,
 } from "./service.js";

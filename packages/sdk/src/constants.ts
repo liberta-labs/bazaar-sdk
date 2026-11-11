@@ -39,7 +39,12 @@ export const ADL_MAX_SCORE = 25n * BAZAAR_SCALE;
 export const ADL_TERMINATION_GRACE = 1_800;
 
 // ---- BazaarPair ----
-export const MAX_LIQUIDATION_PRICE_AGE = 600;
+/**
+ * Seconds before the block a liquidation's price may have been generated: Pyth's latest price, proven
+ * by an update issued within MAX_PRICE_STALENESS of the block, on a market with trading hours. A
+ * liquidation without an update needs a stored price no older than MAX_PRICE_STALENESS.
+ */
+export const MAX_LIQUIDATION_PRICE_AGE = 60;
 
 // ---- VaultHealthLib / AdlLib ----
 export const ADL_TIMEOUT_DURATION = 86_400;

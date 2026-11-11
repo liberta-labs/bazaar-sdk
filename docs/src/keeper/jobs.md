@@ -48,19 +48,21 @@ within the pair's cap. The oracle's fee for the update is sent as the call's ETH
 its cost).
 
 Nothing on chain holds a price but the pair itself. An update a call carries is verified and must be
-fresh: one that is stale or that Pyth's verifier refuses reverts the call, so the keeper never
-attaches one it would not send. A call without an update runs on the pair's stored price while that
-is at most 3 s old.
+fresh (a liquidation's, on a market with trading hours, issued within 3 s of the block: see
+[Liquidation](#liquidation)): one that is stale or that Pyth's verifier refuses reverts the call, so the
+keeper never attaches one it would not send. A call without an update runs on the pair's stored price
+while that is at most 3 s old.
 
 Planning, the simulation and the wallet's queue all take time, so the price a call relies on (the
-print's, or the stored price it is judged at) is checked once more just before the call is signed,
-against the chain's time: one older than the pair's 3 s limit less `prices.sendMarginSeconds` is not
-sent. Nothing refused the candidate, so it does not cool down: the next print plans it again.
+print's, the stored price it is judged at, or the issue time of the latest update a liquidation
+carries) is checked once more just before the call is signed, against the chain's time: one older than
+the pair's 3 s limit less `prices.sendMarginSeconds` is not sent. Nothing refused the candidate, so it
+does not cool down: the next print or tick plans it again.
 
 A market with trading hours gets no fresh print while its venue is closed: Pyth's updates keep
 arriving, but they carry the last price forward, and a price is as old as when it was generated. So
-only the jobs that work without a fresh print still act there: liquidation (judging by the stored
-price), sweepExpired, terminal settlement and collect.
+only the jobs that work without a fresh print still act there: liquidation (on Pyth's latest price,
+for a minute after the last one, [below](#liquidation)), sweepExpired, terminal settlement and collect.
 
 A print without a confidence is never attached. The oracle reads a zero confidence as a missing one
 and reverts the call, so a market whose feed reports none is planned as one without a fresh print,
@@ -70,7 +72,10 @@ and no confidence is made up for it.
 
 A pair stores the price a call carries only when that price was generated in a later second than the
 price it holds (for a composite, when its older leg was). Otherwise it judges the call at the price it
-holds: within one second, the first price stored stands.
+holds: within one second, the first price stored stands. One call differs: a liquidation carrying an
+update on a market with trading hours is judged at that update's price in the stored price's own second
+too, storing nothing, and at the stored price only when that is strictly newer
+([Liquidation](#liquidation)).
 
 The planners judge the same way. While a market's stored price is from the print's second or a later
 one, liquidation, triggers and ADL judge at the stored price:
@@ -79,11 +84,11 @@ one, liquidation, triggers and ADL judge at the stored price:
   simulation and no cooldown spent on it;
 - a candidate that crosses at the stored price is planned even though the print has moved back.
 
-Such a call carries no update. The chain's stored price is at least as new as the one the keeper
-read, and it never goes back, so the pair could never store that print: attaching it would only cost
-its fee, and revert the call once the print aged past the pair's limit, where the call without it
-still runs on the stored price. No refresh bounty is planned in that second, since the pair would
-store nothing.
+Such a call carries no update, a liquidation's included, so the pair judges it at the stored price on
+any market. The chain's stored price is at least as new as the one the keeper read, and it never goes
+back, so the pair could never store that print: attaching it would only cost its fee, and revert the
+call once the print aged past the pair's limit, where the call without it still runs on the stored
+price. No refresh bounty is planned in that second, since the pair would store nothing.
 
 ## Liquidation
 
@@ -116,9 +121,28 @@ capital. Batching earns the same as splitting, for less gas. The probe measures 
 
 **Edge cases**
 
-- **Closed sessions.** With no fresh print, a market with trading hours is judged at its stored price
-  if that price is less than 9.5 minutes old (the pair accepts one up to 10 minutes old), and the call
-  carries no update. Older than that, nothing is planned until the market reopens.
+- **Closed sessions.** A liquidation that carries no update is judged at the stored price only while
+  that is at most 3 s old, and reverts past it. With no fresh print, a liquidation on a market with
+  trading hours carries Pyth's latest update instead: the pair accepts it when every update was issued
+  within 3 s of the block, its price was generated at most a minute (`MAX_LIQUIDATION_PRICE_AGE`)
+  before the block, and its confidence is within the cap (a wider one reverts), and judges the call at
+  that price, or at its own stored price when that is strictly newer (in the stored price's own
+  second, at the update's price). The keeper attaches the newest update its price source holds while
+  it was issued within the pair's 3 s window less `prices.sendMarginSeconds` and its price was
+  generated at most 57 s before it (the SDK's `PriceService.liquidationUpdate`), and checks the issue
+  time again just before signing. Such updates come every interval on a fixed-rate `prices.channel`
+  (the default is one: [Configuration](configuration.md#prices)). With no such update, a call without
+  one is planned only while the pair's stored price is itself within that window; otherwise nothing is
+  planned until the market prices again, and the reason is logged at debug level (`no price can
+  decide a liquidation now (…)`, at most once a minute per market).
+- **Updates issued off the clock.** On a market with trading hours the pair holds every update a
+  liquidation carries to having been issued within 3 s of the block, a fresh print's included. So a
+  fresh print is attached there only while each update carrying it was issued within the window less
+  `prices.sendMarginSeconds` of the chain's clock; one issued further off (an endpoint or a clock
+  running ahead) is passed over as if the market had no fresh print.
+- **24/7 markets** are liquidated only at a fresh print, or without an update while the stored price
+  is within the same window. Their oracle judges a fresh print by when its price was generated, not
+  by when its update was issued.
 - A refused account cools for `engine.simCooldownSeconds` (2 s).
 
 ## Triggers
@@ -213,7 +237,7 @@ explains the auction.
 **Calls** `refreshPrice(priceUpdate)`. **Is paid** $0.10 by the insurance fund.
 
 **Why it matters beyond the bounty.** A pair whose stored price is more than 21 days old can be ended
-by anyone at that price ([`terminate-stale`](manual-operations.md#terminatestalepair)), and one refresh
+by anyone at that price ([`terminate-stale`](manual-operations.md#the-manual-operations)), and one refresh
 with a fresh update restarts the count. On a quiet market this job is what keeps a pair on a live feed
 out of reach. Where no bounty pays (a fund with $1,000 or less of free capital) the job plans nothing;
 `bazaar keeper run refresh-price --market … --force` sends one refresh regardless of the profit rule.

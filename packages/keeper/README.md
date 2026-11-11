@@ -64,9 +64,10 @@ readable line; add `--debug` for the full trace. URLs and keys are masked in eve
   one, the first start replays every Bazaar log from the factory's deployment block (`startBlock`);
   left out, the keeper finds that block itself with about 30 historical `eth_getCode` reads, which
   needs an RPC that keeps historical state (hosted providers do). Later starts tail from the snapshot.
-- **Prices.** Pyth Pro. `prices.endpoint` is `pyth` (with your own Pyth Pro access token in
-  `prices.token`), the URL of a Pyth Pro compatible service (`bazaar mock-prices` on a local chain,
-  a proxy), or `bazaar` once Bazaar's shared endpoint exists; `prices.streamUrls`, `prices.restUrl` and
+- **Prices.** Pyth Pro. `prices.endpoint` is `pyth`, the default (with your Pyth Pro API key in
+  `prices.token`: Pyth's own endpoints serve no one without one, so a config that names them without
+  it does not load), or the URL of a Pyth Pro compatible service (`bazaar mock-prices` on a local chain,
+  a proxy); `prices.streamUrls`, `prices.restUrl` and
   `prices.symbolsUrl` replace one place each. The keeper streams `prices.channel`
   (`fixed_rate@200ms` by default) with one subscription per market, and uses only updates signed by a
   signer the deployment's Pyth verifier trusts (`prices.checkSigners`). A stream that brings no new

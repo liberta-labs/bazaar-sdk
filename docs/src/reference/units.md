@@ -144,7 +144,8 @@ Mostly the keeper's concern, exported for completeness:
 |---|---|---|
 | `LIQUIDATION_FEE_EBP` | `200n` | 2 bp. |
 | `MIN_LIQUIDATOR_REWARD` | `BAZAAR_SCALE / 20n` | $0.05. |
-| `MAX_LIQUIDATION_PRICE_AGE` | `600` | Seconds a stored price may be old and still seize collateral. |
+| `MAX_LIQUIDATION_PRICE_AGE` | `60` | Seconds before the block a liquidation's price may have been generated: Pyth's latest price, on a market with trading hours. A call without an update needs a stored price at most 3 s old. |
+| `MAX_LATEST_PRICE_LAG` | `57` | The same less the 3 s an update's issue may precede the block: the most seconds before its update was issued that a liquidation's price may have been generated. |
 | `UNLOAD_BOUNTY_MIN` | `BAZAAR_SCALE / 4n` | $0.25. |
 | `UNLOAD_BOUNTY_MIN_NOTIONAL` | `1_250n * BAZAAR_SCALE` | $1,250. |
 | `UNLOAD_FLOOR_DECAY` | `180` | Seconds. |

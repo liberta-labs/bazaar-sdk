@@ -58,7 +58,10 @@ export interface ProEndpoints {
   readonly symbolsUrl: string;
 }
 
-/** Pyth's own Pyth Pro endpoints. */
+/**
+ * Pyth's own Pyth Pro endpoints. Their request API and stream serve prices only to the holder of a Pyth
+ * Pro API key: a client for them must present the key or a token minted from it.
+ */
 export const PYTH_PRO: ProEndpoints = {
   streamUrls: [
     "wss://pyth-lazer-0.dourolabs.app/v1/stream",
@@ -72,11 +75,23 @@ export const PYTH_PRO: ProEndpoints = {
 /** Where a Pyth Pro API key is exchanged for a short-lived token (`POST`, the key as the bearer). */
 export const PYTH_PRO_TOKEN_URL = "https://pyth.dourolabs.app/auth/token";
 
+/** The hosts of Pyth's own request API and stream endpoints ({@link PYTH_PRO}). */
+const PYTH_PRO_PRICE_HOSTS: ReadonlySet<string> = new Set([PYTH_PRO.restUrl, ...PYTH_PRO.streamUrls].map((u) => new URL(u).hostname));
+
 /**
- * `prices.endpoint` shortcuts. "bazaar" is the shared endpoint Bazaar intends to run; it has no URLs
- * until that service exists.
+ * Whether `url` is one of Pyth's own price endpoints: its host is that of {@link PYTH_PRO}'s request API
+ * or of one of its stream endpoints. The symbols registry, which needs no key, is not one.
  */
-export const PRICE_ENDPOINTS: Readonly<Record<string, ProEndpoints | null>> = {
+export function isPythProPriceEndpoint(url: string): boolean {
+  try {
+    // A host written with a trailing dot (an absolute domain name) is the same host.
+    return PYTH_PRO_PRICE_HOSTS.has(new URL(url.trim()).hostname.toLowerCase().replace(/\.+$/, ""));
+  } catch {
+    return false;
+  }
+}
+
+/** `prices.endpoint` shortcuts: `pyth` is Pyth's own endpoints, which need a Pyth Pro API key. */
+export const PRICE_ENDPOINTS: Readonly<Record<string, ProEndpoints>> = {
   pyth: PYTH_PRO,
-  bazaar: null,
 };

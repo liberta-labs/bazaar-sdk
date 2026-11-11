@@ -109,7 +109,9 @@ describe("user messages", () => {
     const feed = ("0x" + "00".repeat(31) + "01") as Hex;
     const stale = decodeError(revertData("BazaarOracle__StalePrice", [feed, 1_700_000_000n]));
     // the decoder does not know the chain's time, so the generation time is given as it is, not relative to this machine's clock
-    expect(stale.message).toMatch(/^The price in this transaction was generated at 2023-11-14 22:13:20 UTC, more than 3 seconds from the block's time when it ran\./);
+    expect(stale.message).toMatch(
+      /^The price in this transaction was generated at 2023-11-14 22:13:20 UTC, too far from the block's time when it ran: more than 3 seconds, or, for a liquidation on a market with trading hours, more than a minute before it\./,
+    );
     expect(stale.hint).toBe(KEEPER_HINTS["BazaarOracle__StalePrice"]);
     expect(decodeError(revertData("BazaarOracle__FeeMismatch", [1n, 2n * 10n ** 14n])).message).toContain("must equal Pyth's fee (0.0002 ETH)");
     expect(decodeError(revertData("BazaarOracle__SampleTooLate", [feed, 1_700_000_600n, 1_700_000_000n])).message).toMatch(/is for 2023-11-14 22:23 UTC .*after the latest time this settlement accepts \(2023-11-14 22:13 UTC/);
@@ -126,6 +128,26 @@ describe("user messages", () => {
       expect(KEEPER_HINTS[gone], gone).toBeUndefined();
     }
     expect(KEEPER_HINTS["BazaarPair__NoPriceUpdatesProvided"]).toMatch(/the pair's own stored price is more than 3 seconds old/);
+  });
+
+  it("explains an update issued too far from the block, and a liquidation the stored price cannot decide", () => {
+    // the issue time is given in microseconds, and shown as the second it falls in
+    const issued = decodeError(revertData("BazaarOracle__StaleUpdate", [1_700_000_000_250_000n]));
+    expect(issued.message).toBe(
+      "The price update in this transaction was issued at 2023-11-14 22:13:20 UTC, more than 3 seconds from the block's time when it ran. Fetch Pyth's latest update and send again right away.",
+    );
+    expect(issued.hint).toBe(
+      "A price update was issued more than 3 seconds from the block's time: a liquidation on a market with trading hours judges when each update it carries was issued, not only when its price was generated. Fetch Pyth's latest update and resend.",
+    );
+    const old = decodeError(revertData("BazaarPair__LiquidationPriceTooOld"));
+    expect(old.message).toBe(
+      "This market's stored price is more than 3 seconds old, so a liquidation must bring Pyth's latest price update. Attach it and send again. A price more than a minute old cannot liquidate anyone: on a closed market, liquidations wait for its next price.",
+    );
+    expect(old.hint).toBe(
+      "The liquidation brought no price update and the pair's stored price is more than 3 seconds old, which never decides a liquidation. Attach Pyth's latest update (issued within 3 s of the block); its price may be at most a minute old, so with none that recent the market's positions wait for its next price.",
+    );
+    // a liquidation reads Pyth's latest price up to a minute old, which the stale-price hint says too
+    expect(KEEPER_HINTS["BazaarOracle__StalePrice"]).toMatch(/for a liquidation on a market with trading hours, which reads Pyth's latest price, more than a minute before it or 3 seconds after it/);
   });
 
   it("explains the reason strings Pyth's verifier reverts with", () => {

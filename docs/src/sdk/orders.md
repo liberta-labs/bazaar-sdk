@@ -375,7 +375,7 @@ and the bounty the user signs.
 | `MatchingEngineLib__FillOrKillUnfilled` | A FOK order could not fill completely; nothing happened. |
 | `MatchingEngineLib__BlockedOracleStale` | A Market order on a market whose venue is closed. Use a Limit order. |
 | `BazaarPair__TradingHalted` | ADL, the settlement window or termination: nothing trades. |
-| `Unknown(0x19abf40e)` | Pyth's `StalePrice`: the price update aged past 3 seconds before landing. Rebuild and send again. |
+| `BazaarOracle__StalePrice` | The price update aged past 3 seconds before landing. Rebuild and send again. |
 | An order that was placed but shows canceled | An auto-cancel: post-only, self-match, margin, walk budget or dust. The `OrderUpdated` event's `cancelReason` says which ([Live Updates](live-updates.md)). |
 
 [Errors & Messages](errors.md) explains how to show all of these.

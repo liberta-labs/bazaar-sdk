@@ -113,7 +113,8 @@ async function latestUpdate(source: Pick<PriceSource, "latest">, ids: readonly H
  * - `useSignerCheck(check)`: the client then refuses updates whose signer `check` does not accept,
  *   unless the client was given its own check.
  *
- * Pass a {@link ProClient} instead of options to share one with a {@link LivePrices}.
+ * Pass a {@link ProClient} instead of options to share one with a {@link LivePrices}. Options for
+ * Pyth's own endpoints without a token throw an InputError on `prices.token`, as the ProClient does.
  */
 export function proPriceSource(source: ProClient | ProClientOptions = {}): ProPriceSource {
   const client = source instanceof ProClient ? source : new ProClient(source);

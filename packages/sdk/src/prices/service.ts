@@ -1,10 +1,10 @@
 /** Live prints for every watched feed, and per-market prices and update payloads built from them. */
 
 import type { Hex } from "viem";
-import { ETH_USD_FEED, MAX_PRICE_STALENESS } from "../constants.js";
-import { type PairPrice, pairPrice } from "../formulas/index.js";
+import { ETH_USD_FEED, MAX_LIQUIDATION_PRICE_AGE, MAX_PRICE_STALENESS } from "../constants.js";
+import { type Leg, type PairPrice, pairPrice } from "../formulas/index.js";
 import type { Market } from "../models.js";
-import { type LegEntry, MAX_FEEDS_PER_UPDATE, MICROS_PER_SECOND, legEntries } from "./lazer.js";
+import { type LegEntry, MAX_FEEDS_PER_UPDATE, MICROS_PER_SECOND, isRawFeedId, legEntries, proFeedId, readUpdate } from "./lazer.js";
 import { type Print, type ProClient, ProError, type ProSymbol, STREAM_IDLE_TIMEOUT, type StreamOptions, monotonic, whyNotLive } from "./pro.js";
 
 /** 'Crypto.BTC/USD' -> 'BTC/USD', 'Equity.US.AAPL/USD' -> 'AAPL/USD'. */
@@ -94,6 +94,13 @@ const MAX_NOTICES = 256;
  * stream that keeps ending as soon as it starts is retried after a growing delay, not at once.
  */
 const MIN_HEALTHY_STREAM = 10;
+/**
+ * Seconds a feed the request API refused, while it served the other feeds of the same poll, is left
+ * out of the requests that poll it before it is asked for again.
+ */
+const REFUSED_RETRY = 300;
+/** How many parts of a refused request are asked for at once. */
+const SPLIT_BATCH = 8;
 
 const short = (f: Hex) => `${f.slice(0, 10)}…`;
 
@@ -185,6 +192,130 @@ function inRequests(ids: readonly Hex[], sets: Iterable<readonly Hex[]>): Hex[][
   return out;
 }
 
+/** A feed for a message: a raw Pyth Pro id as its number, anything else as its short hex. */
+const feedText = (f: Hex) => (isRawFeedId(f) ? String(proFeedId(f)) : short(f));
+
+/**
+ * Seconds for a message: rounded up to the millisecond, so a time past a limit never prints as the
+ * limit itself, without trailing zeros.
+ */
+const secs = (x: number) => String(Number((Math.ceil(x * 1000 - 1e-6) / 1000).toFixed(3)));
+
+/**
+ * The most seconds a liquidation's price may have been generated before the earliest update carrying
+ * it was issued: the age the pair accepts for that price at the block (MAX_LIQUIDATION_PRICE_AGE) less
+ * the 3 s the block may follow the update's issue (MAX_PRICE_STALENESS). A price within it is never too
+ * old in a block the updates' own issue times admit.
+ */
+export const MAX_LATEST_PRICE_LAG = MAX_LIQUIDATION_PRICE_AGE - MAX_PRICE_STALENESS;
+
+/**
+ * Pyth's latest price for a market's legs, as BazaarOracle.verifyAndFetchLatestPrice reads it out of the
+ * updates that carry it: what a liquidation on a market with trading hours is judged at when no fresh
+ * price exists.
+ */
+export interface LatestPrice {
+  /** The signed updates a call attaches, in order: normally one, carrying every leg. */
+  readonly update: Hex[];
+  /**
+   * The second the earliest of the updates was issued in (its own timestamp, in whole seconds). The
+   * oracle refuses the call unless every update was issued within 3 s of the block's time, either way.
+   * The updates were issued no more than 3 s apart, so a call landing from this second to 3 s after it
+   * meets that for each of them.
+   */
+  readonly issuedAt: number;
+  /** The second each leg's price was generated in, in the legs' order (base first for a composite). */
+  readonly generated: readonly number[];
+  /**
+   * The price the oracle composes from the legs. Its `publishTime`, the older leg's generation second,
+   * is what the pair stores the price under when it is newer than the one it holds.
+   */
+  readonly price: PairPrice;
+}
+
+/**
+ * Pyth's latest price for `legs` (raw feed ids, base first) as BazaarOracle.verifyAndFetchLatestPrice
+ * reads it out of `update`, or why the oracle would refuse it in any block. Each leg is read from the
+ * update holding its most recently generated price (lazer.ts `legEntries`) and needs a usable live
+ * price (prices/pro.ts `whyNotLive`), and the composed price must clear the 2% confidence cap: a wider
+ * latest price is refused, never passed over for an older one.
+ *
+ * No block time is known here, so the updates are held to having been issued no more than 3 s apart,
+ * and each leg's price to having been generated no more than {@link MAX_LATEST_PRICE_LAG} seconds
+ * before the earliest update was issued and no later than the second the newest one was. In any block
+ * within 3 s of every update's issue time (the oracle's own check, which the caller judges by
+ * `issuedAt`) the price is then at most MAX_LIQUIDATION_PRICE_AGE seconds old and at most 3 s ahead,
+ * the bounds the oracle holds each leg to.
+ */
+export function readLatestPrice(update: readonly Hex[], legs: readonly Hex[], invertQuote: boolean): LatestPrice | { readonly problem: string } {
+  if (update.length === 0) return { problem: "no update was given" };
+  const issued: number[] = [];
+  let entries: (LegEntry | null)[];
+  try {
+    for (const u of update) issued.push(Number(readUpdate(u).timestampUs / MICROS_PER_SECOND));
+    entries = legEntries(update, legs);
+  } catch (e) {
+    return { problem: `an update cannot be read (${message(e)})` };
+  }
+  const first = Math.min(...issued);
+  const last = Math.max(...issued);
+  if (last - first > MAX_PRICE_STALENESS) return { problem: `the updates were issued ${last - first} s apart, more than the pair's ${MAX_PRICE_STALENESS} s window` };
+  const one = update.length === 1;
+  const generated: number[] = [];
+  const read: Leg[] = [];
+  for (let i = 0; i < legs.length; i++) {
+    const e = entries[i];
+    const name = feedText(legs[i]!);
+    if (!e) return { problem: `no update carries feed ${name}` };
+    const why = whyNotLive(e.feed);
+    if (why !== null) return { problem: `feed ${name}: ${why}` };
+    const gen = Number(e.feed.feedUpdateTimestamp / MICROS_PER_SECOND);
+    if (gen > last) return { problem: `feed ${name}'s price is dated ${gen - last} s after ${one ? "the update carrying it was" : "the updates were"} issued` };
+    if (first - gen > MAX_LATEST_PRICE_LAG) {
+      return {
+        problem: `feed ${name}'s latest price was generated ${first - gen} s before ${one ? "the update carrying it" : "the earliest of the updates"} was issued, more than the ${MAX_LATEST_PRICE_LAG} s that keeps it within the ${MAX_LIQUIDATION_PRICE_AGE} s a liquidation's price may be old`,
+      };
+    }
+    generated.push(gen);
+    read.push({ price: e.feed.price, conf: e.feed.confidence, expo: e.feed.exponent, publishTime: gen });
+  }
+  const price = pairPrice(read, invertQuote);
+  if (price === null) return { problem: "the composed price is not above zero" };
+  if (!price.confidenceOk) return { problem: "Pyth's confidence interval for the latest price is wider than the oracle's 2% cap" };
+  return { update: [...update], issuedAt: first, generated, price };
+}
+
+/** What a liquidation on a market can attach now ({@link PriceService.liquidationUpdate}). */
+export interface LiquidationUpdate {
+  /**
+   * "fresh": every leg's price was generated within the pair's 3 s window, as any priced call needs.
+   * "latest": Pyth's latest price, proven by when the updates carrying it were issued (a market with
+   * trading hours only). null: nothing can be attached now.
+   */
+  readonly kind: "fresh" | "latest" | null;
+  /** The signed updates to attach; empty when `kind` is null. */
+  readonly update: Hex[];
+  /** The price the oracle reads from them, composed as it composes it; null when `kind` is null. */
+  readonly price: PairPrice | null;
+  /** The second each leg's price was generated in, base first; empty when `kind` is null. */
+  readonly generated: readonly number[];
+  /**
+   * The second the call must land within 3 s of: the older leg's generation second for a fresh price,
+   * so the call is sent only while that price is fresh; the earliest update's issue second for Pyth's
+   * latest; null when `kind` is null.
+   */
+  readonly priceTime: number | null;
+  /** Why nothing can be attached; null when something can. */
+  readonly reason: string | null;
+}
+
+const noLiquidation = (reason: string): LiquidationUpdate => ({ kind: null, update: [], price: null, generated: [], priceTime: null, reason });
+
+/** When a print's price was generated: what a feed's newest price is chosen by. */
+const generatedAt = (p: Print) => p.generatedUs;
+/** When a print's update was issued: what Pyth's latest price, for a liquidation, is chosen by. */
+const issuedAt = (p: Print) => p.timestampUs;
+
 export class PriceService {
   readonly client: PriceSource | null;
   useStream: boolean;
@@ -214,6 +345,10 @@ export class PriceService {
   private readonly sets = new Map<string, Hex[]>([[ETH_USD_FEED, [ETH_USD_FEED]]]);
   /** per watched set, the prints of the freshest update that carried a live print for each of its feeds */
   private readonly updates = new Map<string, readonly Print[]>();
+  /** Each feed's print from the most recently issued update that carried a live print for it. */
+  private readonly issued = new Map<Hex, Print>();
+  /** per watched set, the prints of the most recently issued update that carried a live print for each of its feeds */
+  private readonly issuedUpdates = new Map<string, readonly Print[]>();
   private readonly notices = new Set<string>(); // stream notices already logged
   private changed = false; // the watched sets changed: restart the stream
   private newFeeds = new Set<Hex>(); // feeds with a print newer than the last nextPrints() handed out
@@ -226,6 +361,10 @@ export class PriceService {
   private readonly views = new WeakMap<Market, View>();
   private readonly warnedFuture = new Set<Hex>(); // feeds already warned about, once each
   private readonly warnedMissing = new Set<Hex>();
+  /** Feeds the request API refused while it served others, each with the monotonic time it is asked for again. */
+  private readonly refused = new Map<Hex, number>();
+  /** The monotonic time before which a refused request is not split again, after a split that served nothing. */
+  private splitAfter = 0;
 
   constructor(client: PriceSource | null, opts: PriceServiceOptions = {}) {
     this.client = client;
@@ -281,8 +420,9 @@ export class PriceService {
    * Take in prints from any source (the background loop, {@link fetch}, or a caller's own): one
    * whose price was generated later than the feed's current print replaces it and wakes
    * {@link nextPrints} and the {@link onPrints} listeners. A print that only carries the same price
-   * forward under a later update changes nothing. A print dated more than {@link maxFutureSkew}
-   * seconds ahead of the clock is ignored, with a warning once per feed.
+   * forward under a later update changes nothing there, but is kept as the feed's most recently
+   * issued one ({@link latestFor}). A print whose price, or whose update, is dated more than
+   * {@link maxFutureSkew} seconds ahead of the clock is ignored, with a warning once per feed.
    *
    * The endpoint's prints (the background loop's and {@link fetch}'s) are kept only for the feeds
    * asked for, so a response naming other feeds cannot grow memory; a caller's own are taken as given.
@@ -298,8 +438,10 @@ export class PriceService {
     const limit = prints.length > 0 ? this.clock() + this.maxFutureSkew : 0;
     for (const p of prints) {
       if (only !== null && !only.has(p.feedId)) continue;
-      if (p.publishTime > limit) {
-        this.future(p, limit - this.maxFutureSkew);
+      // An update stamped far ahead would hold the feed's most recently issued print until that time.
+      const dated = Math.max(p.publishTime, Number(p.timestampUs / MICROS_PER_SECOND));
+      if (dated > limit) {
+        this.future(p, dated, limit - this.maxFutureSkew);
         continue;
       }
       const cur = this.latest.get(p.feedId);
@@ -308,6 +450,8 @@ export class PriceService {
         if (this.listeners.size > 0) (batch ??= new Set()).add(p.feedId);
         this.latest.set(p.feedId, p);
       }
+      const was = this.issued.get(p.feedId);
+      if (was === undefined || p.timestampUs > was.timestampUs) this.issued.set(p.feedId, p);
       (fresh ??= []).push(p);
     }
     if (fresh !== null) this.takeUpdates(fresh);
@@ -328,9 +472,10 @@ export class PriceService {
   }
 
   /**
-   * Keep, per watched set, the update that carries a live print for each of its feeds and nothing
-   * else: the prints of `prints` that share a signed update are one candidate, taken when no leg's
-   * price is older than the kept one's and some leg's is newer.
+   * Keep, per watched set, the updates that carry a live print for each of its feeds and nothing
+   * else: the prints of `prints` that share a signed update are one candidate. The freshest is taken
+   * when no leg's price is older than the kept one's and some leg's is newer; the most recently issued
+   * when it was issued later than the kept one.
    */
   private takeUpdates(prints: readonly Print[]): void {
     for (let i = 0; i < prints.length; i++) {
@@ -342,6 +487,8 @@ export class PriceService {
       for (let j = i; j < prints.length; j++) if (prints[j]!.blob === blob) group.push(prints[j]!);
       const key = setKey(group.map((p) => p.feedId));
       if (!this.sets.has(key)) continue;
+      const was = this.issuedUpdates.get(key);
+      if (was === undefined || group[0]!.timestampUs > was[0]!.timestampUs) this.issuedUpdates.set(key, group);
       const cur = this.updates.get(key);
       if (cur !== undefined) {
         let newer = false;
@@ -391,7 +538,8 @@ export class PriceService {
   /**
    * The latest prints, outside the background loop: of `feeds` (lowercase), or the watched ones. One
    * request per {@link MAX_FEEDS_PER_UPDATE} feeds, each watched set within one request where it
-   * fits. A feed the endpoint serves no print for is reported, once.
+   * fits, and a refused one asked again in parts. A feed the endpoint serves no print for is reported,
+   * once.
    */
   async fetch(feeds?: Iterable<Hex> | null): Promise<void> {
     const ids = [...new Set(feeds ? [...feeds].map((f) => f.toLowerCase() as Hex) : this.feeds)].sort();
@@ -400,15 +548,82 @@ export class PriceService {
     this.reportMissing(ids);
   }
 
-  /** Ask for each request's latest prints at once and take them (only `keep`'s); the first failure is thrown once the others are taken. */
+  /**
+   * Ask for each request's latest prints at once and take them (only `keep`'s); the first failure is
+   * thrown once the others are taken.
+   *
+   * Pyth's request API refuses a whole request (HTTP 403) that names one feed it does not know or the
+   * token does not cover, so a refused request of several feeds is asked again in parts,
+   * {@link SPLIT_BATCH} at a time: each watched set of two or more feeds inside it, then each other
+   * feed alone, and a refused set's feeds alone. A feed still refused while others were served is
+   * logged once and left out of these requests for {@link REFUSED_RETRY} seconds: it has no print
+   * meanwhile, which {@link reportMissing} reports. When nothing was served the refusal is the poll's
+   * failure, as for a token refused on every feed, and a refused request is not split again for
+   * {@link REFUSED_RETRY} seconds, so such a token costs one request per poll, not one per feed.
+   */
   private async poll(source: PriceSource, requests: readonly Hex[][], keep: ReadonlySet<Hex>): Promise<void> {
-    const results = await Promise.allSettled(requests.map((r) => source.latest(r)));
-    let failed: { reason: unknown } | null = null;
-    for (const r of results) {
-      if (r.status === "fulfilled") this.take(r.value, keep);
-      else failed ??= { reason: r.reason };
+    const now = monotonic();
+    const asked = requests.map((r) => r.filter((f) => !((this.refused.get(f) ?? 0) > now))).filter((r) => r.length > 0);
+    const failures: unknown[] = [];
+    const refusals: { feeds: readonly Hex[]; reason: unknown }[] = [];
+    const got = { served: false, split: false };
+    const ask = async (rs: readonly (readonly Hex[])[], depth: number): Promise<void> => {
+      const size = depth === 0 ? rs.length : SPLIT_BATCH;
+      for (let start = 0; start < rs.length; start += size) {
+        const batch = rs.slice(start, start + size);
+        const results = await Promise.allSettled(batch.map((r) => source.latest(r)));
+        const parts: Hex[][] = [];
+        for (let i = 0; i < batch.length; i++) {
+          const r = results[i]!;
+          const feeds = batch[i]!;
+          if (r.status === "fulfilled") {
+            this.take(r.value, keep);
+            got.served = true;
+          } else if (!(r.reason instanceof ProError && r.reason.status === 403)) failures.push(r.reason);
+          else if (feeds.length > 1 && depth < 2 && now >= this.splitAfter) parts.push(...(depth === 0 ? this.parts(feeds) : feeds.map((f) => [f])));
+          else refusals.push({ feeds, reason: r.reason });
+        }
+        if (parts.length > 0) {
+          got.split = true;
+          await ask(parts, depth + 1);
+        }
+      }
+    };
+    await ask(asked, 0);
+    if (got.served) {
+      this.splitAfter = 0;
+      // Recorded before any other failure is thrown, so the next poll leaves these feeds out.
+      for (const { feeds, reason } of refusals) {
+        if (feeds.length !== 1) continue; // a request not split: its feeds are asked for again
+        this.refused.set(feeds[0]!, now + REFUSED_RETRY);
+        this.onNotice(
+          `price endpoint refused feed ${feedText(feeds[0]!)} while serving the others: left out of its requests for ${REFUSED_RETRY / 60} min (${message(reason)})`,
+        );
+      }
+    } else if (got.split) this.splitAfter = now + REFUSED_RETRY;
+    if (failures.length > 0) throw failures[0];
+    if (!got.served && refusals.length > 0) throw refusals[0]!.reason;
+  }
+
+  /**
+   * A refused request's parts, to ask for again: each watched set of two or more feeds inside it, then
+   * each other feed alone. A request that is one watched set is split into its feeds.
+   */
+  private parts(request: readonly Hex[]): Hex[][] {
+    const inRequest = new Set(request);
+    const covered = new Set<Hex>();
+    const seen = new Set<string>();
+    const out: Hex[][] = [];
+    for (const set of this.sets.values()) {
+      if (set.length < 2 || set.length >= request.length || !set.every((f) => inRequest.has(f))) continue;
+      const part = [...set].sort();
+      if (seen.has(part.join())) continue;
+      seen.add(part.join());
+      out.push(part);
+      for (const f of part) covered.add(f);
     }
-    if (failed !== null) throw failed.reason;
+    for (const f of request) if (!covered.has(f)) out.push([f]);
+    return out;
   }
 
   /** The watched feeds without any print yet (one the endpoint does not serve stays here). */
@@ -429,12 +644,12 @@ export class PriceService {
     }
   }
 
-  /** Warn, once per feed, about a print dated ahead of the clock. */
-  private future(p: Print, now: number): void {
+  /** Warn, once per feed, about a print dated (its price or its update) `dated`, ahead of the clock. */
+  private future(p: Print, dated: number, now: number): void {
     if (this.warnedFuture.has(p.feedId)) return;
     this.warnedFuture.add(p.feedId);
     this.logger?.warn(
-      `ignored a print for feed ${short(p.feedId)} dated ${p.publishTime - now} s ahead of the clock (more than ${this.maxFutureSkew} s): check the price endpoint, or this machine's clock`,
+      `ignored a print for feed ${short(p.feedId)} dated ${dated - now} s ahead of the clock (more than ${this.maxFutureSkew} s): check the price endpoint, or this machine's clock`,
     );
   }
 
@@ -575,22 +790,22 @@ export class PriceService {
     v.price = undefined;
     v.update = undefined;
     v.refused = undefined;
-    v.prints = this.select(legs, own, v.newest);
+    v.prints = this.select(legs, own, v.newest, generatedAt);
     return v.prints === null ? null : v;
   }
 
   /**
-   * The prints `legs` price from, given their set's update and each leg's newest print: the set's
-   * own, unless it lacks a leg or lags one by {@link SET_LAG_US}; else the newest per leg; null while
-   * a leg has none.
+   * The prints `legs` price from, given their set's update and each leg's newest print by `at` (when
+   * its price was generated, or when its update was issued): the set's own, unless it lacks a leg or
+   * lags one by {@link SET_LAG_US}; else the newest per leg; null while a leg has none.
    */
-  private select(legs: readonly Hex[], own: readonly Print[] | undefined, newest: readonly (Print | undefined)[]): Print[] | null {
+  private select(legs: readonly Hex[], own: readonly Print[] | undefined, newest: readonly (Print | undefined)[], at: (p: Print) => bigint): Print[] | null {
     if (own !== undefined) {
       const mine: Print[] = [];
       for (let i = 0; i < legs.length; i++) {
         const p = own.find((x) => x.feedId === legs[i]);
         const other = newest[i];
-        if (p === undefined || (other !== undefined && other.generatedUs - p.generatedUs >= SET_LAG_US)) break;
+        if (p === undefined || (other !== undefined && at(other) - at(p) >= SET_LAG_US)) break;
         mine.push(p);
       }
       if (mine.length === legs.length) return mine;
@@ -612,7 +827,7 @@ export class PriceService {
   printsFor(feeds: readonly Hex[]): Print[] | null {
     const legs = feeds.map((f) => f.toLowerCase() as Hex);
     if (legs.length === 0) return [];
-    const prints = this.select(legs, this.updates.get(setKey(legs)), legs.map((l) => this.latest.get(l)));
+    const prints = this.select(legs, this.updates.get(setKey(legs)), legs.map((l) => this.latest.get(l)), generatedAt);
     return prints !== null && oracleRefusal(legs, prints) === null ? prints : null;
   }
 
@@ -671,6 +886,74 @@ export class PriceService {
     if (v === null || this.refusal(v) !== null) return [];
     v.update ??= distinctBlobs(v.prints!);
     return v.update.slice();
+  }
+
+  /**
+   * The prints of the most recently issued update the service holds for the market's legs, one per leg
+   * (base first for a composite), however old their prices: the market's own set's update, unless it
+   * lacks a leg or another update carrying one was issued a second or more later; else each leg's most
+   * recently issued print. A print's `timestampUs` is when its update was issued, its `generatedUs`
+   * when its price was generated. Null while a leg has none. Whether a liquidation can attach them is
+   * {@link liquidationUpdate}'s to judge.
+   */
+  latestFor(m: Market): Print[] | null {
+    const legs = m.legs.map((l) => l.toLowerCase() as Hex);
+    return this.select(legs, this.issuedUpdates.get(setKey(legs)), legs.map((l) => this.issued.get(l)), issuedAt);
+  }
+
+  /**
+   * The update a liquidation on the market attaches now, and the price the oracle reads from it, as
+   * BazaarPair resolves a liquidation's price (the pair judges the call at its own stored price instead
+   * when that is newer, or, on a continuously traded market, from the same second):
+   *
+   * - a fresh price ({@link fresh}, {@link updateFor}) on any market, provided, on a market with
+   *   trading hours, that each update carrying it was issued within the pair's 3 s window less
+   *   `margin` of `now`: the oracle reads every update a liquidation there carries as Pyth's latest
+   *   price, by when it was issued;
+   * - otherwise, on a market with trading hours, Pyth's latest price ({@link latestFor}, read by
+   *   {@link readLatestPrice}) when every update carrying it was issued within the pair's 3 s window
+   *   less `margin` of `now`. An update carries each feed's most recent price as of when it was
+   *   issued, so the oracle takes one issued that close to the block as proof that no newer price
+   *   existed, and a quiet feed's last price decides the call for up to MAX_LIQUIDATION_PRICE_AGE
+   *   seconds after it was generated;
+   * - otherwise nothing (`kind` null, `reason` saying why). A continuously traded market is liquidated
+   *   only at a fresh price, and a call without an update runs only while the pair stored a price
+   *   within the last 3 s, which this service cannot see.
+   *
+   * Judged at `now` (default the clock) with `margin` (default {@link sendMargin}). The call must land
+   * within 3 s of the result's `priceTime`: check it again just before sending.
+   */
+  liquidationUpdate(m: Market, now?: number | null, margin?: number | null): LiquidationUpdate {
+    const t = now ?? this.clock();
+    const mg = margin ?? this.sendMargin;
+    const limit = MAX_PRICE_STALENESS - mg;
+    if (this.fresh(m, t, mg)) {
+      const v = this.view(m)!;
+      if (m.continuous || v.prints!.every((p) => Math.abs(Number(p.timestampUs / MICROS_PER_SECOND) - t) <= limit)) {
+        const price = this.priceOf(v)!;
+        return { kind: "fresh", update: this.updateFor(m), price, generated: v.prints!.map((p) => p.publishTime), priceTime: price.publishTime, reason: null };
+      }
+    }
+    if (m.continuous) {
+      return noLiquidation(
+        "no fresh price: a continuously traded market is liquidated only at a price generated within the pair's 3 s window less the send margin, inside the oracle's confidence cap",
+      );
+    }
+    const prints = this.latestFor(m);
+    if (prints === null) return noLiquidation("the price source holds no update carrying every leg of the market yet");
+    const blobs = distinctBlobs(prints);
+    const latest = readLatestPrice(blobs, prints.map((p) => p.feedId), m.invertQuote);
+    if ("problem" in latest) return noLiquidation(latest.problem);
+    const behind = t - latest.issuedAt;
+    if (behind > limit) {
+      const which = blobs.length > 1 ? "the earliest of the newest updates" : "the newest update";
+      return noLiquidation(`${which} the price source holds was issued ${secs(behind)} s before the clock, past the pair's 3 s window less the ${secs(mg)} s send margin`);
+    }
+    const ahead = Math.max(...prints.map((p) => Number(p.timestampUs / MICROS_PER_SECOND))) - t;
+    if (ahead > limit) {
+      return noLiquidation(`an update the price source holds was issued ${secs(ahead)} s ahead of the clock, past the pair's 3 s window less the ${secs(mg)} s send margin`);
+    }
+    return { kind: "latest", update: latest.update, price: latest.price, generated: latest.generated, priceTime: latest.issuedAt, reason: null };
   }
 
   /**

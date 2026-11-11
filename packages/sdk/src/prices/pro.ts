@@ -8,13 +8,16 @@
  * endpoint appends to one never reach a call's calldata.
  *
  * Feed ids are bytes32 `Hex` everywhere in the SDK, as the contracts hold them; this client alone
- * converts them to Pyth's numbers. An id that is not a raw Pyth Pro id is left out of a request, as an
- * id Pyth does not know is, so one bad feed never fails the others.
+ * converts them to Pyth's numbers. An id that is not a raw Pyth Pro id is left out of a request. A
+ * stream leaves out a feed Pyth does not serve or the token does not cover, and names it in a notice;
+ * the request API refuses a whole request naming one (HTTP 403), which the price service answers by
+ * asking again in parts (prices/service.ts).
  *
  * Browser-safe: requests go through `fetch` and the stream through a WebSocket. A browser cannot set
  * a WebSocket's request headers, so there the token travels in the subprotocol list; elsewhere it is
  * sent as an Authorization header. An API key must stay on a server: a browser is given short-lived
- * tokens minted from it ({@link mintProToken}).
+ * tokens minted from it ({@link mintProToken}). Pyth's own endpoints serve only a client presenting
+ * one or the other, so a client for them without a token is refused when it is made.
  *
  * Credentials stay out of sight: the client holds the token, the headers and the configured URLs in
  * private fields, so printing or serializing it shows none of them; every message it produces has
@@ -24,8 +27,9 @@
  */
 
 import type { Address, Hex } from "viem";
+import { InputError } from "../client/calls.js";
 import { BAZAAR_EXPONENT } from "../constants.js";
-import { PYTH_PRO, PYTH_PRO_TOKEN_URL } from "../networks.js";
+import { PYTH_PRO, PYTH_PRO_TOKEN_URL, isPythProPriceEndpoint } from "../networks.js";
 import { isUrl, redactUrl, redactUrls, urlCredential, urlSecrets } from "../urls.js";
 import {
   CHANNEL_FIXED_RATE_1000,
@@ -133,6 +137,10 @@ export const DEFAULT_CHANNEL: Channel = "fixed_rate@200ms";
 
 /** The subprotocol that marks the next entry of a WebSocket's subprotocol list as the token. */
 export const AUTH_SUBPROTOCOL = "pyth-lazer-auth";
+
+/** What a client for Pyth's own price endpoints is told when it is given no token. */
+const PRO_KEY_REQUIRED =
+  "Pyth's own price endpoints serve only the holder of a Pyth Pro API key. On a server, give the key as the token (an Authorization header among the headers does not count); in a browser, give a function returning short-lived tokens your backend mints from the key (mintProToken), never the key itself. Without a token, the request API (restUrl) and every stream endpoint (streamUrls) must be custom ones, such as a proxy that adds the key or a local mock: both default to Pyth's.";
 
 const INT256_MAX = (1n << 255n) - 1n;
 const INT256_MIN = -(1n << 255n);
@@ -288,9 +296,11 @@ export type WebSocketConstructor = new (url: string, protocolsOrOptions?: any) =
 
 export interface ProClientOptions {
   /**
-   * The token every request and connection presents: a string, or a function called for each request
-   * and each connection attempt (so it can hand over short-lived tokens; cache inside it, for example
-   * with {@link cachedToken}). Omit it only for an endpoint that needs none.
+   * The token every request and connection presents: a Pyth Pro API key (on a server), or a function
+   * called for each request and each connection attempt, so it can hand over short-lived tokens minted
+   * from the key (cache inside it, for example with {@link cachedToken}). Required whenever the request
+   * API or a stream endpoint is one of Pyth's own, as by default; omit it only for an endpoint that
+   * needs none, such as a proxy that adds it or a local mock.
    */
   token?: string | TokenProvider | null;
   /** WebSocket stream endpoints; the stream connects to all of them. Default Pyth's three. */
@@ -573,7 +583,8 @@ export class ProClient {
    * Throws a ProError naming the setting at fault, and never quoting a token, a header's value or a
    * URL, when a URL is not one (or a base URL holds a query or a fragment), the channel is unknown,
    * the token or a header holds a character a request cannot carry, or a credential would travel
-   * unencrypted to another machine without `allowInsecure`.
+   * unencrypted to another machine without `allowInsecure`. Throws an InputError on `prices.token` when
+   * the request API or a stream endpoint is one of Pyth's own and no token is given.
    */
   constructor(opts: ProClientOptions = {}) {
     const url = (u: string, what: string, base: boolean) => {
@@ -640,6 +651,10 @@ export class ProClient {
     const ahead = opts.maxUpdateAhead ?? MAX_UPDATE_AHEAD;
     if (typeof ahead !== "number" || !Number.isFinite(ahead) || ahead < 0) throw new ProError("maxUpdateAhead is not a number of seconds");
     this.#maxAheadUs = BigInt(Math.round(ahead * 1_000_000));
+    // Checked after every other setting, so a malformed or insecure endpoint is reported as such first.
+    if (this.#tokenSource === null && [this.#restUrl, ...this.#streamUrls].some(isPythProPriceEndpoint)) {
+      throw new InputError("prices.token", PRO_KEY_REQUIRED);
+    }
   }
 
   /** The WebSocket stream endpoints, as configured. They may hold a key: print them through `redactUrl`. */
@@ -751,7 +766,10 @@ export class ProClient {
       throw new ProError(`price endpoint unreachable: ${this.#quote(reason(e), url)}`);
     }
     if (r.status === 401 || r.status === 403) {
-      throw new ProError(`price endpoint refused the request (HTTP ${r.status}); check the token (prices.token) and that it covers these feeds and this channel`, r.status);
+      // Pyth's answer names the cause (an invalid key, a feed it does not know, a feed the token does
+      // not cover), so it is quoted, scrubbed like any other answer.
+      const said = answer.trim() === "" ? "" : `. The endpoint said: ${this.#excerpt(answer, url)}`;
+      throw new ProError(`price endpoint refused the request (HTTP ${r.status}); check the token (prices.token) and that it covers these feeds and this channel${said}`, r.status);
     }
     if (r.status === 404) throw new ProError(`price endpoint has no data for this request (HTTP 404): ${this.#excerpt(answer, url)}`, 404);
     if (r.status >= 400) throw new ProError(`price endpoint returned HTTP ${r.status}: ${this.#excerpt(answer, url)}`, r.status);
@@ -781,9 +799,10 @@ export class ProClient {
   }
 
   /**
-   * A request's body: the feeds, the four properties BazaarOracle reads, the EVM format in hex, and
-   * the channel. `ignoreInvalidFeeds` keeps one feed Pyth does not serve from failing the others: the
-   * update then leaves it out (PriceService reports it).
+   * A REST request's body: the feeds, the four properties BazaarOracle reads, the EVM format in hex,
+   * the channel, and no parsed copy of the update (only the signed update is read). Pyth's REST API
+   * refuses the whole request (HTTP 403) when it names a feed Pyth does not know or the token does not
+   * cover, and leaves a feed that is not active out of the update.
    */
   private static query(numbers: readonly number[], channel: Channel): Record<string, unknown> {
     return {
@@ -791,10 +810,18 @@ export class ProClient {
       properties: PRO_PROPERTIES,
       formats: ["evm"],
       channel,
-      deliveryFormat: "json",
       jsonBinaryEncoding: "hex",
-      ignoreInvalidFeeds: true,
+      parsed: false,
     };
+  }
+
+  /**
+   * A subscription's parameters: a REST request's, delivered as JSON text, with `ignoreInvalidFeeds`
+   * so a feed Pyth does not serve, or the token does not cover, does not fail the others: Pyth
+   * subscribes the rest and names the feeds it left out (a notice).
+   */
+  private static subscription(numbers: readonly number[], channel: Channel): Record<string, unknown> {
+    return { ...ProClient.query(numbers, channel), deliveryFormat: "json", ignoreInvalidFeeds: true };
   }
 
   /** The signer of `blob` when signers are checked (throwing a ProError for one that is not trusted), else null. */
@@ -1186,7 +1213,7 @@ export class ProClient {
         ep.state = "open";
         everOpen = true;
         try {
-          for (const s of subscriptions) socket.send(JSON.stringify({ type: "subscribe", subscriptionId: s.subscriptionId, ...ProClient.query(s.priceFeedIds, this.channel) }));
+          for (const s of subscriptions) socket.send(JSON.stringify({ type: "subscribe", subscriptionId: s.subscriptionId, ...ProClient.subscription(s.priceFeedIds, this.channel) }));
         } catch (e) {
           down(ep, socket, reason(e));
         }

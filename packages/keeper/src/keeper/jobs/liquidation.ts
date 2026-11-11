@@ -1,12 +1,26 @@
 /** Liquidation: seize positions below their maintenance margin. */
 
-import { BAZAAR_SCALE, BP_SCALE, type Market, type Position, bucketState, effectiveMmrBp, pair } from "@liberta-labs/bazaar-sdk";
+import {
+  BAZAAR_SCALE,
+  BP_SCALE,
+  MAX_PRICE_STALENESS,
+  type Market,
+  type Position,
+  bucketState,
+  effectiveMmrBp,
+  pair,
+} from "@liberta-labs/bazaar-sdk";
 import type { Address } from "viem";
 import type { LiquidationJob as LiquidationJobConfig } from "../../config/index.js";
 import { type Action, type ActionResult, lockKey } from "../../exec/executor.js";
-import { Job, LIVE_OR_ADL, thousands, units } from "./base.js";
+import { Job, LIVE_OR_ADL, PricedCall, thousands, units } from "./base.js";
 
 const PAIR = pair();
+
+/** Why no price can decide a liquidation on a market now ({@link LiquidationJob.liquidationPrice}). */
+export interface NoLiquidationPrice {
+  readonly reason: string;
+}
 
 /**
  * Whether `p` is below its maintenance requirement at `price` and `fundingIndex`: BucketLib's
@@ -45,12 +59,58 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
     return n;
   }
 
+  /**
+   * The price a liquidation on `m` is judged at now and the update it carries, or why no price can
+   * decide one, as BazaarPair._liquidationPrice resolves it. A call without an update is judged at the
+   * stored price only while that is at most 3 s old, and reverts past it
+   * (BazaarPair__LiquidationPriceTooOld on a market with trading hours,
+   * BazaarPair__NoPriceUpdatesProvided on a continuously traded one).
+   *
+   * Decided by PriceService.liquidationUpdate, at one instant:
+   * - "fresh": priced as every other call at a fresh print ({@link atPrint}). On a market with
+   *   trading hours the pair reads any update a liquidation carries as Pyth's latest price
+   *   (BazaarOracle.verifyAndFetchLatestPrice), which also holds every update to having been issued
+   *   within 3 s of the block, so the SDK offers a fresh print there only while each update carrying
+   *   it was issued within that window less prices.sendMarginSeconds of `now`; past that, the cases
+   *   below apply.
+   * - "latest" (a market with trading hours only): Pyth's latest update, issued within the window less
+   *   the send margin, its price at most a minute old in any block that admits it. The pair judges the
+   *   call at that price whenever it is no older than the stored price, the stored price's own second
+   *   included, where it stores nothing; at the stored price only when that is strictly newer.
+   *   `priceTime` is the earliest update's issue second, the one the call must land within 3 s of.
+   * - Otherwise a call without an update, judged at the stored price, only while that price is within
+   *   the window less the send margin.
+   */
+  liquidationPrice(m: Market): PricedCall | NoLiquidationPrice {
+    const prices = this.k.prices;
+    const now = prices.clock();
+    const lu = prices.liquidationUpdate(m, now);
+    let reason: string;
+    if (lu.kind === "fresh") {
+      const why = this.unconfident(m);
+      if (why === null) return this.atPrint(m);
+      reason = why;
+    } else if (lu.kind === "latest" && lu.price !== null && lu.priceTime !== null) {
+      const st = m.state;
+      const judged = st !== null && st.updateTs > lu.price.publishTime ? st.spot : lu.price.spot;
+      return new PricedCall(judged, lu.update, lu.priceTime, true);
+    } else {
+      reason = lu.reason ?? "no price update can be attached";
+    }
+    const st = m.state;
+    if (st !== null && st.spot > 0n && now - st.updateTs <= MAX_PRICE_STALENESS - prices.sendMargin) return new PricedCall(st.spot, [], st.updateTs);
+    return { reason };
+  }
+
   override async plan(m: Market): Promise<Action[]> {
-    const pc = this.priced(m, true);
-    if (pc === null) return [];
-    const st = m.state!;
     const positions = this.k.store.positions.get(m.address);
     if (positions === undefined || positions.size === 0) return [];
+    const pc = this.liquidationPrice(m);
+    if (!(pc instanceof PricedCall)) {
+      this.k.unusablePrint(m, `no price can decide a liquidation now (${pc.reason})`);
+      return [];
+    }
+    const st = m.state!;
     const mmr = effectiveMmrBp(st.mmrBp, st.laggedMmrBp);
     const price = pc.price;
     const fi = st.projectedFundingIndex;
@@ -66,7 +126,7 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
       (candidates ??= []).push(acct);
     }
     if (candidates === null) return [];
-    const updates = pc.updates; // before the first await: the update of the print `price` is from, or none for the stored price
+    const updates = pc.updates; // before the first await: the update the price was read from, or none for the stored price
     const reader = this.k.reader;
     // The store follows events; the chain is re-read before anything is simulated. The fee read goes
     // out alongside, rather than after it.
@@ -100,6 +160,7 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
         this.action(m, m.address, PAIR.encode("liquidate", batch, updates), `liquidate ${batch.length} account(s), $${thousands(units(notional))} notional`, {
           value: fee,
           priceTime: pc.priceTime,
+          priceIssued: pc.issued,
           locks: batch.map((a) => lockKey("liq", m.address, a)),
           rewardPair: m.address,
         }),
@@ -109,8 +170,8 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
   }
 
   override note(action: Action, result: ActionResult): void {
-    // Refused or unprofitable: wait before simulating the same accounts again. A price that aged
-    // before the send refused nothing: the next print plans them again.
+    // Refused or unprofitable: wait before simulating the same accounts again. A price (or a latest
+    // update's issue time) that aged before the send refused nothing: the next plan prices them again.
     if (!result.sent && !result.priceAged) for (const key of action.locks) this.cool(key);
   }
 }

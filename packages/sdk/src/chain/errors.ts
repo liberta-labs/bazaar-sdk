@@ -21,7 +21,7 @@ const PANIC = "0x4e487b71"; // Panic(uint256)
  */
 export const KEEPER_HINTS: Readonly<Record<string, string>> = {
   "BazaarPair__LiquidationPriceTooOld":
-    "The market is closed and its last stored price is more than 10 minutes old, so it cannot be used to seize collateral. Liquidation resumes when the market reopens and a fresh print exists.",
+    "The liquidation brought no price update and the pair's stored price is more than 3 seconds old, which never decides a liquidation. Attach Pyth's latest update (issued within 3 s of the block); its price may be at most a minute old, so with none that recent the market's positions wait for its next price.",
   "BazaarPair__NoPriceUpdatesProvided":
     "No fresh price was available: the call carried no update and the pair's own stored price is more than 3 seconds old. Check the price endpoint.",
   "BazaarPair__InsufficientPythFee":
@@ -63,7 +63,9 @@ export const KEEPER_HINTS: Readonly<Record<string, string>> = {
   "BazaarOracle__IncompleteFeed":
     "An update carries the feed without a property the call needs: a live price needs its price, exponent, a non-zero confidence and a feed update timestamp. Check the properties the price client requests.",
   "BazaarOracle__StalePrice":
-    "The update's price was generated more than 3 seconds from the block's time: the update is old, the market is closed and its last price is being carried forward, or this machine's or the chain's clock is off.",
+    "The update's price was generated more than 3 seconds from the block's time (for a liquidation on a market with trading hours, which reads Pyth's latest price, more than a minute before it or 3 seconds after it): the update is old, the market is closed and its last price is being carried forward, or this machine's or the chain's clock is off.",
+  "BazaarOracle__StaleUpdate":
+    "A price update was issued more than 3 seconds from the block's time: a liquidation on a market with trading hours judges when each update it carries was issued, not only when its price was generated. Fetch Pyth's latest update and resend.",
   "BazaarOracle__WrongTick":
     "A settlement update is not from Pyth's one-second channel or is not stamped on the second required.",
   "BazaarOracle__SampleCountMismatch":

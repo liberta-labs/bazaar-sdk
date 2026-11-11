@@ -1,11 +1,25 @@
 import type { Hex } from "viem";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ETH_USD_FEED } from "../src/constants.js";
+import { ETH_USD_FEED, MAX_LIQUIDATION_PRICE_AGE } from "../src/constants.js";
+import { pairPrice } from "../src/formulas/index.js";
 import type { Market } from "../src/models.js";
-import { PriceService, type Print, ProClient, ProError, distinctBlobs, feedLabel, fetchFeedInfo, fetchSymbols, marketLabel, printsOf } from "../src/prices/index.js";
+import {
+  MAX_LATEST_PRICE_LAG,
+  PriceService,
+  type Print,
+  ProClient,
+  ProError,
+  distinctBlobs,
+  feedLabel,
+  fetchFeedInfo,
+  fetchSymbols,
+  marketLabel,
+  printsOf,
+  readLatestPrice,
+} from "../src/prices/index.js";
 import type { PriceSource, ProSymbol } from "../src/prices/index.js";
 import { readUpdate } from "../src/prices/lazer.js";
-import { FakeSocket, US, fid, print as pr, settle, streamUpdated, unsigned } from "./pro-fakes.js";
+import { type FeedSpec, FakeSocket, US, fid, print as pr, settle, streamUpdated, unsigned } from "./pro-fakes.js";
 
 const [F1, F3, F4, F5] = [fid(1), fid(3), fid(4), fid(5)];
 
@@ -347,7 +361,7 @@ describe("PriceService.run", () => {
     process.on("unhandledRejection", onUnhandled);
     try {
       const warn = vi.fn();
-      const client = new ProClient({ WebSocket: FakeSocket, streamUrls: ["wss://pro.test/v1/stream"] });
+      const client = new ProClient({ restUrl: "https://pro.test", WebSocket: FakeSocket, streamUrls: ["wss://pro.test/v1/stream"] });
       const svc = new PriceService(client, { streamIdleTimeout: 0.2, clock: () => 100, logger: { warn } });
       expect(new PriceService(null).streamIdleTimeout).toBe(10);
       svc.watch([F1]);
@@ -580,5 +594,295 @@ describe("PriceService, as the oracle reads its updates", () => {
     asked.length = 0;
     await svc.fetch();
     expect(asked.map((r) => r.length)).toEqual([255, 48]);
+  });
+});
+
+describe("Pyth's latest price, as a liquidation on a market with trading hours proves it", () => {
+  /** A market with trading hours over `legs`. */
+  const hours = (legs: Hex[], address: Hex = `0x${"dd".repeat(20)}`): Market => ({ ...market(legs, address), continuous: false });
+  /** An update stamped at second `at` (plus `extraUs`) carrying `feeds`. */
+  const blob = (at: number, feeds: FeedSpec[], extraUs = 0n): Hex => unsigned({ at, extraUs, feeds });
+  /** The prints a client returns for update `b`. */
+  const prints = (b: Hex): Print[] => printsOf(readUpdate(b), b, null, 0);
+  /** The price the oracle composes from one leg at the fakes' default price, generated in second `at`. */
+  const priceAt = (at: number) => pairPrice([{ price: 200_000_000_000n, conf: 1_000n, expo: -8, publishTime: at }], false);
+  /** Why a price generated `s` seconds before `carrying` was issued cannot decide a liquidation. */
+  const tooOld = (feed: number, s: number, carrying = "the update carrying it") =>
+    `feed ${feed}'s latest price was generated ${s} s before ${carrying} was issued, more than the 57 s that keeps it within the 60 s a liquidation's price may be old`;
+
+  it("is read as the oracle reads it: when each update was issued, when each price was generated, inside the cap", () => {
+    expect([MAX_LIQUIDATION_PRICE_AGE, MAX_LATEST_PRICE_LAG]).toEqual([60, 57]);
+    const quiet = blob(1_000, [{ id: 1, generated: 943 }]);
+    expect(readLatestPrice([quiet], [F1], false)).toEqual({ update: [quiet], issuedAt: 1_000, generated: [943], price: priceAt(943) });
+    // a second older, and a block 3 s after the update would find it 61 s old
+    expect(readLatestPrice([blob(1_000, [{ id: 1, generated: 942 }])], [F1], false)).toEqual({ problem: tooOld(1, 58) });
+    // a composite's legs in one update: the price is as old as its older leg
+    const both = blob(1_000, [{ id: 3, generated: 990 }, { id: 4, generated: 980 }]);
+    expect(readLatestPrice([both], [F3, F4], false)).toMatchObject({ update: [both], issuedAt: 1_000, generated: [990, 980], price: { publishTime: 980 } });
+    // in two updates, each of which the block must be within 3 s of: the earliest bounds how late the block can
+    // be, so each price's age counts from it, whichever update carries the price
+    const base = blob(1_000, [{ id: 3, generated: 990 }]);
+    expect(readLatestPrice([base, blob(1_002, [{ id: 4, generated: 943 }])], [F3, F4], false)).toMatchObject({ issuedAt: 1_000, generated: [990, 943] });
+    expect(readLatestPrice([base, blob(1_002, [{ id: 4, generated: 942 }])], [F3, F4], false)).toEqual({ problem: tooOld(4, 58, "the earliest of the updates") });
+    // a price dated after the updates were issued would be ahead of every block that admits them
+    expect(readLatestPrice([blob(1_000, [{ id: 1, generated: 1_001 }])], [F1], false)).toEqual({ problem: "feed 1's price is dated 1 s after the update carrying it was issued" });
+    // each leg is read from the update holding its most recently generated price, usable or not
+    const later = blob(1_001, [{ id: 1, generated: 950, conf: 0n }]);
+    expect(readLatestPrice([quiet, later], [F1], false)).toEqual({ problem: "feed 1: Pyth reports no confidence for it, and the oracle refuses a live price without one" });
+    // a wider latest price is refused, never passed over for an older one
+    expect(readLatestPrice([blob(1_000, [{ id: 1, generated: 990, conf: 5_000_000_000n }])], [F1], false)).toEqual({
+      problem: "Pyth's confidence interval for the latest price is wider than the oracle's 2% cap",
+    });
+    expect(readLatestPrice([quiet], [F1, F3], false)).toEqual({ problem: "no update carries feed 3" });
+    expect(readLatestPrice([], [F1], false)).toEqual({ problem: "no update was given" });
+    expect(readLatestPrice(["0x1234"], [F1], false)).toEqual({ problem: expect.stringMatching(/^an update cannot be read \(malformed Pyth Pro update/) });
+  });
+
+  it("gives a liquidation a fresh price, else Pyth's latest one issued within the window, else nothing and why", () => {
+    let now = 1_000.5;
+    const svc = new PriceService(null, { clock: () => now, logger: null });
+    const m = hours([F1]);
+    svc.watchMarkets([m]);
+    expect(svc.latestFor(m)).toBeNull();
+    expect(svc.liquidationUpdate(m)).toEqual({ kind: null, update: [], price: null, generated: [], priceTime: null, reason: "the price source holds no update carrying every leg of the market yet" });
+    // a fresh price: its update, judged at it
+    const live = blob(1_000, [{ id: 1 }]);
+    svc.ingest(prints(live));
+    expect(svc.liquidationUpdate(m)).toEqual({ kind: "fresh", update: [live], price: priceAt(1_000), generated: [1_000], priceTime: 1_000, reason: null });
+    // the venue closes: updates keep coming, each carrying the last price forward
+    let last = live;
+    for (let at = 1_001; at <= 1_030; at++) {
+      now = at + 0.2;
+      svc.ingest(prints((last = blob(at, [{ id: 1, generated: 1_000 }]))));
+    }
+    expect(svc.fresh(m)).toBe(false);
+    expect(svc.updateFor(m)).toEqual([live]); // no newer price arrived for a fresh-price call to carry
+    expect(svc.latestFor(m)!.map((p) => [p.timestampUs, p.generatedUs, p.blob])).toEqual([[1_030n * US, 1_000n * US, last]]);
+    expect(svc.liquidationUpdate(m)).toEqual({ kind: "latest", update: [last], price: priceAt(1_000), generated: [1_000], priceTime: 1_030, reason: null });
+    // the source falls behind: its newest update is past the window less the send margin
+    now = 1_032.5;
+    expect(svc.liquidationUpdate(m)).toMatchObject({
+      kind: null,
+      update: [],
+      reason: "the newest update the price source holds was issued 2.5 s before the clock, past the pair's 3 s window less the 1 s send margin",
+    });
+    expect(svc.liquidationUpdate(m, null, 0).kind).toBe("latest");
+    // the last price ages: 57 s before its update is the last second it can decide a liquidation
+    for (let at = 1_031; at <= 1_058; at++) {
+      now = at + 0.2;
+      svc.ingest(prints((last = blob(at, [{ id: 1, generated: 1_000 }]))));
+      expect(svc.liquidationUpdate(m).kind, String(at)).toBe(at - 1_000 <= 57 ? "latest" : null);
+    }
+    expect(svc.liquidationUpdate(m).reason).toBe(tooOld(1, 58));
+    // the reopen: a fresh price again
+    now = 1_100.2;
+    const reopen = blob(1_100, [{ id: 1 }]);
+    svc.ingest(prints(reopen));
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: "fresh", update: [reopen], priceTime: 1_100 });
+    // a continuously traded market is liquidated only at a fresh price
+    now = 1_105.2;
+    svc.ingest(prints(blob(1_105, [{ id: 1, generated: 1_100 }])));
+    expect(svc.liquidationUpdate(m).kind).toBe("latest");
+    expect(svc.liquidationUpdate(market([F1]))).toMatchObject({
+      kind: null,
+      reason: "no fresh price: a continuously traded market is liquidated only at a price generated within the pair's 3 s window less the send margin, inside the oracle's confidence cap",
+    });
+  });
+
+  it("refuses an update issued ahead of the clock past the window, and ignores one stamped past the skew", () => {
+    const warn = vi.fn();
+    let now = 2_000;
+    const svc = new PriceService(null, { clock: () => now, logger: { warn } });
+    const m = hours([F1]);
+    svc.watchMarkets([m]);
+    // an endpoint whose clock runs ahead: inside the skew, but no block within the window would admit it now
+    svc.ingest(prints(blob(2_003, [{ id: 1, generated: 1_990 }])));
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: null, reason: "an update the price source holds was issued 3 s ahead of the clock, past the pair's 3 s window less the 1 s send margin" });
+    // stamped an hour ahead, whatever its price's age: ignored, so it holds neither the feed's newest price nor
+    // its most recently issued update
+    svc.ingest(prints(blob(5_600, [{ id: 1, generated: 1_995 }])));
+    expect(warn).toHaveBeenCalledWith("ignored a print for feed 0x00000000… dated 3600 s ahead of the clock (more than 5 s): check the price endpoint, or this machine's clock");
+    expect(svc.latest.get(F1)!.publishTime).toBe(1_990);
+    now = 2_003.4;
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: "latest", priceTime: 2_003, generated: [1_990] });
+  });
+
+  it("takes a market's own update, unless another carrying one of its legs was issued a second later", () => {
+    let now = 3_000.1;
+    const svc = new PriceService(null, { clock: () => now, logger: null });
+    const m = hours([F3, F4]);
+    svc.watchMarkets([m]);
+    svc.watch([F4]); // the FX leg is also watched on its own
+    const own = blob(3_000, [{ id: 3, generated: 2_990 }, { id: 4, generated: 2_980 }]);
+    svc.ingest(prints(own));
+    svc.ingest(prints(blob(3_000, [{ id: 4, generated: 2_980 }], 400_000n)));
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: "latest", update: [own], generated: [2_990, 2_980], priceTime: 3_000 });
+    // its subscription falls a second behind: each leg's most recently issued update, one per leg, and the call
+    // must land within 3 s of the earlier one
+    now = 3_001.3;
+    const alone = blob(3_001, [{ id: 4, generated: 2_980 }], 200_000n);
+    svc.ingest(prints(alone));
+    expect(svc.latestFor(m)!.map((p) => p.blob)).toEqual([own, alone]);
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: "latest", update: [own, alone], priceTime: 3_000 });
+    expect(svc.liquidationUpdate(m, 3_003.5)).toMatchObject({
+      kind: null,
+      reason: "the earliest of the newest updates the price source holds was issued 3.5 s before the clock, past the pair's 3 s window less the 1 s send margin",
+    });
+    // a poll's update carrying every feed, issued later still, serves both legs in one
+    now = 3_002.2;
+    const poll = blob(3_002, [{ id: 1 }, { id: 3, generated: 2_990 }, { id: 4, generated: 2_980 }]);
+    svc.ingest(prints(poll));
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: "latest", update: [poll], priceTime: 3_002 });
+  });
+
+  it("holds a fresh price on a market with trading hours to its update's issue window as well", () => {
+    const svc = new PriceService(null, { clock: () => 1_000, logger: null });
+    const m = hours([F1]);
+    const c = market([F1], `0x${"ee".repeat(20)}`);
+    svc.watchMarkets([m, c]);
+    // an endpoint whose clock runs ahead: the price is fresh by when it was generated, but its update was
+    // issued past the window the oracle holds every update a liquidation there carries to
+    const ahead = blob(1_005, [{ id: 1, generated: 1_002 }]);
+    svc.ingest(prints(ahead));
+    expect(svc.fresh(m)).toBe(true);
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: null, reason: "an update the price source holds was issued 5 s ahead of the clock, past the pair's 3 s window less the 1 s send margin" });
+    // a continuously traded market's oracle reads the price's generation time alone
+    expect(svc.liquidationUpdate(c)).toMatchObject({ kind: "fresh", update: [ahead], priceTime: 1_002 });
+  });
+
+  it("holds every attached update to the window by its own issue time, the newest included", () => {
+    const svc = new PriceService(null, { clock: () => 3_000.1, logger: null });
+    const m = hours([F3, F4]);
+    svc.watchMarkets([m]);
+    svc.watch([F4]);
+    const own = blob(3_000, [{ id: 3, generated: 2_990 }, { id: 4, generated: 2_980 }]);
+    svc.ingest(prints(own));
+    // the FX leg's own subscription runs ahead: inside the skew, but past the window
+    const alone = blob(3_003, [{ id: 4, generated: 2_980 }]);
+    svc.ingest(prints(alone));
+    expect(svc.latestFor(m)!.map((p) => p.blob)).toEqual([own, alone]);
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: null, reason: "an update the price source holds was issued 2.9 s ahead of the clock, past the pair's 3 s window less the 1 s send margin" });
+  });
+
+  it("composes an inverted composite as the oracle does, from each leg's latest price", () => {
+    const fx = blob(1_000, [{ id: 3, generated: 990 }, { id: 4, generated: 980, price: 15_000_000_000n }]);
+    const legsAt = [
+      { price: 200_000_000_000n, conf: 1_000n, expo: -8, publishTime: 990 },
+      { price: 15_000_000_000n, conf: 1_000n, expo: -8, publishTime: 980 },
+    ];
+    expect(pairPrice(legsAt, true)).not.toEqual(pairPrice(legsAt, false));
+    expect(readLatestPrice([fx], [F3, F4], true)).toMatchObject({ price: pairPrice(legsAt, true) });
+    expect(readLatestPrice([fx], [F3, F4], false)).toMatchObject({ price: pairPrice(legsAt, false) });
+    const svc = new PriceService(null, { clock: () => 1_000.2, logger: null });
+    const m: Market = { ...market([F3, F4], `0x${"cc".repeat(20)}`, true), continuous: false };
+    svc.watchMarkets([m]);
+    svc.ingest(prints(fx));
+    expect(svc.liquidationUpdate(m)).toMatchObject({ kind: "latest", update: [fx], price: pairPrice(legsAt, true), priceTime: 1_000 });
+  });
+
+  it("takes a price generated between two updates' issue times, and refuses updates issued too far apart", () => {
+    const early = blob(1_000, [{ id: 3, generated: 990 }]);
+    // generated after the earlier update was issued but not after the later one: inside every block both admit
+    expect(readLatestPrice([early, blob(1_002, [{ id: 4, generated: 1_001 }])], [F3, F4], false)).toMatchObject({ issuedAt: 1_000, generated: [990, 1_001] });
+    // 3 s apart at most: every block in the 3 s after the earlier one is then within 3 s of both
+    expect(readLatestPrice([early, blob(1_003, [{ id: 4, generated: 1_001 }])], [F3, F4], false)).toMatchObject({ issuedAt: 1_000 });
+    expect(readLatestPrice([early, blob(1_004, [{ id: 4, generated: 1_001 }])], [F3, F4], false)).toEqual({ problem: "the updates were issued 4 s apart, more than the pair's 3 s window" });
+  });
+});
+
+describe("PriceService, when the request API refuses a feed", () => {
+  const refusal = () =>
+    new ProError("price endpoint refused the request (HTTP 403); check the token (prices.token) and that it covers these feeds and this channel. The endpoint said: not entitled", 403);
+
+  it("asks again in parts, serves every other feed, and leaves the refused one out for a while", async () => {
+    const BAD = fid(99);
+    const asked: Hex[][] = [];
+    const src: PriceSource = {
+      async latest(ids) {
+        asked.push([...ids]);
+        if (ids.includes(BAD)) throw refusal();
+        return ids.map((f) => pr(f, 100));
+      },
+      async *stream() {},
+    };
+    const warn = vi.fn();
+    const svc = new PriceService(src, { stream: false, clock: () => 100, logger: { warn } });
+    svc.watchMarkets([market([F3, F4]), market([F1], `0x${"bb".repeat(20)}`), market([BAD, F4], `0x${"cc".repeat(20)}`)]);
+    await svc.fetch();
+    for (const f of [ETH_USD_FEED, F1, F3, F4]) expect(svc.latest.has(f), f).toBe(true);
+    expect(svc.latest.has(BAD)).toBe(false);
+    // the whole request first; the refused market's legs were last asked for one by one
+    expect(asked[0]).toEqual([ETH_USD_FEED, F1, F3, F4, BAD].sort());
+    expect(asked.filter((r) => r.length === 1 && r[0] === BAD)).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/^price endpoint refused feed 99 while serving the others: left out of its requests for 5 min \(price endpoint refused the request \(HTTP 403\)/),
+    );
+    // the next poll leaves it out, and is served whole
+    asked.length = 0;
+    await svc.fetch();
+    expect(asked).toEqual([[ETH_USD_FEED, F1, F3, F4].sort()]);
+  });
+
+  it("fails the poll when every feed is refused, leaves none out, and splits again only after a while", async () => {
+    const asked: Hex[][] = [];
+    const src: PriceSource = {
+      async latest(ids) {
+        asked.push([...ids]);
+        throw refusal();
+      },
+      async *stream() {},
+    };
+    const svc = new PriceService(src, { stream: false, clock: () => 100, logger: null });
+    svc.watchMarkets([market([F3, F4])]);
+    await expect(svc.fetch()).rejects.toThrow(/HTTP 403/);
+    expect(asked).toHaveLength(5); // the request, the market's legs and ETH/USD, then each leg alone
+    asked.length = 0;
+    await expect(svc.fetch()).rejects.toThrow(/HTTP 403/);
+    expect(asked).toEqual([[ETH_USD_FEED, F3, F4].sort()]);
+  });
+
+  it("leaves a refused feed out although another part of the poll failed otherwise", async () => {
+    const BAD = fid(99);
+    let busy = true;
+    const asked: Hex[][] = [];
+    const src: PriceSource = {
+      async latest(ids) {
+        asked.push([...ids]);
+        if (ids.includes(BAD)) throw refusal();
+        if (busy && ids.length === 1 && ids[0] === F1) throw new ProError("price endpoint returned HTTP 429: slow down", 429);
+        return ids.map((f) => pr(f, 100));
+      },
+      async *stream() {},
+    };
+    const svc = new PriceService(src, { stream: false, clock: () => 100, logger: null });
+    svc.watchMarkets([market([F1]), market([BAD], `0x${"bb".repeat(20)}`)]);
+    await expect(svc.fetch()).rejects.toThrow(/HTTP 429/);
+    busy = false;
+    asked.length = 0;
+    await svc.fetch();
+    expect(asked).toEqual([[ETH_USD_FEED, F1].sort()]);
+  });
+
+  it("asks a refused request's parts at most 8 at a time", async () => {
+    const BAD = fid(99);
+    let inFlight = 0;
+    let most = 0;
+    const src: PriceSource = {
+      async latest(ids) {
+        inFlight++;
+        most = Math.max(most, inFlight);
+        await Promise.resolve();
+        inFlight--;
+        if (ids.includes(BAD)) throw refusal();
+        return ids.map((f) => pr(f, 100));
+      },
+      async *stream() {},
+    };
+    const svc = new PriceService(src, { stream: false, clock: () => 100, logger: null });
+    const many = Array.from({ length: 20 }, (_, i) => market([fid(200 + i)], `0x${(i + 1).toString(16).padStart(40, "0")}`));
+    svc.watchMarkets([...many, market([BAD], `0x${"bb".repeat(20)}`)]);
+    await svc.fetch();
+    expect(most).toBe(8);
+    for (const m of many) expect(svc.latest.has(m.legs[0]!)).toBe(true);
   });
 });

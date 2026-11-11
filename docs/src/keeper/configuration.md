@@ -105,13 +105,15 @@ find open termination claims, insurer votes and listings.
 ## `prices`
 
 Prices come from Pyth Pro: signed updates the keeper attaches to its calls and the pair's oracle has
-verified on chain. Pyth Pro needs an access token, which you get from Pyth.
+verified on chain. Pyth's own endpoints serve prices only to the holder of a Pyth Pro API key, which
+you get from Pyth: a config that reads prices from them without one is refused when it loads
+(`prices.token: Pyth's own price endpoints serve prices only to the holder of a Pyth Pro API key: …`).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `endpoint` | string | `bazaar` | `pyth` (Pyth's own Pyth Pro endpoints, with your own token), `bazaar` (Bazaar's shared endpoint, which has no URLs yet: choosing it is an error), or the `http(s)` base URL of a Pyth Pro compatible service |
-| `token` | string | none | the Pyth Pro access token, sent as `Authorization: Bearer <token>`. A `${NAME}` reference |
-| `channel` | `real_time` \| `fixed_rate@50ms` \| `fixed_rate@200ms` \| `fixed_rate@1000ms` | `fixed_rate@200ms` | the channel the keeper streams and polls |
+| `endpoint` | string | `pyth` | `pyth` (Pyth's own Pyth Pro endpoints, with your Pyth Pro API key), or the `http(s)` base URL of a Pyth Pro compatible service |
+| `token` | string | none | the Pyth Pro API key, sent as `Authorization: Bearer <token>`. A `${NAME}` reference. Required wherever the request API or a stream endpoint is Pyth's own (an empty or blank one counts as none); a compatible service (a proxy that adds the key, `bazaar mock-prices`) may need none |
+| `channel` | `real_time` \| `fixed_rate@50ms` \| `fixed_rate@200ms` \| `fixed_rate@1000ms` | `fixed_rate@200ms` | the channel the keeper streams and polls. Keep a fixed-rate one to liquidate on closed markets: it is what guarantees an update every interval, the latest update such a liquidation carries (**The channel**, below) |
 | `streamUrls` | list of strings, at least one | the endpoint's | the WebSocket stream endpoints, in place of the endpoint's own; the keeper connects to every one |
 | `restUrl` | string | the endpoint's | the request API's base URL (`/v1/latest_price`, `/v1/price`), in place of the endpoint's own |
 | `symbolsUrl` | string | the endpoint's | the symbols registry's base URL (`/v1/symbols`), in place of the endpoint's own |
@@ -121,7 +123,7 @@ verified on chain. Pyth Pro needs an access token, which you get from Pyth.
 | `stream` | boolean | `true` | follow the WebSocket price stream; when off, poll the request API for the latest price |
 | `pollInterval` | number > 0 | `1.0` | seconds between polls when not streaming |
 | `streamIdleTimeoutSeconds` | number ≥ 0 | `10` | a stream that brings no new update for this long is dropped and reconnected; `0` waits forever |
-| `sendMarginSeconds` | 0 ≤ number < 3 | `1.0` | a call carries a print only while it is this much younger than the pair's 3 s limit, so it is still fresh when the transaction lands |
+| `sendMarginSeconds` | 0 ≤ number < 3 | `1.0` | a call carries a print only while it is this much younger than the pair's 3 s limit, so it is still fresh when the transaction lands (a liquidation's latest update, only while it was issued that recently) |
 
 **The endpoint.** `pyth` is three stream endpoints (`wss://pyth-lazer-0.dourolabs.app/v1/stream`, and
 `-1` and `-2`), the request API at `https://pyth-lazer.dourolabs.app` and the symbols registry at
@@ -129,8 +131,10 @@ verified on chain. Pyth Pro needs an access token, which you get from Pyth.
 registry at that URL and streams at its `/v1/stream` over `ws` or `wss`: `http://127.0.0.1:8787`
 (where [`bazaar mock-prices`](local-testing.md#the-mock-price-server) listens) means the request API
 and the registry there and the stream at `ws://127.0.0.1:8787/v1/stream`. `streamUrls`, `restUrl` and
-`symbolsUrl` each replace one of the three, over a preset or a base URL. A URL that carries a key is a
-secret like any other: write it as `${NAME}` ([the secrets rules](wallets.md#the-secrets-rules)).
+`symbolsUrl` each replace one of the three, over a preset or a base URL. Whichever way they are named,
+a request API or stream endpoint on Pyth's own hosts needs `token`, a custom `restUrl` beside `pyth`'s
+stream endpoints included. A URL that carries a key is a secret like any other: write it as `${NAME}`
+([the secrets rules](wallets.md#the-secrets-rules)).
 
 **Plain `http` and `ws`.** A token or a header sent over plain `http` or `ws` can be read by anyone on
 the path, so the keeper refuses to start when one would go that way to another machine:
@@ -160,8 +164,14 @@ connection unread (the endpoint is reconnected like any that drops).
 
 **The channel.** A faster channel shows a move sooner and brings more updates to read. A print is as
 old as its price, not as the update that carries it: a quiet feed's updates carry its last price
-forward, and those read as stale. A feed Pyth does not serve on the chosen channel, or that the token
-does not cover, gets no print; the keeper warns once per feed and its markets get no price.
+forward, and those read as stale. A fixed-rate channel (`fixed_rate@50ms`, `fixed_rate@200ms`, the
+default, or `fixed_rate@1000ms`) issues an update every interval whether or not the price moved,
+carrying the last price with the time it was generated. That is what a liquidation on a market with
+trading hours carries once the venue has closed: the newest such update, for a minute after that
+price ([Liquidation](jobs.md#liquidation)). A fixed-rate channel is what guarantees an update every
+interval, so keep one if the keeper should liquidate on closed markets. A feed Pyth does not serve on
+the chosen channel, or that the token does not cover, gets no print; the keeper warns once per feed
+and its markets get no price.
 
 **`checkSigners`.** Once the deployment is read, the keeper asks its Pyth verifier whether it trusts
 the signer of each update (`isValidSigner`, each answer kept for a minute) and takes no price from an
@@ -382,7 +392,7 @@ subgraph:
 
 prices:
   endpoint: pyth                 # Pyth Pro; or ${PRICE_ENDPOINT_URL} for another Pyth Pro compatible service
-  token: ${PYTH_PRO_TOKEN}       # your Pyth Pro access token
+  token: ${PYTH_PRO_TOKEN}       # your Pyth Pro API key: Pyth's own endpoints serve no one without it
   channel: fixed_rate@200ms
   checkSigners: true             # only updates signed by a signer the deployment's Pyth verifier trusts
   stream: true

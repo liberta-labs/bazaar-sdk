@@ -37,7 +37,10 @@ const registryCache = new Map<string, Held>();
  * @internal
  */
 export function cachedRegistry(src: string | SymbolSource, opts: { ttl?: number; clock?: () => number } = {}): SymbolSource {
-  const client: SymbolSource = typeof src === "string" ? new ProClient({ symbolsUrl: src }) : src;
+  // A client for the registry alone, never asked for a price and streaming nothing, so it needs no
+  // token. Its request API is Pyth's symbols host, which serves no prices and so asks for no key, so
+  // that only `src` is checked as a URL, and named as the registry's in what is wrong with it.
+  const client: SymbolSource = typeof src === "string" ? new ProClient({ symbolsUrl: src, restUrl: PYTH_PRO.symbolsUrl, streamUrls: [] }) : src;
   const key = typeof src === "string" ? src.replace(/\/+$/, "") : (src.base ?? null);
   if (key === null) return client; // nothing to key a cache on: the caller's source caches, or not
   const ttl = opts.ttl ?? REGISTRY_TTL;

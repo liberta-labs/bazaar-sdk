@@ -11,6 +11,8 @@ import { FACTORY, FakeTransport, contextFor } from "./client-reads-fakes.js";
 import { FakePro, SIGNER, type FeedSpec, evm, fakeFetch, fid, json, signed, unsigned } from "./pro-fakes.js";
 
 const [F1, F2, F3] = [fid(1), fid(2), fid(3)];
+/** What a client for Pyth's own endpoints is given as its key. */
+const TOKEN = "fake-pyth-pro-key";
 
 /** The prints of one update carrying `feeds`, stamped at second `at`, as a client returns them. */
 function update(feeds: FeedSpec[], at = 100, extraUs = 0n): Print[] {
@@ -74,7 +76,7 @@ describe("proPriceSource", () => {
 
   it("latest: asks once when the endpoint sends no update", async () => {
     const { fetch, calls } = fakeFetch(() => json({}));
-    const e = await proPriceSource(new ProClient({ fetch })).latest([F1]).catch((x) => x);
+    const e = await proPriceSource(new ProClient({ token: TOKEN, fetch })).latest([F1]).catch((x) => x);
     expect(e).toBeInstanceOf(NoLivePriceError);
     expect((e as Error).message).toBe("the price endpoint has no live price for feed 1: it sent no update");
     expect(calls).toHaveLength(1);
@@ -100,14 +102,14 @@ describe("proPriceSource", () => {
   it("takes the context's signer check unless the client has its own", async () => {
     const good = await signed({ at: 100, feeds: [{ id: 1 }] });
     const { fetch } = fakeFetch(() => json(evm(good)));
-    const src = proPriceSource({ fetch });
+    const src = proPriceSource({ token: TOKEN, fetch });
     expect(src.client.isTrustedSigner).toBeNull();
     const refuse = vi.fn(() => false);
     src.useSignerCheck(refuse);
     await expect(src.latest([F1])).rejects.toThrow("not a signer Pyth's verifier trusts");
     expect(refuse).toHaveBeenCalledWith(SIGNER);
     // a client given its own check keeps it
-    const own = proPriceSource({ fetch, isTrustedSigner: () => true });
+    const own = proPriceSource({ token: TOKEN, fetch, isTrustedSigner: () => true });
     own.useSignerCheck(refuse);
     expect((await own.latest([F1])).update).toEqual([good]);
   });
@@ -290,18 +292,18 @@ describe("livePrices and signer checks", () => {
     const t = new FakeTransport();
     t.answer(FACTORY, "getAllPairs", []);
     const ctx = contextFor(t);
-    const own = await livePrices(ctx, { pro: { restUrl: "https://pro.test" }, start: false });
+    const own = await livePrices(ctx, { pro: { token: TOKEN, restUrl: "https://pro.test" }, start: false });
     expect((own.service.client as ProClient).isTrustedSigner).toBeTypeOf("function");
     own.stop();
-    const given = new ProClient({ restUrl: "https://pro.test" });
+    const given = new ProClient({ token: TOKEN, restUrl: "https://pro.test" });
     (await livePrices(ctx, { client: given, start: false })).stop();
     expect(given.isTrustedSigner).toBeTypeOf("function");
     // a check of its own is kept, and a context that does not check signers installs none
     const kept = () => true;
-    const mine = new ProClient({ isTrustedSigner: kept });
+    const mine = new ProClient({ token: TOKEN, isTrustedSigner: kept });
     (await livePrices(ctx, { client: mine, start: false })).stop();
     expect(mine.isTrustedSigner).toBe(kept);
-    const off = await livePrices({ ...ctx, checkSigners: false }, { pro: {}, start: false });
+    const off = await livePrices({ ...ctx, checkSigners: false }, { pro: { token: TOKEN }, start: false });
     expect((off.service.client as ProClient).isTrustedSigner).toBeNull();
     off.stop();
   });

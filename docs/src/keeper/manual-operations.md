@@ -63,9 +63,12 @@ settling; this job runs while it is live`. Planning finds nothing: `skipped … 
 maintenance margin`.
 
 With an explicit list the planner's filters are skipped (the chain still decides in simulation), so
-`--accounts` can name an account the index does not know about. `liquidate --accounts` on a closed
-market uses the stored price when it is at most 9.5 minutes old (the pair accepts one up to 10). `execute-triggers --orders` and
-`execute-adl` need a fresh print.
+`--accounts` can name an account the index does not know about. The price is the job's: `liquidate
+--accounts` on a closed market carries Pyth's latest update, as the job does
+([Liquidation](jobs.md#liquidation)). When no price can decide a liquidation (that update's price more
+than a minute old, say), `liquidate` is skipped with the reason and nothing is simulated: `no price can
+decide a liquidation now (…): positions wait for the market's next price` (without `--accounts`, on a
+market that holds positions). `execute-triggers --orders` and `execute-adl` need a fresh print.
 
 For `collect`, `--force` means "claim every balance that covers its gas, as on shutdown" rather than
 skipping the rules.

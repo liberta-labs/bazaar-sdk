@@ -30,7 +30,7 @@ import { SweepExpiredJob } from "../src/keeper/jobs/sweep.js";
 import { TerminalSettlementJob } from "../src/keeper/jobs/terminal.js";
 import { TriggersJob } from "../src/keeper/jobs/triggers.js";
 import { UnloadJob } from "../src/keeper/jobs/unload.js";
-import { DEP, FEE, ME, S, acct, fake, order, position } from "./keeper-harness.js";
+import { DEP, FEE, FEED, ME, S, acct, fake, order, position, update } from "./keeper-harness.js";
 
 let dir: string;
 beforeEach(() => {
@@ -184,19 +184,30 @@ describe("liquidation", () => {
     expect(decode(again[0]!).args[0]).toEqual([ALICE]);
   });
 
-  it("a closed session market liquidates at the stored price within 570 s, a 24/7 one never without a fresh print", async () => {
+  it("a closed session market liquidates on Pyth's latest update, never on an old stored price; a 24/7 one never without a fresh print", async () => {
     const f = liq({}, { continuous: false });
-    f.positions.set(ALICE, position(ALICE, 150));
-    f.m.state = { ...f.m.state!, spot: 1_940n * S, updateTs: f.now - 100 };
-    const [a] = await f.job.plan(f.m);
-    expect(decode(a!).args).toEqual([[ALICE], []]);
-    expect(a!.value).toBe(0n);
-    f.m.state = { ...f.m.state, updateTs: f.k.now() - 571 };
+    f.positions.set(ALICE, position(ALICE, 150)); // under at 1940, not at 2000
+    const now = Math.floor(f.k.chainTime());
+    // The stored 1940 is 100 s old: no call without an update is planned on it.
+    f.m.state = { ...f.m.state!, spot: 1_940n * S, updateTs: now - 100 };
     expect(await f.job.plan(f.m)).toEqual([]);
+    expect(f.calls.buckets).toEqual([]);
+    // The venue closed 30 s ago at 1940, and Pyth's update issued this second carries that price forward.
+    f.m.state = { ...f.m.state, spot: 2_000n * S };
+    const latest = update(now, [{ feed: FEED, usd: 1_940, generated: now - 30 }]);
+    f.k.prices.ingest(latest.prints);
+    const [a] = await f.job.plan(f.m);
+    expect(decode(a!).args).toEqual([[ALICE], [latest.blob]]); // judged at 1940, the update attached
+    expect(a!.value).toBe(FEE);
+    expect([a!.priceTime, a!.priceIssued]).toEqual([now, true]); // the update's issue second
+    expect(a!.summary).toBe("liquidate 1 account(s), $1,940 notional");
+    // A 24/7 market is liquidated only at a fresh print: neither that update nor a print too old to send.
     const g = liq();
     g.positions.set(ALICE, position(ALICE, 150));
-    g.m.state = { ...g.m.state!, spot: 1_940n * S };
-    g.printAt(1_940, 10); // too old to send
+    g.m.state = { ...g.m.state!, spot: 2_000n * S, updateTs: now - 100 };
+    g.k.prices.ingest(latest.prints);
+    expect(await g.job.plan(g.m)).toEqual([]);
+    g.printAt(1_940, 10);
     expect(await g.job.plan(g.m)).toEqual([]);
   });
 

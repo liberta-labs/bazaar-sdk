@@ -12,7 +12,7 @@ import { UnloadJob } from "./unload.js";
 export { AdlJob } from "./adl.js";
 export { ALL_STATUSES, type ActionExtras, Job, type JobClass, LIVE, LIVE_OR_ADL, PricedCall, monotonic } from "./base.js";
 export { CollectJob } from "./collect.js";
-export { LiquidationJob, belowMaintenance } from "./liquidation.js";
+export { LiquidationJob, type NoLiquidationPrice, belowMaintenance } from "./liquidation.js";
 export { RefreshJob } from "./refresh.js";
 export { SweepExpiredJob } from "./sweep.js";
 export { TerminalSettlementJob } from "./terminal.js";

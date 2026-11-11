@@ -4,7 +4,16 @@
  * Unknown keys are refused everywhere, so a typo is an error rather than a silently ignored setting.
  */
 
-import { CHANNEL_IDS, type Channel, DEFAULT_CHANNEL, NETWORKS, PRICE_ENDPOINTS, type ProEndpoints, isUrl } from "@liberta-labs/bazaar-sdk";
+import {
+  CHANNEL_IDS,
+  type Channel,
+  DEFAULT_CHANNEL,
+  NETWORKS,
+  PRICE_ENDPOINTS,
+  type ProEndpoints,
+  isPythProPriceEndpoint,
+  isUrl,
+} from "@liberta-labs/bazaar-sdk";
 import { type Address, getAddress, isAddress } from "viem";
 import { z } from "zod";
 
@@ -48,11 +57,14 @@ const CHANNELS = Object.keys(CHANNEL_IDS) as [Channel, ...Channel[]];
 export const PricesConfig = z
   .object({
     /**
-     * pyth | bazaar | the base URL of a Pyth Pro compatible service: one that answers the request API
-     * and the symbols registry at that URL and streams at its `/v1/stream`.
+     * pyth | the base URL of a Pyth Pro compatible service: one that answers the request API and the
+     * symbols registry at that URL and streams at its `/v1/stream`.
      */
-    endpoint: z.string().default("bazaar"),
-    /** the Pyth Pro access token, sent as "Authorization: Bearer <token>" */
+    endpoint: z.string().default("pyth"),
+    /**
+     * the Pyth Pro API key, sent as "Authorization: Bearer <token>"; required for Pyth's own endpoints
+     * ({@link missingProKey})
+     */
     token: z.string().nullish(),
     /** the channel streamed and polled: the faster it is, the sooner a move is seen and the more updates arrive */
     channel: z.enum(CHANNELS).default(DEFAULT_CHANNEL),
@@ -321,6 +333,8 @@ export const KeeperConfig = z
   .strict()
   .superRefine((c, ctx) => {
     const issue = (message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+    const noKey = missingProKey(c.prices);
+    if (noKey !== null) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["prices", "token"], message: noKey });
     const preset = NETWORKS[c.network];
     if (c.network !== "custom" && !preset) {
       issue(`network must be one of ${[...Object.keys(NETWORKS), "custom"].join(", ")}, not ${JSON.stringify(c.network)}`);
@@ -400,7 +414,7 @@ export const UNCHECKED_SIGNERS_WARNING =
  * endpoints it may go to.
  */
 export const PRICES_API_KEY_MESSAGE =
-  "prices.apiKey is not a setting: the Pyth Pro access token goes in prices.token (a Pyth Core or Hermes key does not work), " +
+  "prices.apiKey is not a setting: the Pyth Pro API key goes in prices.token (a Pyth Core or Hermes key does not work), " +
   "and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service";
 
 /**
@@ -426,23 +440,45 @@ export function hermesEndpointProblem(setting: string, url: string): string | nu
 }
 
 /**
+ * What a config that reads prices from Pyth's own endpoints without a token is told (the setting it
+ * concerns, `prices.token`, is named where it is reported).
+ */
+export const PRO_KEY_REQUIRED =
+  "Pyth's own price endpoints serve prices only to the holder of a Pyth Pro API key: give yours as prices.token (in the " +
+  "config file token: ${PYTH_PRO_TOKEN}, with the key in .env), or set prices.endpoint to a Pyth Pro compatible service " +
+  "that needs none (a proxy that adds the key, bazaar mock-prices on a local chain)";
+
+/**
+ * {@link PRO_KEY_REQUIRED} when `p` reads prices from Pyth's own request API or stream endpoints (the
+ * `pyth` preset, Pyth's URLs, or a custom request API beside Pyth's default stream URLs) and gives no
+ * token, else null. A token that is empty or blank counts as none: `${PYTH_PRO_TOKEN:-}` with the
+ * variable unset fills in an empty one, and the operator is told about the key rather than about an
+ * empty token. The price client refuses a missing token too; refusing it here reports it with the
+ * rest of the config's problems. The symbols registry needs no key. Null as well when the endpoints
+ * cannot be resolved: {@link priceEndpoints} names that setting.
+ */
+export function missingProKey(p: PricesConfig): string | null {
+  if (typeof p.token === "string" && p.token.trim() !== "") return null;
+  let e: ProEndpoints;
+  try {
+    e = priceEndpoints(p);
+  } catch {
+    return null;
+  }
+  return [e.restUrl, ...e.streamUrls].some(isPythProPriceEndpoint) ? PRO_KEY_REQUIRED : null;
+}
+
+/**
  * Where the keeper reads prices. `prices.endpoint` gives the three places (a preset's, or those a base
  * URL implies: the request API and the symbols registry at the base, the stream at its `/v1/stream`
  * over ws or wss), and `prices.streamUrls`, `prices.restUrl` and `prices.symbolsUrl` each replace one.
- * Throws, naming the setting, when the endpoint is a preset without URLs or neither a preset nor an
- * http(s) URL, and when a URL the token is sent to names Hermes ({@link hermesEndpointProblem}).
+ * Throws, naming the setting, when the endpoint is neither a preset nor an http(s) URL, and when a URL
+ * the token is sent to names Hermes ({@link hermesEndpointProblem}).
  */
 export function priceEndpoints(p: PricesConfig): ProEndpoints {
   let base: ProEndpoints;
   if (Object.hasOwn(PRICE_ENDPOINTS, p.endpoint)) {
-    const preset = PRICE_ENDPOINTS[p.endpoint];
-    if (!preset) {
-      throw new Error(
-        `prices.endpoint: the '${p.endpoint}' price endpoint has no URLs yet; set prices.endpoint to 'pyth' with your own Pyth Pro token ` +
-          "(prices.token), or to the URL of a Pyth Pro compatible service",
-      );
-    }
-    base = preset;
+    base = PRICE_ENDPOINTS[p.endpoint];
   } else {
     const url = p.endpoint.trim().replace(/\/+$/, "");
     if (!isUrl(url) || !/^https?:/i.test(url)) {

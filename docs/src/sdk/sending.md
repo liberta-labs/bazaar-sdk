@@ -66,6 +66,20 @@ cap, or not a usable live price, a market with trading hours gets no update (the
 The insurance and termination builders that read a price are described on [Insurance](insurance.md)
 and [Termination & Settlement](termination.md).
 
+A liquidation is held to a stricter rule: without an update it never runs on a stored price more
+than 3 seconds old, and on a market with trading hours it reads an attached update as Pyth's latest price
+instead, accepting it when every update was issued within 3 seconds of the block and its price was
+generated at most a minute before the block. `liquidationUpdateFor(ctx, pair)` returns the update a
+liquidation attaches and its fee: a fresh price when there is one (`kind: "fresh"`), else on a market
+with trading hours the latest update, provided its price was generated at most `MAX_LATEST_PRICE_LAG`
+(57) seconds before the update was issued (`kind: "latest"`). `priceTime` is the second the call must
+land within 3 seconds of: on a continuously traded market the price's generation second; on a market
+with trading hours the update's issue second, fresh price or not, since the oracle judges every update
+a liquidation there carries by when it was issued. It never returns an empty update: it throws `NoFreshPriceError` on a continuously
+traded market without a fresh price, and `NoLiquidationPriceError` when Pyth's latest price cannot
+decide the call either, in which case positions wait for the market's next price. `priceUpdateFor` is
+not for liquidations.
+
 ## Simulating
 
 ```ts
@@ -154,7 +168,9 @@ The pair accepts a Pyth price only when it was generated at most 3 seconds from 
 (`MAX_PRICE_STALENESS`). A call that carries an update is judged on it: the pair has it verified, and
 an update whose price is older than that reverts the call. A call that carries none runs on the pair's
 own stored price while that is at most 3 seconds old, which it is only when another call stored one
-that recently. Pyth Pro keeps no price on chain, so nothing else stands in. See
+that recently. Pyth Pro keeps no price on chain, so nothing else stands in. A liquidation on a market
+with trading hours is the exception: it may carry Pyth's latest update, judged by when the update was
+issued ([PreparedCall](#preparedcall)). See
 [Oracle](https://docs.bazaar.finance/protocol/oracle.html) for the full rule, including the stale-price
 regime of markets with trading hours.
 
@@ -193,10 +209,10 @@ count against those 3 seconds. In practice:
 {{#include ../../examples/trading/sending.ts:fresh}}
 ```
 
-A stale print fails inside Pyth's contract with Pyth's own `StalePrice` error (selector `0x19abf40e`).
-The SDK's ABIs do not declare it, so it decodes as `Unknown(0x19abf40e)`; when you see that name on a
-price-carrying call, rebuild it. [Errors & Messages](errors.md#errors-the-sdk-does-not-name) shows how to
-give it a message.
+A stale print fails in Bazaar's oracle with `BazaarOracle__StalePrice(feedId, generatedTs)`, the second
+the price was generated. `decodeError` names it and `errorMessage` gives it a user message
+([Errors & Messages](errors.md)); when you see it on a price-carrying call, rebuild the call and send it
+again.
 
 ## Waiting for the Receipt
 

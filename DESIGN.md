@@ -102,11 +102,15 @@ was), so while a market's stored price is from the print's second or a later one
 at the stored price: a candidate that crosses only at the print waits for the next second's print,
 and one that crosses at the stored price is not missed. Such a call carries no update: the chain's
 stored price never goes back, so the pair could never store the print, and attaching it would only
-cost its fee and a revert once the print aged past the window. A candidate the chain refuses waits
-`engine.simCooldownSeconds` before it is simulated again; nothing else schedules a retry. Just before
-signing, the executor checks the age of the price a call relies on against the chain's time, and does
-not send one older than the pair's 3 s window less `prices.sendMarginSeconds`: nothing refused that
-candidate, so the next print plans it again.
+cost its fee and a revert once the print aged past the window. Without a fresh print, a liquidation on
+a market with trading hours carries Pyth's latest update (`PriceService.liquidationUpdate`) and is
+judged at its price, or at the stored price when that is strictly newer; failing that, on any market,
+it runs without an update only on a stored price within the window less the send margin, and
+otherwise waits, with the reason at debug level. A candidate the chain refuses waits `engine.simCooldownSeconds` before
+it is simulated again; nothing else schedules a retry. Just before signing, the executor checks the
+age of the price a call relies on (for a latest update, when it was issued) against the chain's time,
+and does not send one older than the pair's 3 s window less `prices.sendMarginSeconds`: nothing
+refused that candidate, so the next print or tick plans it again.
 
 ## The subgraph finds, the chain decides
 
@@ -160,19 +164,46 @@ client, and `prices/service.ts` keeps the live state.
 - **Freshness.** The pair accepts a price generated at most 3 s from the block's time whose confidence
   is within 2% (per leg, and on the composed price). A call carries an update only while its price is
   `sendMarginSeconds` younger than that, so it is still fresh when the transaction lands. Attaching
-  an older one would revert the call, so a closed session market gets no update and only the jobs
-  that work on the stored price proceed (liquidation, within 10 minutes of the stored price).
+  an older one would revert the call, so a closed session market gets no fresh update; only the jobs
+  that work without one proceed there, and liquidation through Pyth's latest price (below).
+- **Liquidation reads Pyth's latest price.** A call without an update never liquidates on a stored
+  price more than 3 s old. On a market with trading hours it reads an attached update as Pyth's latest price
+  (`BazaarOracle.verifyAndFetchLatestPrice`): every update issued within 3 s of the block, each leg's
+  price generated at most `MAX_LIQUIDATION_PRICE_AGE` (60 s) before it. An update carries each feed's
+  most recent price as of when it was issued, so that proves no newer price existed; a closed venue's
+  last price can decide a liquidation for a minute after it was generated, and then positions wait for
+  the next price. `PriceService` keeps each market's most recently issued update alongside its
+  freshest one (`latestFor`), and `liquidationUpdate(market)` says what a liquidation attaches: the
+  fresh price's update, else Pyth's latest one when it was issued within the window less the send
+  margin and its price at most `MAX_LATEST_PRICE_LAG` (57 s) before that, which keeps the price within
+  the minute in any block the issue time admits, else nothing, with the reason. The call must land
+  within 3 s of its `priceTime`, the latest update's issue second (for a fresh price, its generation
+  second, so the call goes only while that price is fresh). `liquidationUpdateFor(ctx, pair)` reads the
+  price source's latest update the same way, without a clock: on a market with trading hours its
+  `priceTime` is that update's issue second whether the price is fresh or not, since the oracle judges
+  every update a liquidation there carries by when it was issued, and it throws rather than return an
+  empty update.
 - **A live price needs four properties.** Price, exponent, a confidence above zero and a generation
   time. The oracle refuses an update without any of them, so a feed entry lacking one yields no print.
 - **No price on chain but the pair's own.** An update a call carries is verified and must be fresh, or
   the call reverts; the pair then judges the call at it when it was generated in a later second than
-  the price the pair holds, and at the price it holds otherwise. A call without one runs on the
+  the price the pair holds, and at the price it holds otherwise. A liquidation on a market with
+  trading hours is the exception, above: its update is read as Pyth's latest price, and it is judged at
+  that price in the stored price's own second too. A call without one runs on the
   pair's stored price while that is at most 3 s old (at any age on a market with trading hours, where
-  the call accepts that). So the SDK's builders attach an update only when the oracle would accept
-  it, and otherwise send none on a market with trading hours and refuse to build on a continuously
-  traded one (`NoFreshPriceError`).
+  the call accepts that, which a liquidation never does). So the SDK's builders attach an update only
+  when the oracle would accept it, and otherwise send none on a market with trading hours and refuse to
+  build on a continuously traded one (`NoFreshPriceError`).
+- **A Pyth Pro API key.** Pyth's own endpoints serve prices only to the holder of a Pyth Pro API key,
+  so a `ProClient` for them without a token is refused when it is made (an `InputError` on
+  `prices.token`); in a browser the token is a short-lived one the app's backend mints from the key.
+  Without a token both the request API and every stream endpoint must be custom ones (a proxy that adds
+  the key, a local mock), and the symbols registry needs none.
 - **The keeper's client.** The keeper builds one `ProClient` from `prices` (the endpoint's three places,
-  the token, the channel) and streams on the `ws` package (Node has a global WebSocket only from 22),
+  the token, the channel); `prices.endpoint` defaults to `pyth`, and config validation refuses Pyth's
+  own endpoints without `prices.token` (a `ConfigError` naming it, which the keeper also raises in
+  place of the client's `InputError` for a config that skipped validation). It streams on the `ws`
+  package (Node has a global WebSocket only from 22),
   bounded so an endpoint cannot make it buffer more than the client reads: no compression, no
   redirects, a handshake timeout, and a frame announcing more than three times the SDK's
   `MAX_STREAM_MESSAGE` ends the connection unread. Once the deployment is read it installs the
@@ -316,7 +347,8 @@ names the rule a settlement is under, and calls a stored-price fallback what it 
 ## Open questions
 
 1. **The shared price endpoint.** Its URL, how keepers authenticate, and whether Pyth's licence lets
-   Bazaar hand signed updates to third-party keepers. `prices.endpoint: bazaar` errors until then.
+   Bazaar hand signed updates to third-party keepers. Until then there is none: `PRICE_ENDPOINTS`
+   holds only `pyth`, and a client for Pyth's endpoints needs the operator's own Pyth Pro API key.
 2. **Network presets.** The official factory, its deployment block and the subgraph URL for each
    network, once deployed.
 3. **Refresh-bounty constants** are internal to `RiskParamsLib`, so `constants.ts` copies them for

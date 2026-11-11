@@ -9,8 +9,8 @@ Before you start, have at hand:
 
 - an Arbitrum RPC URL that supports `eth_call` state overrides (most hosted providers' URLs carry
   your API key; the wizard keeps them out of the config file);
-- a Pyth Pro access token (from Pyth; a Pyth Core or Hermes key does not work), or the URL of another
-  Pyth Pro compatible price service;
+- a Pyth Pro API key (from Pyth; a Pyth Core or Hermes key does not work), which Pyth's own price
+  endpoints require, or the URL of another Pyth Pro compatible price service;
 - the factory address of the Bazaar deployment you want to keep (the network presets carry no
   official address yet);
 - a little ETH on that network for gas.
@@ -104,9 +104,11 @@ from the factory's deployment block; later starts resume from the snapshot eithe
 
 | Answer | Asks | Writes |
 |---|---|---|
-| Pyth Pro, with my own access token | the token (hidden) | `prices.endpoint: pyth`, `prices.token: ${PYTH_PRO_TOKEN}` |
-| Custom Pyth Pro compatible URL (bazaar mock-prices, a proxy) | the URL (on Anvil, default `http://127.0.0.1:8787`), then whether it needs an access token, and the token | `prices.endpoint: ${PRICE_ENDPOINT_URL}`, and `prices.token: ${PRICE_TOKEN}` if it needs one |
-| Bazaar shared endpoint | (not selectable: it has no URLs yet) | |
+| Pyth Pro, with my Pyth Pro API key | the key (hidden), always | `prices.endpoint: pyth`, `prices.token: ${PYTH_PRO_TOKEN}` |
+| Custom Pyth Pro compatible URL (bazaar mock-prices, a proxy) | the URL (on Anvil, default `http://127.0.0.1:8787`); then, for one of Pyth's own URLs, the Pyth Pro API key; for any other, whether it needs an access token, and the token | `prices.endpoint: ${PRICE_ENDPOINT_URL}`, and `prices.token: ${PYTH_PRO_TOKEN}` for Pyth's own URL, or `prices.token: ${PRICE_TOKEN}` if another needs one |
+
+Pyth's own endpoints serve prices only to the holder of a Pyth Pro API key, so the wizard asks for the
+key whenever the endpoint is Pyth's, and a config without it does not load.
 
 It then reads an ETH/USD print (Pyth Pro feed 2) from the request API to check the endpoint and the
 token: `✔ ETH/USD print 3,012.45`, or a warning (`⚠ could not read a print yet: …`) that does not stop
@@ -223,7 +225,7 @@ and the `.env` beside it, owner-only (mode 0600) where the file system has POSIX
 
 ```bash
 RPC_HTTP_URL=https://arb-sepolia.g.alchemy.com/v2/your-key
-PYTH_PRO_TOKEN=your-pyth-pro-token
+PYTH_PRO_TOKEN=your-pyth-pro-api-key
 KEEPER_KEYSTORE_PASSWORD=your-password
 ```
 
@@ -242,7 +244,9 @@ bazaar keeper doctor
 `doctor` loads the config and the wallets (a keystore without a stored password is asked for here),
 then checks everything `start` relies on, one line each. It exits 0 when nothing failed (warnings
 allowed) and 1 otherwise. A config file that does not load (invalid YAML, a secret written into it,
-an unknown key) prints one line and exits 2. URLs and keys are masked in everything it prints.
+an unknown key, Pyth's own price endpoints without a Pyth Pro API key: `prices.token: Pyth's own price
+endpoints serve prices only to the holder of a Pyth Pro API key: …`) prints the problem and exits 2.
+URLs and keys are masked in everything it prints.
 
 ```text
 ✔ RPC            chain 421614, latency 84 ms, eth_call state overrides supported
@@ -257,7 +261,7 @@ an unknown key) prints one line and exits 2. URLs and keys are masked in everyth
 
 | Line | What it checks | When it fails |
 |---|---|---|
-| Config | the keeper can be built: the network, `rpc.send`, the price endpoint, the wallets (keystores decrypted) | `✘ Config` with the reason, and nothing else is checked |
+| Config | the keeper can be built: the network, `rpc.send`, the price endpoint and its key, the wallets (keystores decrypted) | `✘ Config` with the reason, and nothing else is checked |
 | RPC | `eth_chainId` and its latency; whether `eth_call` state overrides work | unreachable, or on another chain: stops here. No overrides is a warning: paid jobs will skip |
 | Factory | the deployment can be read from the factory, and how many markets it lists; whether it is an official deployment | the factory cannot be read (wrong address, no code): stops here |
 | Wiring | the lens and the terminator report this factory | either belongs to a different factory or reports none (`start` refuses to run) |

@@ -47,7 +47,7 @@ import { pairPrice } from "../src/formulas/index.js";
 import { FEED, INTEGRATOR, PAIR, USDC, alice, bob, bucket, fakeContext, mockUpdate, storedOrder } from "./client-writes-fake.js";
 import { type FeedSpec, fid, unsigned } from "./pro-fakes.js";
 import type { PriceUpdateSource } from "../src/client/context.js";
-import { NoFreshPriceError, priceUpdateFor, updateProblem } from "../src/client/feeds.js";
+import { NoFreshPriceError, NoLiquidationPriceError, liquidationUpdateFor, priceUpdateFor, updateProblem } from "../src/client/feeds.js";
 import { NO_HINTS } from "../src/client/orders.js";
 import { errorMessage } from "../src/errors/messages.js";
 import { NoLivePriceError, ProError } from "../src/prices/pro.js";
@@ -666,5 +666,37 @@ describe("the price update a builder attaches", () => {
     // one with a position reads a price: refused here rather than on chain
     stockAccount(fake, bucket({ size: E18 }));
     await expect(withdrawCollateral(ctx, PAIR, alice.address, 3n * E18)).rejects.toBeInstanceOf(NoFreshPriceError);
+  });
+
+  it("gives a liquidation a fresh price, else on a market with trading hours Pyth's latest one, and never no update", async () => {
+    // a fresh price, as any call carries it
+    expect(await liquidationUpdateFor(scene(sourceOf(), true).ctx, PAIR)).toEqual({ update: updateWith(), fee: 7n, kind: "fresh", publishTime: AT, priceTime: AT });
+    // on a market with trading hours the oracle judges even a fresh price's update by when it was issued,
+    // so the call has until 3 s after that
+    const recent = { generated: AT - 2 };
+    expect(await liquidationUpdateFor(scene(sourceOf(recent), false).ctx, PAIR)).toEqual({ update: updateWith(recent), fee: 7n, kind: "fresh", publishTime: AT - 2, priceTime: AT });
+    expect(await liquidationUpdateFor(scene(sourceOf(recent), true).ctx, PAIR)).toMatchObject({ kind: "fresh", publishTime: AT - 2, priceTime: AT - 2 });
+    // a closed venue: the latest update carries the last price forward, which a liquidation may use for a
+    // minute, and the call must land within 3 s of when the update was issued
+    const quiet = { generated: AT - 30 };
+    expect(await liquidationUpdateFor(scene(sourceOf(quiet), false).ctx, PAIR)).toEqual({ update: updateWith(quiet), fee: 7n, kind: "latest", publishTime: AT - 30, priceTime: AT });
+    // a continuously traded market is liquidated only at a fresh price
+    const e1 = await liquidationUpdateFor(scene(sourceOf(quiet), true).ctx, PAIR).catch((x) => x);
+    expect(e1).toBeInstanceOf(NoFreshPriceError);
+    // a last price too old to decide a liquidation, or wider than the cap: refused here, not sent to revert
+    const e2 = (await liquidationUpdateFor(scene(sourceOf({ generated: AT - 3_600 }), false).ctx, PAIR).catch((x) => x)) as NoLiquidationPriceError;
+    expect(e2).toBeInstanceOf(NoLiquidationPriceError);
+    expect(e2.reason).toBe("feed 171's latest price was generated 3600 s before the update carrying it was issued, more than the 57 s that keeps it within the 60 s a liquidation's price may be old");
+    expect(e2.message).toBe(`No price can decide a liquidation on market ${PAIR} now (${e2.reason}): positions wait for its next price.`);
+    expect(errorMessage(e2)).toBe("This market has no price that can decide a liquidation right now. Liquidations wait for its next price.");
+    const wide = (await liquidationUpdateFor(scene(sourceOf({ ...quiet, conf: 5_000_000_000n }), false).ctx, PAIR).catch((x) => x)) as NoLiquidationPriceError;
+    expect(wide.reason).toBe("Pyth's confidence interval for the latest price is wider than the oracle's 2% cap");
+    // a source with no live price at all for the feed
+    const noPrice = new NoLivePriceError("the price endpoint has no live price for feed 171: Pyth has no price for it at the update's time");
+    const e3 = (await liquidationUpdateFor(scene({ latest: () => Promise.reject(noPrice) }, false).ctx, PAIR).catch((x) => x)) as NoLiquidationPriceError;
+    expect([e3 instanceof NoLiquidationPriceError, e3.reason]).toEqual([true, noPrice.message]);
+    // and one that cannot be asked fails as it is
+    const down = scene({ latest: () => Promise.reject(new ProError("price endpoint unreachable: timeout")) }, false);
+    await expect(liquidationUpdateFor(down.ctx, PAIR)).rejects.toThrow(new ProError("price endpoint unreachable: timeout"));
   });
 });

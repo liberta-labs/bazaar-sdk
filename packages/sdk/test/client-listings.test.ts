@@ -25,7 +25,8 @@ import {
 } from "../src/client/listings.js";
 import { proPriceSource } from "../src/client/prices.js";
 import { BondQuoteError, erc20Codec, optimisticOracleCodec } from "../src/client/uma.js";
-import { ProClient, type ProSymbol } from "../src/prices/pro.js";
+import { ProClient, ProError, type ProSymbol } from "../src/prices/pro.js";
+import { PYTH_PRO } from "../src/networks.js";
 import { fakeFetch, json } from "./pro-fakes.js";
 import { cachedRegistry, feedInfoFor } from "../src/client/registry.js";
 import { ADDR, FakeChain, Revert, b32, makeCtx } from "./termination-fakes.js";
@@ -284,7 +285,7 @@ describe("proposePairDeployment", () => {
     // null skips it; by default the context's own Pyth Pro client is asked
     expect((await proposePairDeployment(s.ctx, args({ baseFeedId: 404, registry: null }))).legFeeds).toEqual([null]);
     const { fetch, calls } = fakeFetch(() => json([{ pyth_lazer_id: 0xaaa1, symbol: "Crypto.BTC/USD", asset_type: "crypto", min_channel: "real_time", state: "stable" }]));
-    const ctx = makeCtx(s.fake, { prices: proPriceSource(new ProClient({ fetch, symbolsUrl: "https://listing-registry.test" })) });
+    const ctx = makeCtx(s.fake, { prices: proPriceSource(new ProClient({ token: "fake-pyth-pro-key", fetch, symbolsUrl: "https://listing-registry.test" })) });
     expect((await proposePairDeployment(ctx, args())).legFeeds[0]).toMatchObject({ symbol: "Crypto.BTC/USD" });
     await inputError(proposePairDeployment(ctx, args({ baseFeedId: 404 })), "baseFeedId");
     expect(calls).toHaveLength(1); // the listing is fetched once per registry
@@ -503,10 +504,32 @@ describe("the symbols registry", () => {
     });
     try {
       const { fetch } = fakeFetch(() => json([{ pyth_lazer_id: 7, symbol: "Test.SEVEN/USD" }]));
-      const ctx = makeCtx(new FakeChain(), { prices: proPriceSource(new ProClient({ fetch, symbolsUrl: "https://own-registry.test" })) });
+      const ctx = makeCtx(new FakeChain(), { prices: proPriceSource(new ProClient({ token: "fake-pyth-pro-key", fetch, symbolsUrl: "https://own-registry.test" })) });
       expect(await feedInfoFor(ctx, [b32(1)], undefined)).toEqual(new Map()); // its own lists no feed 1, and that is the answer
       expect((await feedInfoFor(ctx, [b32(7)], undefined)).get(b32(7))?.symbol).toBe("Test.SEVEN/USD");
       expect(asked).toEqual([]); // Pyth's registry was never asked
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reads a registry given by its URL, and Pyth's own, without a token", async () => {
+    const asked: { url: string; auth: string | null }[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL, init: RequestInit = {}) => {
+      asked.push({ url: String(input), auth: new Headers(init.headers).get("authorization") });
+      return json([{ pyth_lazer_id: 9, symbol: "Test.NINE/USD" }]);
+    });
+    try {
+      const ctx = makeCtx(new FakeChain());
+      expect((await feedInfoFor(ctx, [b32(9)], "https://url-registry.test")).get(b32(9))?.symbol).toBe("Test.NINE/USD");
+      // a context without a Pyth Pro source reads Pyth's registry, which needs no key
+      await expect(feedInfoFor(ctx, [b32(9)], undefined)).resolves.toBeInstanceOf(Map);
+      expect(asked[0]!.url).toBe("https://url-registry.test/v1/symbols");
+      expect(asked.every((a) => a.auth === null)).toBe(true);
+      // what is wrong with a registry's URL is named as the registry's, and a Pyth price host given as one
+      // asks for no key, since a registry read sends none
+      expect(() => cachedRegistry("pyth")).toThrow(new ProError("the symbols registry URL is not an http(s) or ws(s) URL"));
+      expect(() => cachedRegistry(PYTH_PRO.restUrl)).not.toThrow();
     } finally {
       vi.unstubAllGlobals();
     }

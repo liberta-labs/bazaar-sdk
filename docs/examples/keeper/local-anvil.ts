@@ -53,7 +53,8 @@ const running = keeper.start();
 await new Promise((r) => setTimeout(r, 10_000));
 mock.setPrice(ETH_USD_FEED, 1500);
 // Stop the feed generating prices, as a market closing for the night would: its updates carry the
-// last price forward, so the keeper attaches none of them.
+// last price forward, so on this 24/7 market the keeper attaches none of them (on a market with
+// trading hours a liquidation could still carry the newest, for a minute after that price).
 mock.pause(ETH_USD_FEED);
 await new Promise((r) => setTimeout(r, 10_000));
 mock.resume(ETH_USD_FEED);

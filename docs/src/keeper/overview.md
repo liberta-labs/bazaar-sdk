@@ -81,7 +81,7 @@ real run would do.
 |---|---|---|
 | Node 20 or later | the keeper is a Node program | or Docker ([Running in Production](production.md#docker)) |
 | An Arbitrum RPC with `eth_call` state overrides | the probe is placed by a state override; reads are batched through it | Without overrides calls are simulated directly: reverts are still caught, but the reward is unknown, so paid jobs skip. `bazaar keeper doctor` checks. The node must also answer `eth_getLogs` (refused ranges are split automatically) and, when there is no subgraph and no `startBlock`, historical `eth_getCode` reads |
-| A Pyth Pro price endpoint | every price-touching call carries a signed Pyth Pro update, which Pyth's verifier checks on chain | `pyth` with your own Pyth Pro access token, or the URL of a Pyth Pro compatible service. Bazaar's shared endpoint (`bazaar`) has no URLs yet. The keeper streams over a WebSocket (the `ws` package, so Node 20 works) |
+| A Pyth Pro price endpoint | every price-touching call carries a signed Pyth Pro update, which Pyth's verifier checks on chain | `pyth` with your Pyth Pro API key (Pyth's own endpoints serve no one without one, so the config is refused without it), or the URL of a Pyth Pro compatible service. The keeper streams over a WebSocket (the `ws` package, so Node 20 works) |
 | ETH on Arbitrum | gas, and Pyth's update fee | no keeper call needs USDC or an approval |
 | A wallet | to sign | an encrypted keystore (recommended), a private key, a mnemonic, or a remote signer ([Wallets & Secrets](wallets.md)). Without one the keeper is watch-only |
 | The deployment's factory address | everything else is read from it | Bazaar's network presets carry no official factory address yet, so the config names one |

@@ -124,6 +124,14 @@ public. A frontend therefore either gets short-lived tokens from its own backend
 ([below](#tokens-for-a-browser)), or leaves prices out and routes orders through a relayer that
 attaches the update ([Gasless Trading](gasless.md)).
 
+The SDK holds you to this. A client for Pyth's own endpoints (the default ones, `PYTH_PRO`) without a
+token is refused when it is made: `new ProClient(...)`, `proPriceSource(...)` and `Bazaar.connect({
+prices: { ... } })` throw an `InputError` on `prices.token` asking for a Pyth Pro API key, or, in a
+browser, a function returning tokens your backend mints from it (`mintProToken`). An endpoint of your
+own (a proxy that adds the key, a local mock) may run without one, provided both the request API
+(`restUrl`) and every stream endpoint (`streamUrls`) are yours: both default to Pyth's. The symbols
+registry needs no token either way.
+
 `prices` takes three forms:
 
 - **Options for a client**: `{ token }`, where `token` is the API key (servers), or a function that
@@ -140,7 +148,7 @@ attaches the update ([Gasless Trading](gasless.md)).
 
 | Option | Default | Meaning |
 |---|---|---|
-| `token` | none | A string, or `() => string \| Promise<string>`. Sent as `Authorization: Bearer <token>`; on a stream connection in a browser, in the subprotocol list instead, since a browser cannot set a WebSocket's headers. |
+| `token` | none: required for Pyth's own endpoints | A string, or `() => string \| Promise<string>`. Sent as `Authorization: Bearer <token>`; on a stream connection in a browser, in the subprotocol list instead, since a browser cannot set a WebSocket's headers. Without one, a client whose `restUrl` or a `streamUrls` entry is Pyth's throws an `InputError` on `prices.token`. |
 | `channel` | `"fixed_rate@200ms"` | The channel streamed and read by `latest`: `real_time`, `fixed_rate@50ms`, `fixed_rate@200ms` or `fixed_rate@1000ms`. A feed is served on its registry `min_channel` and every slower one. |
 | `streamUrls` | Pyth's three | The WebSocket endpoints. The stream connects to all of them, as Pyth requires, and yields each update once. |
 | `restUrl` | Pyth's | Base URL of the request API (`/v1/latest_price`, `/v1/price`). A URL with a query or a fragment is refused: a key goes in `token` or `headers`. |
@@ -289,11 +297,12 @@ further check.
 | `HttpError` | `HTTP 401 from https://.../v2/***: the provider refused the request; check the key in the URL` | The RPC refused the request. |
 | `TypeError` | `JsonRpc: the ... header's value holds a line break, ...` | A header value (often from an `.env` file) has a stray character. |
 | `ProError` | `the price token (prices.token) holds a line break ...` | The same, for the Pyth Pro token. Raised when the client is made, or when a token provider returns one. |
+| `InputError` | `prices.token: Pyth's own price endpoints serve only the holder of a Pyth Pro API key. ...` | `prices` names Pyth's endpoints (the default) without a token. Raised when the client is made, before anything is read. |
 | `ConnectError` | `this call needs a fresh Pyth Pro price: connect with a price source (prices)` | Later, from a builder: the connection has no `prices`. |
 | `ConnectError` | `history comes from Bazaar's subgraph: connect with a subgraph source` | Later, from `history`: the connection has no `subgraph`. |
 
 `errorMessage(e)` shows these as "Something went wrong. Please try again." (they are not the user's
-doing); log `e.message` for the detail.
+doing), except the `InputError`, whose own message it shows; log `e.message` for the detail.
 
 ## Related Pages
 

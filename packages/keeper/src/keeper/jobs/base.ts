@@ -1,6 +1,6 @@
 /** What every job shares: its scope, its cooldowns, and the price it acts on. */
 
-import { MAX_LIQUIDATION_PRICE_AGE, type Market, Status, marketStatus } from "@liberta-labs/bazaar-sdk";
+import { type Market, Status, marketStatus } from "@liberta-labs/bazaar-sdk";
 import type { Address, Hex } from "viem";
 import { JobConfig } from "../../config/index.js";
 import { Action, type ActionInit, type ActionResult } from "../../exec/executor.js";
@@ -17,7 +17,8 @@ export const ALL_STATUSES: ReadonlySet<Status> = new Set(Object.values(Status));
 
 /**
  * The price a planner judges by and the update payload its call carries: the print's update when the
- * call is judged at the print, none when it is judged at the pair's stored price.
+ * call is judged at the print, Pyth's latest update when a liquidation on a market with trading hours
+ * carries one, none when the call is judged at the pair's stored price.
  *
  * `updates` is built on first use (most plans find nothing to do and never need it); a planner reads
  * it before its first await, so the update attached is the one that carried the print the price was
@@ -30,13 +31,18 @@ export class PricedCall {
   constructor(
     readonly price: bigint,
     updates: readonly Hex[] | (() => Hex[]),
-    readonly fresh: boolean,
     /**
-     * The second the price the call relies on was generated or stored in, when the call needs it to
-     * be within the pair's 3 s window as it lands (the executor checks it again just before sending);
-     * null when it does not (the stored price on a closed session market).
+     * The second the call must land within the pair's 3 s window of, which the executor checks again
+     * just before signing: when the price the call relies on was generated (the print's) or stored
+     * (the pair's own), or, with {@link issued}, when the earliest update it carries was issued.
      */
-    readonly priceTime: number | null = null,
+    readonly priceTime: number,
+    /**
+     * `priceTime` is when Pyth issued the update the call carries rather than when its price was
+     * generated: Pyth's latest price, which the oracle accepts for a liquidation on a market with
+     * trading hours by the time each update carrying it was issued.
+     */
+    readonly issued = false,
   ) {
     if (typeof updates === "function") {
       this.built = null;
@@ -123,8 +129,18 @@ export class Job<C extends JobConfig = JobConfig> {
 
   // ---- prices ----
   /**
-   * The price a call on `m` is judged at now and the update it carries: a fresh print's, or, when
-   * allowed, the stored price on a closed session market (with no update).
+   * The price a call on `m` is judged at now and the update it carries, when the market has a fresh
+   * print ({@link atPrint}); null when it has none, or when one of its prints carries no confidence
+   * ({@link unconfident}).
+   */
+  priced(m: Market): PricedCall | null {
+    if (!this.k.prices.fresh(m) || this.unconfident(m) !== null) return null;
+    return this.atPrint(m);
+  }
+
+  /**
+   * The price a call on `m` is judged at while the market has a fresh print, and the update it
+   * carries.
    *
    * A pair stores an update's price only when it was generated in a later second than the price it
    * holds (for a composite, when its older leg was), and otherwise judges the call at the price it
@@ -136,35 +152,29 @@ export class Job<C extends JobConfig = JobConfig> {
    * stored, and attaching it would only cost its fee and revert the call once the print aged past the
    * window, where the call without it runs on the stored price, which is at least as fresh.
    */
-  priced(m: Market, allowStale = false): PricedCall | null {
+  protected atPrint(m: Market): PricedCall {
     const prices = this.k.prices;
     const st = m.state;
-    if (prices.fresh(m) && this.confident(m)) {
-      const pp = prices.price(m)!;
-      if (st !== null && st.spot > 0n && st.updateTs >= pp.publishTime) return new PricedCall(st.spot, [], true, st.updateTs);
-      return new PricedCall(pp.spot, () => prices.updateFor(m), true, pp.publishTime);
-    }
-    if (allowStale && !m.continuous && st !== null && st.spot > 0n) {
-      if (this.k.now() - st.updateTs <= MAX_LIQUIDATION_PRICE_AGE - 30) return new PricedCall(st.spot, [], false);
-    }
-    return null;
+    const pp = prices.price(m)!;
+    if (st !== null && st.spot > 0n && st.updateTs >= pp.publishTime) return new PricedCall(st.spot, [], st.updateTs);
+    return new PricedCall(pp.spot, () => prices.updateFor(m), pp.publishTime);
   }
 
   /**
-   * Whether every print `m` prices from carries a confidence. BazaarOracle reads a zero confidence as
-   * an absent one and reverts the call (BazaarOracle__IncompleteFeed), so such a print is never
-   * attached: the market is planned as one without a fresh print, and no confidence is made up for
-   * it. The SDK's client yields no print for such a feed; this holds whatever the print's source.
+   * Why a print `m` prices from must not be attached for want of a confidence, or null when every one
+   * carries one. BazaarOracle reads a zero confidence as an absent one and reverts the call
+   * (BazaarOracle__IncompleteFeed), so such a print is never attached: the market is planned as one
+   * without a fresh print, and no confidence is made up for it. The SDK's client yields no print for
+   * such a feed; this holds whatever the print's source. The reason is logged at debug level.
    */
-  private confident(m: Market): boolean {
-    const legs = this.k.prices.legs(m);
-    if (legs === null) return false;
-    for (const p of legs) {
+  protected unconfident(m: Market): string | null {
+    for (const p of this.k.prices.legs(m) ?? []) {
       if (p.conf > 0n) continue;
-      this.k.unusablePrint(m, `the print for feed ${p.feedId} carries no confidence, and the oracle refuses a live price without one`);
-      return false;
+      const why = `the print for feed ${p.feedId} carries no confidence, and the oracle refuses a live price without one`;
+      this.k.unusablePrint(m, why);
+      return why;
     }
-    return true;
+    return null;
   }
 
   /** Per-market jobs: what to send on `m` now. */

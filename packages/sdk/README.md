@@ -32,8 +32,9 @@ with the connection bound (`bz.trade.createOrder(...)`); the same functions are 
 use without the facade (`import { trade } from "@liberta-labs/bazaar-sdk"; trade.createOrder(ctx, ...)`),
 along with the pure helpers (packing, formatting, type strings) that need no connection.
 
-Do not put a Pyth API key in a browser bundle: point `prices` at a proxy you control, or at an endpoint
-that needs no key.
+Do not put a Pyth Pro API key in a browser bundle: give `prices` a function returning short-lived tokens
+your backend mints from the key (`mintProToken`), or point it at a proxy you control. Pyth's own
+endpoints need one or the other: a client for them without a token is refused when it is made.
 
 ## Read
 

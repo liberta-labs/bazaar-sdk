@@ -25,6 +25,7 @@ import { join } from "node:path";
 import {
   Chain,
   type Deployment,
+  InputError,
   type Market,
   PriceService,
   ProClient,
@@ -51,6 +52,7 @@ import {
   UNCHECKED_SIGNERS_WARNING,
   enabledJobs,
   expandHome,
+  missingProKey,
   priceEndpoints,
   resolvedNetwork,
   subgraphUrl,
@@ -338,6 +340,12 @@ export class Keeper {
     } catch (e) {
       // The client names the setting at fault and never quotes a value.
       if (e instanceof ProError) throw new ConfigError(`prices: ${e.message}`);
+      // Its refusal of a missing key for Pyth's own endpoints. Config validation refuses that first
+      // (missingProKey); a config that never went through it is refused here, in the same words.
+      if (e instanceof InputError) {
+        const noKey = missingProKey(cfg.prices);
+        throw new ConfigError(noKey === null ? e.message : `prices.token: ${noKey}`);
+      }
       throw e;
     }
     this.prices = new PriceService(this.pro, {

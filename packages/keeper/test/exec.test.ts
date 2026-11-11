@@ -345,7 +345,7 @@ describe("executor", () => {
     expect(ledger.reserved).toBe(0);
     expect(events.filter(([k]) => k === "sent")).toEqual([]);
 
-    // A price inside the limit, at its edge, or none to judge (the stored price on a closed market): sent.
+    // A price inside the limit, at its edge, or none to judge (a call that relies on no price): sent.
     for (const priceTime of [999, null]) {
       const ok = await ex.run(action({ priceTime }), { jobCfg: job });
       expect(ok.status, String(priceTime)).toBe("confirmed");

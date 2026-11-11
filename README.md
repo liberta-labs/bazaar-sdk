@@ -41,8 +41,9 @@ as `${RPC_HTTP_URL}`, or only its key, as in `https://arb-mainnet.g.alchemy.com/
 
 The keeper connects to any JSON-RPC provider (Alchemy, Infura, QuickNode, your own node). It needs
 `eth_call` state overrides to measure rewards before sending (`doctor` checks), and `eth_getLogs` over
-`rpc.logChunk` blocks. Prices come from Pyth Pro: give it your own Pyth Pro access token (`prices.token`),
-or the URL of a Pyth Pro compatible service. Full guide: [packages/keeper](packages/keeper/README.md).
+`rpc.logChunk` blocks. Prices come from Pyth Pro: give it your Pyth Pro API key (`prices.token`), which
+Pyth's own endpoints require, or the URL of a Pyth Pro compatible service. Full guide:
+[packages/keeper](packages/keeper/README.md).
 
 ## Frontends
 

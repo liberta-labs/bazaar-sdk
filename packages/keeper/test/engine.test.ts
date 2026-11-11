@@ -14,7 +14,7 @@ import { ConfigError } from "../src/config/index.js";
 import { type Action, ActionResult, type RunOptions, lockKey } from "../src/exec/executor.js";
 import { Keeper, stateDirFor } from "../src/keeper/engine.js";
 import { setupLogging } from "../src/observe/index.js";
-import { marketAt, marketState, ME, S, acct, fake, order, position } from "./keeper-harness.js";
+import { FEE, FEED, marketAt, marketState, ME, S, acct, fake, order, position, update } from "./keeper-harness.js";
 
 const logged: string[] = [];
 beforeAll(() => {
@@ -303,8 +303,8 @@ describe("markets and events", () => {
 });
 
 describe("keeper.run", () => {
-  function oneShot(cfg: Record<string, unknown> = {}) {
-    const f = fake(dir, cfg);
+  function oneShot(cfg: Record<string, unknown> = {}, opts: { continuous?: boolean } = {}) {
+    const f = fake(dir, cfg, opts);
     f.addWallet();
     f.k.connected = true;
     f.k.updateBlock = async () => {};
@@ -338,6 +338,36 @@ describe("keeper.run", () => {
     expect(res.map((r) => [r.status, r.reason])).toEqual([["skipped", "no position is below its maintenance margin"]]);
   });
 
+  it("liquidate: skipped with the reason, nothing simulated, while no price can decide a liquidation", async () => {
+    const f = oneShot(); // a 24/7 market: no print, and a stored price 10 s old
+    const ALICE = acct(1);
+    f.k.store.positionsOf(f.m.address).set(ALICE, position(ALICE, 150));
+    const why =
+      "no price can decide a liquidation now (no fresh price: a continuously traded market is liquidated only at a price generated " +
+      "within the pair's 3 s window less the send margin, inside the oracle's confidence cap): positions wait for the market's next price";
+    const [listed] = await f.k.run.liquidate("ETH/USD", [ALICE]);
+    expect([listed!.status, listed!.reason]).toEqual(["skipped", why]);
+    const [planned] = await f.k.run.liquidate("ETH/USD");
+    expect([planned!.status, planned!.reason]).toEqual(["skipped", why]);
+    expect(f.ex.runs).toEqual([]);
+    // With no position at all, the plan simply found nothing.
+    f.k.store.positionsOf(f.m.address).clear();
+    const [none] = await f.k.run.liquidate("ETH/USD");
+    expect(none!.reason).toBe("no position is below its maintenance margin");
+  });
+
+  it("liquidate with accounts on a closed market carries Pyth's latest update, re-checked by its issue second", async () => {
+    const f = oneShot({}, { continuous: false });
+    const BOB = acct(2);
+    const now = Math.floor(f.k.chainTime());
+    const latest = update(now, [{ feed: FEED, usd: 1_940, generated: now - 30 }]);
+    f.k.prices.ingest(latest.prints);
+    await f.k.run.liquidate("ETH/USD", [BOB], { dryRun: true });
+    const [a] = f.ex.runs[0]!;
+    expect(decodeFunctionData({ abi: bazaarPairAbi, data: a.data }).args).toEqual([[BOB], [latest.blob]]);
+    expect([a.value, a.priceTime, a.priceIssued]).toEqual([FEE, now, true]);
+  });
+
   it("reports a market whose status the job does not run in", async () => {
     const f = oneShot();
     f.m.state = marketState(f.now, { settlementFixedTs: f.now - 10 });
@@ -366,6 +396,7 @@ describe("keeper.run", () => {
 
   it("one-shots honour the running keeper's in-flight keys, and hold their own while they send", async () => {
     const f = oneShot();
+    f.printAt(1_940); // a price the liquidations below can carry
     const BOB = acct(2);
     const key = lockKey("liq", f.m.address, BOB);
     f.k.executor.inflight.add(key); // the running keeper is sending this liquidation

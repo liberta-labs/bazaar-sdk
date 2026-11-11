@@ -4,11 +4,11 @@ import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Chain } from "@liberta-labs/bazaar-sdk";
+import { Chain, PYTH_PRO } from "@liberta-labs/bazaar-sdk";
 import type { Command } from "commander";
 import { parse as parseDotenv } from "dotenv";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { ConfigError, type KeeperConfig, UNCHECKED_SIGNERS_WARNING, enabledJobs, loadConfig, parseConfig } from "../src/config/index.js";
+import { ConfigError, type KeeperConfig, PRO_KEY_REQUIRED, UNCHECKED_SIGNERS_WARNING, enabledJobs, loadConfig, parseConfig } from "../src/config/index.js";
 import { ActionResult } from "../src/exec/executor.js";
 import { runDoctor } from "../src/cli/doctor.js";
 import {
@@ -74,11 +74,13 @@ async function parse(argv: string[]) {
 /** A stand-in for the engine module (packages/keeper/src/keeper/engine.ts). */
 const engine = (impl: Record<string, unknown>): CliDeps["engine"] => (async () => impl) as never;
 
+/** A config file on a local mock price endpoint, which needs no Pyth Pro API key. */
 function writeConfig(dir: string, extra = ""): string {
   const path = join(dir, "bazaar-keeper.yaml");
   writeFileSync(
     path,
-    `network: anvil\nfactory: "${FACTORY}"\nrpc:\n  http: http://127.0.0.1:8545\nstate:\n  dir: ${JSON.stringify(dir)}\n${extra}`,
+    `network: anvil\nfactory: "${FACTORY}"\nrpc:\n  http: http://127.0.0.1:8545\nprices:\n  endpoint: http://127.0.0.1:8787\n` +
+      `state:\n  dir: ${JSON.stringify(dir)}\n${extra}`,
     "utf8",
   );
   return path;
@@ -461,6 +463,7 @@ describe("doctor", () => {
       network: "anvil",
       factory: FACTORY,
       rpc: { http },
+      prices: { token: "fake-pyth-pro-key" },
       jobs: { liquidation: { allowLoss: true, maxLossUsdPerCall: 0.1, lossBudgetUsdPerDay: 2 }, triggers: {}, sweepExpired: {} },
     });
 
@@ -548,7 +551,12 @@ describe("doctor", () => {
 
   it("warns when prices.checkSigners is off: the gas price's print is then unchecked", async () => {
     const unchecked = (checkSigners: boolean) =>
-      parseConfig({ network: "anvil", factory: FACTORY, rpc: { http: "http://127.0.0.1:8545" }, prices: { endpoint: "pyth", checkSigners } });
+      parseConfig({
+        network: "anvil",
+        factory: FACTORY,
+        rpc: { http: "http://127.0.0.1:8545" },
+        prices: { endpoint: "pyth", token: "fake-pyth-pro-key", checkSigners },
+      });
     const off = capture();
     expect(await runDoctor(unchecked(false), { Keeper: keeperClass(fakeKeeper()), out: off.io })).toBe(true);
     expect(off.out).toContain(`⚠ Prices         ${UNCHECKED_SIGNERS_WARNING}`);
@@ -587,6 +595,20 @@ describe("doctor", () => {
     const Keeper = { create: async () => Promise.reject(new WalletError("wallet default: wrong keystore password")) } as never;
     expect(await runDoctor(cfg(), { Keeper, out: cap.io })).toBe(false);
     expect(cap.out).toEqual(["✘ Config         wallet default: wrong keystore password"]);
+  });
+
+  it("reports a missing Pyth Pro API key: the command refuses the config, and a config that skipped validation fails its first line", async () => {
+    const dir = tempDir();
+    const path = join(dir, "bazaar-keeper.yaml");
+    writeFileSync(path, `network: anvil\nfactory: "${FACTORY}"\nrpc:\n  http: http://127.0.0.1:8545\nprices:\n  endpoint: pyth\n`, "utf8");
+    const cli = capture();
+    expect(await main(["keeper", "doctor", "-c", path], { out: cli.io })).toBe(2);
+    expect(cli.errText()).toBe(`the config is not valid:\n  prices.token: ${PRO_KEY_REQUIRED}`);
+    // Built in code without the key, the config reaches the real keeper, which refuses it in the same words.
+    const keyless = { ...cfg(), state: { dir }, prices: { ...cfg().prices, token: null } };
+    const cap = capture();
+    expect(await runDoctor(keyless, { out: cap.io })).toBe(false);
+    expect(cap.out).toEqual([`✘ Config         prices.token: ${PRO_KEY_REQUIRED}`]);
   });
 
   describe("a failing RPC never shows its key", () => {
@@ -1365,7 +1387,7 @@ describe("wizard", () => {
       ["select", "Subgraph", "custom"],
       ["input", "Subgraph GraphQL URL", SG],
       ["select", "Price endpoint", "pyth"],
-      ["password", "Pyth Pro access token", ` ${PYTH_TOKEN}\n`], // pasted with blanks around it
+      ["password", "Pyth Pro API key", ` ${PYTH_TOKEN}\n`], // pasted with blanks around it
       ["select", "Keeper wallet", "new"],
       ["password", "Choose a keystore password", "first"],
       ["password", "Repeat it", "second"],
@@ -1564,6 +1586,42 @@ describe("wizard", () => {
       expect(cfg.prices).toMatchObject({ endpoint: PRICE_URL, token: "made-up-price-token" });
       expect(cfg.rpc.send).toBe("sequencer");
       expect(Object.keys(enabledJobs(cfg.jobs))).toEqual([]);
+    } finally {
+      clearEnv();
+    }
+  });
+
+  it("offers Pyth Pro or a compatible URL, and asks for the Pyth Pro API key wherever the endpoint is Pyth's", async () => {
+    const dir = tempDir();
+    const cfgPath = join(dir, "bazaar-keeper.yaml");
+    const s = scripted([
+      ["select", "Network", "anvil"],
+      ["input", "Factory address", FACTORY],
+      ["input", "RPC URL", "http://127.0.0.1:8545"],
+      ["select", "Subgraph", "none"],
+      ["select", "Price endpoint", "custom"],
+      ["input", "Price endpoint URL", PYTH_PRO.restUrl],
+      // No "does it need an access token?": Pyth's own endpoint serves no one without the key.
+      ["password", "Pyth Pro API key", "fake-pyth-pro-key"],
+      ["select", "Keeper wallet", "none"],
+      ["checkbox", "Jobs to run automatically", []],
+    ]);
+    const offered: unknown[] = [];
+    const prompts: Prompts = {
+      ...s.prompts,
+      select: async <T>(q: { message: string; choices: readonly PromptChoice<T>[] }) => {
+        if (q.message.startsWith("Price endpoint")) offered.push(q.choices.map((c) => c.value));
+        return s.prompts.select(q);
+      },
+    };
+    const { d } = deps({ prompts });
+    await runWizard(cfgPath, d);
+    expect(s.done()).toBe(true);
+    expect(offered).toEqual([["pyth", "custom"]]);
+    expect(readFileSync(cfgPath, "utf8")).toContain("\nprices:\n  endpoint: ${PRICE_ENDPOINT_URL}\n  token: ${PYTH_PRO_TOKEN}\n");
+    clearEnv();
+    try {
+      expect(loadConfig(cfgPath).prices).toMatchObject({ endpoint: PYTH_PRO.restUrl, token: "fake-pyth-pro-key" });
     } finally {
       clearEnv();
     }

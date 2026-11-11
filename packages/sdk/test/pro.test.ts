@@ -1,14 +1,16 @@
 import type { Hex } from "viem";
 import { privateKeyToAddress } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PYTH_PRO, PYTH_PRO_TOKEN_URL } from "../src/networks.js";
+import { PRICE_ENDPOINTS, PYTH_PRO, PYTH_PRO_TOKEN_URL, isPythProPriceEndpoint } from "../src/networks.js";
 import { MAX_RESPONSE_BYTES, MAX_STREAM_MESSAGE, PRO_PROPERTIES, type Print, ProClient, ProError, STREAM_IDLE_TIMEOUT, cachedToken, isLivePrint, mintProToken, whyNotLive } from "../src/prices/index.js";
 import { FakeSocket, SIGNER, evm, fakeFetch, fid, json, settle, signed, streamUpdated, tick, unsigned } from "./pro-fakes.js";
 import { MAX_STRAY_MESSAGES, MAX_UPDATE_AHEAD, PriceService, UNKNOWN_EXPIRY_LIFETIME } from "../src/prices/index.js";
 import { MAX_UPDATE_BYTES } from "../src/prices/lazer.js";
 import { Chain } from "../src/chain/client.js";
 import type { JsonRpc } from "../src/chain/rpc.js";
+import { InputError } from "../src/client/calls.js";
 import { proPriceSource } from "../src/client/prices.js";
+import { errorMessage } from "../src/errors/messages.js";
 import { SubgraphClient } from "../src/subgraph/client.js";
 
 const [F1, F2, F3] = [fid(1), fid(2), fid(3)];
@@ -17,6 +19,8 @@ const B = "wss://pro-1.test/v1/stream";
 const C = "wss://pro-2.test/v1/stream";
 const OTHER_KEY: Hex = `0x${"11".repeat(32)}`;
 const TOKEN = "tok_live_SECRET1234";
+/** A request API that is not Pyth's: with stream URLs of its own, a client for it needs no token. */
+const REST = "https://pro.test";
 
 beforeEach(() => FakeSocket.reset());
 afterEach(() => {
@@ -26,7 +30,7 @@ afterEach(() => {
 
 describe("ProClient requests", () => {
   it("defaults to Pyth's endpoints, the 200 ms channel and no signer check", () => {
-    const c = new ProClient();
+    const c = new ProClient({ token: TOKEN });
     expect(c.streamUrls).toEqual(PYTH_PRO.streamUrls);
     expect(c.streamUrls).toHaveLength(3);
     expect(c.restUrl).toBe("https://pyth-lazer.dourolabs.app");
@@ -34,11 +38,63 @@ describe("ProClient requests", () => {
     expect(c.channel).toBe("fixed_rate@200ms");
     expect(c.isTrustedSigner).toBeNull();
     expect(c.streamAuth).toBe("header"); // no document here
-    expect(new ProClient({ restUrl: "https://proxy.test/pro///" }).restUrl).toBe("https://proxy.test/pro");
+    expect(new ProClient({ token: TOKEN, restUrl: "https://proxy.test/pro///" }).restUrl).toBe("https://proxy.test/pro");
     expect(() => new ProClient({ restUrl: "pyth" })).toThrow("the price request URL is not an http(s) or ws(s) URL");
     expect(() => new ProClient({ channel: "fixed_rate@10ms" as never })).toThrow("unknown Pyth Pro channel");
     vi.stubGlobal("document", {});
-    expect(new ProClient().streamAuth).toBe("subprotocol"); // a browser cannot set WebSocket headers
+    expect(new ProClient({ token: TOKEN }).streamAuth).toBe("subprotocol"); // a browser cannot set WebSocket headers
+  });
+
+  it("asks for a Pyth Pro API key for Pyth's own endpoints, and lets a custom endpoint run without one", () => {
+    const refusal = (opts?: ConstructorParameters<typeof ProClient>[0]): InputError => {
+      try {
+        new ProClient(opts);
+      } catch (e) {
+        if (e instanceof InputError) return e;
+        throw e;
+      }
+      throw new Error("expected an InputError");
+    };
+    const e = refusal();
+    expect(e.field).toBe("prices.token");
+    expect(e.message).toBe(
+      "prices.token: Pyth's own price endpoints serve only the holder of a Pyth Pro API key. On a server, give the key as the token (an Authorization header among the headers does not count); in a browser, give a function returning short-lived tokens your backend mints from the key (mintProToken), never the key itself. Without a token, the request API (restUrl) and every stream endpoint (streamUrls) must be custom ones, such as a proxy that adds the key or a local mock: both default to Pyth's.",
+    );
+    expect(errorMessage(e)).toBe(e.message);
+    // Pyth's request API, or any one of its stream endpoints, however written, needs the key
+    for (const opts of [
+      { token: null },
+      { streamUrls: [A] },
+      { restUrl: REST },
+      { restUrl: REST, streamUrls: [A, PYTH_PRO.streamUrls[2]!] },
+      { restUrl: "HTTPS://PYTH-LAZER.DOUROLABS.APP/", streamUrls: [A] },
+      { headers: { "x-proxy": "proxy-header-value" }, restUrl: REST },
+      { restUrl: "https://pyth-lazer.dourolabs.app.", streamUrls: [A] },
+      { restUrl: REST, streamUrls: ["wss://pyth-lazer-0.dourolabs.app./v1/stream"] },
+    ]) {
+      expect(refusal(opts).field).toBe("prices.token");
+    }
+    // the key goes in the token: an Authorization header of one's own is not taken for it
+    expect(refusal({ headers: { Authorization: "Bearer fake-pyth-pro-key" } }).field).toBe("prices.token");
+    // a token, or endpoints of one's own, and it is made
+    expect(() => new ProClient({ token: () => "jwt-test-token" })).not.toThrow();
+    expect(() => new ProClient({ restUrl: REST, streamUrls: [A] })).not.toThrow();
+    // the symbols registry needs no key, so Pyth's own registry is no reason to ask for one
+    expect(() => new ProClient({ restUrl: REST, streamUrls: [A], symbolsUrl: PYTH_PRO.symbolsUrl })).not.toThrow();
+    // what is wrong with an endpoint is reported first
+    expect(() => new ProClient({ restUrl: "pyth" })).toThrow(new ProError("the price request URL is not an http(s) or ws(s) URL"));
+    // and the facade's options and a source built from options are held to it as well
+    expect(() => proPriceSource({})).toThrow(InputError);
+    expect(() => proPriceSource({ restUrl: REST, streamUrls: [A] })).not.toThrow();
+    // Pyth's own price endpoints are its request API's host and its stream endpoints' hosts
+    expect([PYTH_PRO.restUrl, ...PYTH_PRO.streamUrls, "https://pyth-lazer-1.dourolabs.app/v1/latest_price"].map(isPythProPriceEndpoint)).toEqual([true, true, true, true, true]);
+    expect([PYTH_PRO.symbolsUrl, PYTH_PRO_TOKEN_URL, REST, A, "https://pyth-lazer.dourolabs.app.example", "not a url"].map(isPythProPriceEndpoint)).toEqual([false, false, false, false, false, false]);
+    // a host written with a trailing dot, however encoded, is the same host
+    expect(
+      ["https://pyth-lazer.dourolabs.app.", "https://pyth-lazer.dourolabs.app.:443/", "https://pyth-lazer.dourolabs.app%2E/", "wss://pyth-lazer-0.dourolabs.app./v1/stream"].map(isPythProPriceEndpoint),
+    ).toEqual([true, true, true, true]);
+    // the only endpoint shortcut is Pyth's own: there is no shared endpoint that needs no key
+    expect(PRICE_ENDPOINTS).toEqual({ pyth: PYTH_PRO });
   });
 
   it("asks for the four properties in the EVM format, with the token as a bearer, and reads the signed bytes only", async () => {
@@ -58,14 +114,14 @@ describe("ProClient requests", () => {
     expect(headers.get("authorization")).toBe(`Bearer ${TOKEN}`);
     expect(headers.get("content-type")).toBe("application/json");
     expect(headers.get("x-extra")).toBe("1");
+    // Only fields Pyth's REST API reads: it has no ignoreInvalidFeeds and no deliveryFormat.
     expect(body).toEqual({
       priceFeedIds: [1, 2],
       properties: ["price", "exponent", "confidence", "feedUpdateTimestamp"],
       formats: ["evm"],
       channel: "fixed_rate@200ms",
-      deliveryFormat: "json",
       jsonBinaryEncoding: "hex",
-      ignoreInvalidFeeds: true,
+      parsed: false,
     });
     expect(PRO_PROPERTIES).toEqual(body.properties);
   });
@@ -75,22 +131,22 @@ describe("ProClient requests", () => {
     const b64 = btoa(String.fromCharCode(...(blob.slice(2).match(/../g) ?? []).map((h) => parseInt(h, 16))));
     for (const evmField of [{ encoding: "hex", data: blob }, { encoding: "hex", data: blob.slice(2) }, { encoding: "base64", data: b64 }, blob, { data: blob.toUpperCase().replace("0X", "0x") }]) {
       const { fetch } = fakeFetch(() => json({ evm: evmField }));
-      const prints = await new ProClient({ fetch }).latest([F1]);
+      const prints = await new ProClient({ token: TOKEN, fetch }).latest([F1]);
       expect(prints.map((p) => [p.feedId, p.blob])).toEqual([[F1, blob]]);
     }
     for (const bad of [{ data: "zz" }, { data: 12 }, { encoding: "base64", data: "***" }, { encoding: "hex" }]) {
       const { fetch } = fakeFetch(() => json({ evm: bad }));
-      await expect(new ProClient({ fetch }).latest([F1])).rejects.toThrow(ProError);
+      await expect(new ProClient({ token: TOKEN, fetch }).latest([F1])).rejects.toThrow(ProError);
     }
     // an answer without update data brings no print
     const { fetch } = fakeFetch(() => json({ parsed: {} }));
-    expect(await new ProClient({ fetch }).latest([F1])).toEqual([]);
+    expect(await new ProClient({ token: TOKEN, fetch }).latest([F1])).toEqual([]);
   });
 
   it("returns only the feeds asked for, leaves out ids that are not raw, and asks nothing when none is", async () => {
     const blob = unsigned({ at: 100, feeds: [{ id: 1 }, { id: 2 }, { id: 3 }] });
     const { fetch, calls } = fakeFetch(() => json(evm(blob)));
-    const c = new ProClient({ fetch });
+    const c = new ProClient({ token: TOKEN, fetch });
     const composite: Hex = `0x${"ab".repeat(32)}`;
     expect((await c.latest([F3, composite])).map((p) => p.feedId)).toEqual([F3]);
     expect(calls[0]!.body.priceFeedIds).toEqual([3]);
@@ -126,7 +182,7 @@ describe("ProClient requests", () => {
     });
     const { fetch } = fakeFetch(() => json(evm(blob)));
     const ids = Array.from({ length: 13 }, (_, i) => fid(i + 1));
-    const u = (await new ProClient({ fetch }).latestUpdate(ids))!;
+    const u = (await new ProClient({ token: TOKEN, fetch }).latestUpdate(ids))!;
     expect(u.prints.map((p) => [p.feedId, p.publishTime])).toEqual([
       [fid(1), at],
       [fid(10), at - 3_600],
@@ -166,12 +222,12 @@ describe("ProClient requests", () => {
     // the endpoint answering another second, or another channel, is refused
     await expect(c.atTick([F1], 1_700_000_001)).rejects.toThrow("answered the one-second tick at 1700000001 with another update");
     const wrongChannel = unsigned({ at: 1_700_000_000, channel: "fixed_rate@200ms", feeds: [{ id: 1 }] });
-    const c2 = new ProClient({ fetch: fakeFetch(() => json(evm(wrongChannel))).fetch });
+    const c2 = new ProClient({ token: TOKEN, fetch: fakeFetch(() => json(evm(wrongChannel))).fetch });
     await expect(c2.atTick([F1], 1_700_000_000)).rejects.toThrow(ProError);
     // no update for that second: a 404, or an answer without data
-    expect(await new ProClient({ fetch: fakeFetch(() => new Response("none", { status: 404 })).fetch }).atTick([F1], 5)).toBeNull();
-    expect(await new ProClient({ fetch: fakeFetch(() => json({})).fetch }).atTick([F1], 5)).toBeNull();
-    await expect(new ProClient({ fetch: fakeFetch(() => new Response("down", { status: 503 })).fetch }).atTick([F1], 5)).rejects.toThrow("HTTP 503");
+    expect(await new ProClient({ token: TOKEN, fetch: fakeFetch(() => new Response("none", { status: 404 })).fetch }).atTick([F1], 5)).toBeNull();
+    expect(await new ProClient({ token: TOKEN, fetch: fakeFetch(() => json({})).fetch }).atTick([F1], 5)).toBeNull();
+    await expect(new ProClient({ token: TOKEN, fetch: fakeFetch(() => new Response("down", { status: 503 })).fetch }).atTick([F1], 5)).rejects.toThrow("HTTP 503");
     for (const bad of [0, -1, 1.5, Number.NaN, 2 ** 53]) await expect(c.atTick([F1], bad)).rejects.toThrow("is not a unix time in whole seconds");
     expect(await c.atTick([`0x${"ab".repeat(32)}`], 5)).toBeNull();
   });
@@ -188,7 +244,7 @@ describe("ProClient requests", () => {
       expect(String((err as Error).message)).not.toContain("SECRET");
       expect(String((err as Error).message)).toContain("prices.token");
     }
-    expect(() => new ProClient({ token: null })).not.toThrow(); // no token at all
+    expect(() => new ProClient({ token: null, restUrl: REST, streamUrls: [A] })).not.toThrow(); // no token at all, for endpoints that need none
     for (const empty of ["", "   "]) expect(() => new ProClient({ token: empty })).toThrow("the price token is empty: set it (prices.token)");
     expect(() => new ProClient({ headers: { "bad name": "x" } })).toThrow("is not a valid HTTP header name");
     let err: Error | null = null;
@@ -211,20 +267,27 @@ describe("ProClient requests", () => {
     expect(e1).toBeInstanceOf(ProError);
     expect(e1.message).toBe("price endpoint unreachable: fetch failed for https://pro.test/***/v1/latest_price with *** and ***");
     const e2 = (await mk(() => new Response("nope", { status: 401 })).latest([F1]).catch((e) => e)) as ProError;
-    expect([e2.message, e2.status]).toEqual(["price endpoint refused the request (HTTP 401); check the token (prices.token) and that it covers these feeds and this channel", 401]);
+    // the endpoint's answer is withheld here: the URL itself holds a key the endpoint might echo
+    expect([e2.message, e2.status]).toEqual(["price endpoint refused the request (HTTP 401); check the token (prices.token) and that it covers these feeds and this channel. The endpoint said: (response withheld: the endpoint URL holds a key)", 401]);
+    // what Pyth says on a refusal names the cause, and is quoted with the token masked
+    const e2b = (await new ProClient({ token: TOKEN, restUrl: "https://pro.test", fetch: fakeFetch(() => new Response(`Not entitled: feed 3925 (asked by ${TOKEN})`, { status: 403 })).fetch }).latest([F1]).catch((e) => e)) as ProError;
+    expect([e2b.message, e2b.status]).toEqual(["price endpoint refused the request (HTTP 403); check the token (prices.token) and that it covers these feeds and this channel. The endpoint said: Not entitled: feed 3925 (asked by ***)", 403]);
+    // an empty refusal adds nothing
+    const e2c = (await mk(() => new Response("", { status: 403 })).latest([F1]).catch((e) => e)) as ProError;
+    expect(e2c.message).toBe("price endpoint refused the request (HTTP 403); check the token (prices.token) and that it covers these feeds and this channel");
     // the body of an error is withheld when the URL itself holds a key the endpoint might echo
     const e3 = (await mk(() => new Response(`bad key ${keyed}`, { status: 500 })).latest([F1]).catch((e) => e)) as Error;
     expect(e3.message).toBe("price endpoint returned HTTP 500: (response withheld: the endpoint URL holds a key)");
     const plain = new ProClient({ token: TOKEN, restUrl: "https://pro.test", fetch: fakeFetch(() => new Response(`no such feed for ${TOKEN}`, { status: 400 })).fetch });
     expect(((await plain.latest([F1]).catch((e) => e)) as Error).message).toBe("price endpoint returned HTTP 400: no such feed for ***");
-    const notJson = new ProClient({ fetch: fakeFetch(() => new Response("<html>")).fetch });
+    const notJson = new ProClient({ token: TOKEN, fetch: fakeFetch(() => new Response("<html>")).fetch });
     await expect(notJson.latest([F1])).rejects.toThrow("price endpoint returned a body that is not JSON: <html>");
     expect(mk(() => json({})).displayUrl).toBe("https://pro.test/***");
   });
 
   it("refuses a response body over 16 MiB, declared or streamed", async () => {
     expect(MAX_RESPONSE_BYTES).toBe(16 * 1024 * 1024);
-    const declared = new ProClient({ fetch: fakeFetch(() => new Response("{}", { headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) } })).fetch });
+    const declared = new ProClient({ token: TOKEN, fetch: fakeFetch(() => new Response("{}", { headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) } })).fetch });
     await expect(declared.latest([F1])).rejects.toThrow("price endpoint's response is larger than 16 MiB: refusing it");
     const chunk = new Uint8Array(1024 * 1024).fill(0x20);
     let sent = 0;
@@ -234,7 +297,7 @@ describe("ProClient requests", () => {
         c.enqueue(chunk);
       },
     });
-    const streamed = new ProClient({ fetch: fakeFetch(() => new Response(endless)).fetch });
+    const streamed = new ProClient({ token: TOKEN, fetch: fakeFetch(() => new Response(endless)).fetch });
     await expect(streamed.latest([F1])).rejects.toThrow("larger than 16 MiB");
     expect(sent).toBeLessThan(20); // stopped reading soon after the limit
   });
@@ -271,14 +334,15 @@ describe("ProClient requests", () => {
       asked.push(s);
       return s === SIGNER;
     };
-    const c = new ProClient({ isTrustedSigner: check, fetch: fakeFetch(() => json(evm(good))).fetch });
+    const c = new ProClient({ token: TOKEN, isTrustedSigner: check, fetch: fakeFetch(() => json(evm(good))).fetch });
     expect((await c.latest([F1])).map((p) => p.signer)).toEqual([SIGNER]);
-    const bad = new ProClient({ isTrustedSigner: check, fetch: fakeFetch(() => json(evm(forged))).fetch });
+    const bad = new ProClient({ token: TOKEN, isTrustedSigner: check, fetch: fakeFetch(() => json(evm(forged))).fetch });
     await expect(bad.latest([F1])).rejects.toThrow(`a price update is signed by ${privateKeyToAddress(OTHER_KEY)}, which is not a signer Pyth's verifier trusts: refusing it`);
     await expect(bad.atTick([F1], 100)).rejects.toThrow("refusing it");
     expect(asked).toEqual([SIGNER, privateKeyToAddress(OTHER_KEY), privateKeyToAddress(OTHER_KEY)]);
     // a check that cannot answer leaves the update unused: unconfirmed is not trusted
     const down = new ProClient({
+      token: TOKEN,
       isTrustedSigner: () => {
         throw new Error("rpc down");
       },
@@ -287,8 +351,8 @@ describe("ProClient requests", () => {
     await expect(down.latest([F1])).rejects.toThrow("could not confirm that Pyth trusts the signer of a price update: rpc down");
     // a signature that recovers to nothing, and bytes that are no update at all
     const broken = `${good.slice(0, 138)}05${good.slice(140)}` as Hex;
-    await expect(new ProClient({ isTrustedSigner: check, fetch: fakeFetch(() => json(evm(broken))).fetch }).latest([F1])).rejects.toThrow("price endpoint sent an update the SDK cannot read");
-    await expect(new ProClient({ fetch: fakeFetch(() => json(evm("0xdeadbeef"))).fetch }).latest([F1])).rejects.toThrow("price endpoint sent an update the SDK cannot read (malformed Pyth Pro update: shorter than an envelope): refusing it");
+    await expect(new ProClient({ token: TOKEN, isTrustedSigner: check, fetch: fakeFetch(() => json(evm(broken))).fetch }).latest([F1])).rejects.toThrow("price endpoint sent an update the SDK cannot read");
+    await expect(new ProClient({ token: TOKEN, fetch: fakeFetch(() => json(evm("0xdeadbeef"))).fetch }).latest([F1])).rejects.toThrow("price endpoint sent an update the SDK cannot read (malformed Pyth Pro update: shorter than an envelope): refusing it");
   });
 
   it("lists the symbols registry without credentials", async () => {
@@ -313,14 +377,14 @@ describe("ProClient requests", () => {
     await c.symbols();
     expect(calls[1]!.url.href).toBe("https://symbols.test/v1/symbols");
     // an answer that is not a list is a failure, not an empty registry
-    await expect(new ProClient({ fetch: fakeFetch(() => json({ error: "?" })).fetch }).symbols()).rejects.toThrow(
+    await expect(new ProClient({ token: TOKEN, fetch: fakeFetch(() => json({ error: "?" })).fetch }).symbols()).rejects.toThrow(
       new ProError("the symbols registry answered with something that is not a list of feeds"),
     );
   });
 
   it("makes the registry's text printable and bounded", async () => {
     const { fetch } = fakeFetch(() => json([{ pyth_lazer_id: 7, symbol: "Crypto.EVIL\n/USD\u202e", description: "d".repeat(1_000), state: "\u001b[31mstable" }]));
-    const [s] = await new ProClient({ fetch }).symbols();
+    const [s] = await new ProClient({ token: TOKEN, fetch }).symbols();
     expect([s!.symbol, s!.state, s!.description.length]).toEqual(["Crypto.EVIL /USD", "[31mstable", 257]);
   });
 });
@@ -403,7 +467,7 @@ describe("tokens", () => {
 });
 
 describe("ProClient.stream", () => {
-  const SUBSCRIBE = { properties: ["price", "exponent", "confidence", "feedUpdateTimestamp"], formats: ["evm"], channel: "fixed_rate@200ms", deliveryFormat: "json", jsonBinaryEncoding: "hex", ignoreInvalidFeeds: true };
+  const SUBSCRIBE = { properties: ["price", "exponent", "confidence", "feedUpdateTimestamp"], formats: ["evm"], channel: "fixed_rate@200ms", jsonBinaryEncoding: "hex", parsed: false, deliveryFormat: "json", ignoreInvalidFeeds: true };
   const u = (at: number, extraUs = 0n, feeds: number[] = [1]) => unsigned({ at, extraUs, feeds: feeds.map((id) => ({ id })) });
   const rows = (batch: Print[] | void) => (batch ?? []).map((p) => [p.feedId, p.timestampUs]);
 
@@ -461,7 +525,7 @@ describe("ProClient.stream", () => {
     expect(e.message).not.toContain("SECRET");
     expect(FakeSocket.all).toEqual([]);
     // without a token there is nothing to present
-    const open = new ProClient({ WebSocket: FakeSocket, streamUrls: [A], streamAuth: "subprotocol" });
+    const open = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A], streamAuth: "subprotocol" });
     const waiting = open.stream([F1], undefined, { idleTimeout: null }).next();
     await settle();
     expect(FakeSocket.all[0]!.arg).toBeUndefined();
@@ -471,11 +535,11 @@ describe("ProClient.stream", () => {
 
   it("says so when the runtime has no WebSocket", async () => {
     vi.stubGlobal("WebSocket", undefined);
-    await expect(new ProClient({ streamUrls: [A] }).stream([F1]).next()).rejects.toThrow(
+    await expect(new ProClient({ restUrl: REST, streamUrls: [A] }).stream([F1]).next()).rejects.toThrow(
       "this runtime has no WebSocket (Node before 22 has none): pass a WebSocket constructor, for example the `ws` package's, as the client's WebSocket option",
     );
     vi.stubGlobal("WebSocket", FakeSocket);
-    const c = new ProClient({ streamUrls: [A] });
+    const c = new ProClient({ restUrl: REST, streamUrls: [A] });
     const waiting = c.stream([F1], undefined, { idleTimeout: null }).next();
     await settle();
     expect(FakeSocket.all).toHaveLength(1); // the global one is used when none is given
@@ -484,7 +548,7 @@ describe("ProClient.stream", () => {
   });
 
   it("makes one subscription per distinct set, so a market's update carries exactly its legs", async () => {
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A], channel: "real_time" });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A], channel: "real_time" });
     const composite: Hex = `0x${"ab".repeat(32)}`;
     const it = c.stream([[F2], [F3, F1], [F1, F3], [F1], [composite], [], [F2, composite]], undefined, { idleTimeout: null });
     const first = it.next();
@@ -520,7 +584,7 @@ describe("ProClient.stream", () => {
   });
 
   it("hands a slow consumer the newest update per set, and never mistakes it for silence", async () => {
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A] });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A] });
     const it = c.stream([[F1], [F2]], undefined, { idleTimeout: 0.05 });
     const first = it.next();
     await settle();
@@ -542,7 +606,7 @@ describe("ProClient.stream", () => {
   });
 
   it("counts an update without a live print as life, and a connection that never opens as silence", async () => {
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A] });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A] });
     const it = c.stream([F1], undefined, { idleTimeout: 0.6 });
     const first = it.next();
     await settle();
@@ -641,7 +705,7 @@ describe("ProClient.stream", () => {
   });
 
   it("returns once every endpoint has dropped after connecting, and at once when aborted or closed", async () => {
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A, B] });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B] });
     const it = c.stream([F1], undefined, { idleTimeout: null });
     const first = it.next();
     await settle();
@@ -682,7 +746,7 @@ describe("ProClient.stream", () => {
     const good = await signed({ at: 100, feeds: [{ id: 1 }] });
     const forged = await signed({ at: 100, feeds: [{ id: 1, price: 999n }] }, OTHER_KEY);
     const notices: string[] = [];
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A, B], isTrustedSigner: (s) => s === SIGNER });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B], isTrustedSigner: (s) => s === SIGNER });
     const it = c.stream([F1], undefined, { idleTimeout: null, onNotice: (m) => notices.push(m) });
     const first = it.next();
     await settle();
@@ -707,6 +771,7 @@ describe("ProClient.stream", () => {
     let down = true;
     const notices: string[] = [];
     const c = new ProClient({
+      restUrl: REST,
       WebSocket: FakeSocket,
       streamUrls: [A],
       isTrustedSigner: () => {
@@ -766,7 +831,7 @@ describe("ProClient.stream", () => {
     ]);
     // a message past the size limit
     FakeSocket.reset();
-    const big = new ProClient({ WebSocket: FakeSocket, streamUrls: [A] }).stream([F1], undefined, { idleTimeout: null });
+    const big = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A] }).stream([F1], undefined, { idleTimeout: null });
     const end = big.next();
     await vi.advanceTimersByTimeAsync(0);
     FakeSocket.all[0]!.open();
@@ -821,8 +886,8 @@ describe("ProClient credentials", () => {
     await c.latest([F1]);
     await c.atTick([F1], 100);
     await c.symbols();
-    await new ProClient({ headers: { "x-key": "hunter2hunter2" }, fetch, restUrl: "https://pro.test" }).latest([F1]);
-    await new ProClient({ fetch, restUrl: "https://pro.test" }).latest([F1]); // nothing to hand over
+    await new ProClient({ headers: { "x-key": "hunter2hunter2" }, fetch, restUrl: "https://pro.test", streamUrls: [A] }).latest([F1]);
+    await new ProClient({ fetch, restUrl: "https://pro.test", streamUrls: [A] }).latest([F1]); // nothing to hand over
     await mintProToken("pk_test_NOT_A_REAL_KEY", { fetch, url: "https://tokens.test/auth/token" });
     expect(seen).toEqual(["/v1/latest_price error", "/v1/price error", "/v1/symbols follow", "/v1/latest_price error", "/v1/latest_price follow", "/auth/token error"]);
   });
@@ -853,7 +918,7 @@ describe("ProClient credentials", () => {
 
   it("quotes an endpoint's text on one line, and bounded", async () => {
     const body = `bad\u001b[31m request\r\nForged: entry\u202e${"x".repeat(10_000)}`;
-    const msg = ((await new ProClient({ fetch: fakeFetch(() => new Response(body, { status: 400 })).fetch }).latest([F1]).catch((e) => e)) as Error).message;
+    const msg = ((await new ProClient({ token: TOKEN, fetch: fakeFetch(() => new Response(body, { status: 400 })).fetch }).latest([F1]).catch((e) => e)) as Error).message;
     expect(msg.startsWith("price endpoint returned HTTP 400: bad [31m request Forged: entry xxx")).toBe(true);
     expect(msg).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u202e]/);
     expect(msg.length).toBeLessThan(260);
@@ -862,6 +927,7 @@ describe("ProClient credentials", () => {
   it("reduces a failed signer check to a short summary, with every URL in it redacted", async () => {
     const blob = await signed({ at: 100, feeds: [{ id: 1 }] });
     const c = new ProClient({
+      token: TOKEN,
       fetch: fakeFetch(() => json(evm(blob))).fetch,
       isTrustedSigner: () => {
         throw new Error(`HTTP request failed.\nURL: https://arb.example/v2/abcdefghijklmnopqrstuvwxyz0123456789\nDetails: ${"y".repeat(5_000)}`);
@@ -885,7 +951,7 @@ describe("ProClient credentials", () => {
       expect(err!.message).toBe("the price request URL holds a query or a fragment: give the base URL alone (a key goes in the token or the headers)");
     }
     expect(() => new ProClient({ symbolsUrl: "https://symbols.test/v1?x=1" })).toThrow("the symbols registry URL holds a query or a fragment");
-    expect(() => new ProClient({ streamUrls: ["wss://pro.test/v1/stream?key=s3cr3tvalue"] })).not.toThrow(); // a stream URL is used as given
+    expect(() => new ProClient({ restUrl: REST, streamUrls: ["wss://pro.test/v1/stream?key=s3cr3tvalue"] })).not.toThrow(); // a stream URL is used as given
     for (const channel of ["constructor", "toString", "__proto__"]) expect(() => new ProClient({ channel: channel as never })).toThrow("unknown Pyth Pro channel");
   });
 
@@ -906,7 +972,7 @@ describe("ProClient credentials", () => {
 
   it("refuses to ask for more feeds than one update carries", async () => {
     const { fetch, calls } = fakeFetch(() => json({}));
-    const c = new ProClient({ fetch });
+    const c = new ProClient({ token: TOKEN, fetch });
     const many = Array.from({ length: 256 }, (_, i) => fid(i + 1));
     await expect(c.latestUpdate(many)).rejects.toThrow("256 feeds were asked for in one request, but one update carries at most 255: ask for them in parts");
     await expect(c.atTick(many, 100)).rejects.toThrow("one update carries at most 255");
@@ -918,9 +984,9 @@ describe("ProClient credentials", () => {
   it("keeps every update exactly as the verifier reads it, and refuses data longer than any update", async () => {
     const blob = unsigned({ at: 100, feeds: [{ id: 1 }] });
     const padded = `${blob}${"ab".repeat(1_000)}` as Hex;
-    const u = (await new ProClient({ fetch: fakeFetch(() => json(evm(padded))).fetch }).latestUpdate([F1]))!;
+    const u = (await new ProClient({ token: TOKEN, fetch: fakeFetch(() => json(evm(padded))).fetch }).latestUpdate([F1]))!;
     expect([u.blob, u.prints[0]!.blob]).toEqual([blob, blob]);
-    const s = new ProClient({ WebSocket: FakeSocket, streamUrls: [A] });
+    const s = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A] });
     const first = s.stream([F1], undefined, { idleTimeout: null }).next();
     await settle();
     FakeSocket.all[0]!.open();
@@ -928,7 +994,7 @@ describe("ProClient credentials", () => {
     expect((await first).value![0]!.blob).toBe(blob);
     await s.close();
     const huge = `0x${"00".repeat(MAX_UPDATE_BYTES + 1)}`;
-    await expect(new ProClient({ fetch: fakeFetch(() => json({ evm: { encoding: "hex", data: huge } })).fetch }).latestUpdate([F1])).rejects.toThrow(
+    await expect(new ProClient({ token: TOKEN, fetch: fakeFetch(() => json({ evm: { encoding: "hex", data: huge } })).fetch }).latestUpdate([F1])).rejects.toThrow(
       `price endpoint sent update data longer than the largest update there can be (${MAX_UPDATE_BYTES} bytes): refusing it`,
     );
   });
@@ -939,7 +1005,7 @@ describe("ProClient.stream under a misbehaving endpoint", () => {
   const rows = (batch: Print[] | void) => (batch ?? []).map((p) => [p.feedId, p.timestampUs]);
 
   it("sends the proxy headers without a token too", async () => {
-    const c = new ProClient({ headers: { "x-proxy": "proxy-header-value" }, WebSocket: FakeSocket, streamUrls: [A] });
+    const c = new ProClient({ headers: { "x-proxy": "proxy-header-value" }, restUrl: REST, WebSocket: FakeSocket, streamUrls: [A] });
     const waiting = c.stream([F1], undefined, { idleTimeout: null }).next();
     await settle();
     expect(FakeSocket.all[0]!.headers).toEqual({ "x-proxy": "proxy-header-value" });
@@ -949,7 +1015,7 @@ describe("ProClient.stream under a misbehaving endpoint", () => {
 
   it("drops an endpoint that sends an update stamped far ahead of the clock", async () => {
     const notices: string[] = [];
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A, B], clock: () => 1_000 });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B], clock: () => 1_000 });
     const it = c.stream([F1], undefined, { idleTimeout: null, onNotice: (m) => notices.push(m) });
     const first = it.next();
     await settle();
@@ -968,6 +1034,7 @@ describe("ProClient.stream under a misbehaving endpoint", () => {
     let open: () => void = () => {};
     const gate = new Promise<void>((r) => (open = r));
     const c = new ProClient({
+      restUrl: REST,
       WebSocket: FakeSocket,
       streamUrls: [A, B],
       clock: () => 1_000,
@@ -1007,7 +1074,7 @@ describe("ProClient.stream under a misbehaving endpoint", () => {
 
   it("checks every set's newest update in turn, however slow the checks", async () => {
     const releases: (() => void)[] = [];
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A], isTrustedSigner: () => new Promise<boolean>((r) => releases.push(() => r(true))) });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A], isTrustedSigner: () => new Promise<boolean>((r) => releases.push(() => r(true))) });
     const ids = [1, 2, 3, 4, 5, 6];
     const seen = new Set<Hex>();
     const it = c.stream(ids.map((id) => [fid(id)]), undefined, { idleTimeout: null });
@@ -1033,7 +1100,7 @@ describe("ProClient.stream under a misbehaving endpoint", () => {
 
   it("drops an endpoint that keeps sending messages that are not price updates", async () => {
     const notices: string[] = [];
-    const c = new ProClient({ WebSocket: FakeSocket, streamUrls: [A, B] });
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B] });
     const first = c.stream([F1], undefined, { idleTimeout: null, onNotice: (m) => notices.push(m) }).next();
     await settle();
     const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
@@ -1071,11 +1138,11 @@ describe("ProClient credentials inside URLs", () => {
         `${what} holds a user name, a password or a query and uses ${scheme}://, which would send them unencrypted to another machine: use https:// or wss://, or set allowInsecure for an endpoint on a network you trust`,
       );
       expect(err!.message).not.toMatch(/s3cr3tvalue|pa55w0rd|feeds|example/);
-      expect(() => new ProClient({ ...opts, allowInsecure: true })).not.toThrow();
+      expect(() => new ProClient({ restUrl: REST, streamUrls: [A], ...opts, allowInsecure: true })).not.toThrow();
     }
     // encrypted, or this machine: nothing travels in the clear to anyone else
     expect(() => new ProClient({ streamUrls: ["wss://proxy.example/v1/stream?key=s3cr3tvalue", "ws://127.0.0.1:9000/v1/stream?key=1"], restUrl: "http://feeds:pa55w0rd@localhost:8080" })).not.toThrow();
-    expect(() => new ProClient({ streamUrls: ["ws://proxy.example:9000/v1/stream?"] })).not.toThrow(); // an empty query holds nothing
+    expect(() => new ProClient({ restUrl: REST, streamUrls: ["ws://proxy.example:9000/v1/stream?"] })).not.toThrow(); // an empty query holds nothing
   });
 
   it("counts only the literal localhost, 127.0.0.0/8 and [::1] as this machine", () => {

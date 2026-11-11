@@ -16,8 +16,8 @@ subgraph:
   url: none                         # default | none | a GraphQL URL
 
 prices:
-  endpoint: pyth                    # pyth (Pyth Pro) | bazaar (not available yet) | the URL of a Pyth Pro compatible service
-  token: ${PYTH_PRO_TOKEN}          # your Pyth Pro access token
+  endpoint: pyth                    # pyth (Pyth Pro, the default) | the URL of a Pyth Pro compatible service
+  token: ${PYTH_PRO_TOKEN}          # your Pyth Pro API key: required for pyth, whose endpoints serve no one without it
   # channel: fixed_rate@200ms       # real_time | fixed_rate@50ms | fixed_rate@200ms | fixed_rate@1000ms
   # checkSigners: true              # use only updates signed by a signer the deployment's Pyth verifier trusts
   # streamIdleTimeoutSeconds: 10    # a stream that brings no new update for this long is reconnected
