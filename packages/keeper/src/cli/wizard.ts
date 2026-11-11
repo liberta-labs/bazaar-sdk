@@ -2,10 +2,10 @@
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { ETH_USD_FEED, HermesClient, JsonRpc, NETWORKS, PRICE_ENDPOINTS } from "@liberta-labs/bazaar-sdk";
+import { ETH_USD_FEED, JsonRpc, NETWORKS, ProClient } from "@liberta-labs/bazaar-sdk";
 import { type Hex, getAddress, isAddress } from "viem";
 import { parse as parseYaml } from "yaml";
-import { type JobName, type KeeperConfig, expandHome, parseConfig } from "../config/index.js";
+import { type JobName, type KeeperConfig, PricesConfig, expandHome, hermesEndpointProblem, parseConfig, priceEndpoints } from "../config/index.js";
 import { LocalSigner, newKey, writeKeystore } from "../exec/wallets.js";
 import { safeLabel } from "../observe/logs.js";
 import { CliExit, FAIL, OK, type Output, WARN, c, consoleOutput, errorText, groupedFixed } from "./format.js";
@@ -67,8 +67,8 @@ export interface WizardDeps {
   isTTY: boolean;
   /** the RPC's chain id */
   chainId(url: string): Promise<number>;
-  /** a line describing the endpoint's ETH/USD print */
-  priceCheck(base: string, apiKey: string | null): Promise<string>;
+  /** a line describing the ETH/USD print of `endpoint` (a `prices.endpoint` value), read with `token` */
+  priceCheck(endpoint: string, token: string | null): Promise<string>;
   /** the factory's markets (the engine's listMarkets) */
   listMarkets(cfg: KeeperConfig): Promise<readonly { label: string; address: string }[]>;
   newKey(): Hex;
@@ -88,14 +88,15 @@ async function rpcChainId(url: string): Promise<number> {
   return n;
 }
 
-async function priceCheck(base: string, apiKey: string | null): Promise<string> {
-  const h = new HermesClient(base, apiKey);
+async function priceCheck(endpoint: string, token: string | null): Promise<string> {
+  // One request to the request API: no stream is opened, so no WebSocket is needed here.
+  const pro = new ProClient({ ...priceEndpoints(PricesConfig.parse({ endpoint })), token });
   try {
-    const p = (await h.latest([ETH_USD_FEED]))[0];
+    const p = (await pro.latest([ETH_USD_FEED]))[0];
     if (!p) throw new Error("the endpoint served no ETH/USD print");
     return `ETH/USD print ${groupedFixed(Number(p.price) * 10 ** p.expo, 2)}`;
   } finally {
-    await h.close();
+    await pro.close();
   }
 }
 
@@ -129,6 +130,9 @@ const digits: Validate = (s) => /^\d+$/.test(s.trim()) || "enter a whole number"
 const nonEmpty: Validate = (s) => s.trim().length > 0 || "enter a URL";
 const usdAmount: Validate = (s) => /^(?:\.\d+|\d+(?:\.\d*)?)$/.test(s.trim()) || "enter an amount in USD, such as 0.05";
 const anAddress: Validate = (s) => isAddress(s.trim()) || "not an address";
+const aToken: Validate = (s) => s.trim().length > 0 || "enter the token";
+/** A Pyth Pro compatible endpoint's URL: the token is sent there, so a Hermes service is refused. */
+const aPriceUrl: Validate = (s) => (nonEmpty(s) === true ? (hermesEndpointProblem("prices.endpoint", s) ?? true) : nonEmpty(s));
 const aKey: Validate = (s) => {
   try {
     void new LocalSigner(s.trim());
@@ -156,9 +160,8 @@ export function yamlScalar(s: string, flow = false): string {
 }
 
 /**
- * A .env value that dotenv reads back unchanged: as given when that is safe (the usual case, and what
- * the Python keeper wrote), else quoted, because dotenv cuts an unquoted value at `#`, trims it, and
- * strips quotes around it.
+ * A .env value that dotenv reads back unchanged: as given when that is safe (the usual case), else
+ * quoted, because dotenv cuts an unquoted value at `#`, trims it, and strips quotes around it.
  */
 export function envValue(v: string): string {
   if (/^[^#'"`\\$\r\n]*$/.test(v) && v.trim() === v) return v;
@@ -171,7 +174,7 @@ export function envValue(v: string): string {
 }
 
 /**
- * Merge `values` into the .env at `path`, as the Python wizard did: every `NAME=value` line already
+ * Merge `values` into the .env at `path`: every `NAME=value` line already
  * there is kept as written (comments are not), the new values replace or follow them, and the file is
  * owner-only (0600) where the OS has POSIX permissions, before and after the secrets go in.
  */
@@ -265,8 +268,14 @@ async function wizard(configPath: string, d: WizardDeps, state: { keystore: stri
     factory = getAddress((await p.input({ message: "Factory address", validate: anAddress })).trim());
     lines.push(`factory: "${factory}"`);
     if (net === "custom") {
-      const sb = await p.input({ message: "The factory's deployment block (for indexing from logs)", default: "0", validate: digits });
-      lines.push(`startBlock: ${sb.trim()}`);
+      const sb = (
+        await p.input({
+          message: "The factory's deployment block (leave empty to have the keeper find it)",
+          default: "",
+          validate: (v: string) => v.trim() === "" || digits(v),
+        })
+      ).trim();
+      if (sb !== "") lines.push(`startBlock: ${sb}`);
     }
   }
 
@@ -308,31 +317,31 @@ async function wizard(configPath: string, d: WizardDeps, state: { keystore: stri
 
   // ---- prices ----
   const pchoice = await p.select({
-    message: "Price endpoint",
+    message: "Price endpoint (Pyth Pro)",
     choices: [
-      { name: "My own Pyth API key", value: "pyth" },
-      { name: "Custom Hermes-compatible URL", value: "custom" },
+      { name: "Pyth Pro, with my own access token", value: "pyth" },
+      { name: "Custom Pyth Pro compatible URL (bazaar mock-prices, a proxy)", value: "custom" },
       { name: "Bazaar shared endpoint (not available yet)", value: "bazaar", disabled: "coming later" },
     ],
   });
   lines.push("", "prices:");
-  let key: string | null = null;
-  let base: string;
+  let token: string | null = null;
+  let endpoint: string;
   if (pchoice === "pyth") {
-    key = await p.password({ message: "Pyth API key" });
-    base = PRICE_ENDPOINTS["pyth"] ?? "";
-    lines.push("  endpoint: pyth", `  apiKey: ${setEnv("PYTH_API_KEY", key)}`);
+    token = (await p.password({ message: "Pyth Pro access token", validate: aToken })).trim();
+    endpoint = "pyth";
+    lines.push("  endpoint: pyth", `  token: ${setEnv("PYTH_PRO_TOKEN", token)}`);
   } else {
-    base = (
-      await p.input({ message: "Price endpoint URL", default: net === "anvil" ? "http://127.0.0.1:8787" : undefined, validate: nonEmpty })
+    endpoint = (
+      await p.input({ message: "Price endpoint URL", default: net === "anvil" ? "http://127.0.0.1:8787" : undefined, validate: aPriceUrl })
     ).trim();
-    lines.push(`  endpoint: ${setEnv("PRICE_ENDPOINT_URL", base)}`);
-    if (await p.confirm({ message: "Does it need an API key?", default: false })) {
-      key = await p.password({ message: "API key" });
-      lines.push(`  apiKey: ${setEnv("PRICE_API_KEY", key)}`);
+    lines.push(`  endpoint: ${setEnv("PRICE_ENDPOINT_URL", endpoint)}`);
+    if (await p.confirm({ message: "Does it need an access token?", default: false })) {
+      token = (await p.password({ message: "Access token", validate: aToken })).trim();
+      lines.push(`  token: ${setEnv("PRICE_TOKEN", token)}`);
     }
   }
-  const pr = await check(() => d.priceCheck(base, key));
+  const pr = await check(() => d.priceCheck(endpoint, token));
   say(pr.error === null ? `${OK()} ${pr.value}` : `${WARN()} could not read a print yet: ${pr.error}`);
 
   // ---- wallet ----
@@ -384,7 +393,7 @@ async function wizard(configPath: string, d: WizardDeps, state: { keystore: stri
   let markets: { label: string; address: string }[] = [];
   if (picked.some((j) => j !== "collect")) {
     // In memory only: the market listing needs the URL and key themselves.
-    const tmp: Record<string, unknown> = { network: net, rpc: { http: url }, prices: { endpoint: base, apiKey: key }, subgraph: { url: "none" } };
+    const tmp: Record<string, unknown> = { network: net, rpc: { http: url }, prices: { endpoint, token }, subgraph: { url: "none" } };
     if (factory) tmp.factory = factory;
     if (net === "custom") tmp.chainId = chainId;
     const found = await check(() => d.listMarkets(parseConfig(tmp)));

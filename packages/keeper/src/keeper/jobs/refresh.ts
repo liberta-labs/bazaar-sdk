@@ -30,6 +30,7 @@ export class RefreshJob extends Job<RefreshJobConfig> {
       return [
         this.action(m, m.address, PAIR.encode("refreshPrice", updates), "refresh a quiet market's price", {
           value: fee,
+          priceTime: pc.priceTime,
           locks: [lock],
           rewardPair: m.address,
         }),
@@ -51,6 +52,7 @@ export class RefreshJob extends Job<RefreshJobConfig> {
     return [
       this.action(m, m.address, PAIR.encode("refreshPrice", updates), "health check (unpaid refresh)", {
         value: fee,
+        priceTime: pc.priceTime,
         locks: [lock],
         rewardPair: m.address,
         paid: false,
@@ -61,6 +63,6 @@ export class RefreshJob extends Job<RefreshJobConfig> {
   }
 
   override note(action: Action, result: ActionResult): void {
-    if (!result.sent && action.market) this.cool(lockKey("refresh", action.market.address), 10);
+    if (!result.sent && !result.priceAged && action.market) this.cool(lockKey("refresh", action.market.address), 10);
   }
 }

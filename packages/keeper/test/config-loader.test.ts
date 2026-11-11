@@ -47,13 +47,31 @@ describe("the secrets rule", () => {
     const key = load(...HEAD, "prices: {endpoint: http://p}", "wallets:", "  default:", "    type: privateKey", `    key: \${NOPE_KEY:-${PRIVATE_KEY}}`);
     expect(key).toMatch(/^wallets\.default\.key holds a secret written into the file/);
     expect(key).not.toContain(PRIVATE_KEY.slice(2));
-    const apiKey = load(...HEAD, "prices:", "  endpoint: http://p", `  apiKey: "\${NOPE_KEY:-${KEY}}"`);
-    expect(apiKey).toMatch(/^prices\.apiKey holds a secret/);
-    expect(apiKey).not.toContain(KEY);
+    const token = load(...HEAD, "prices:", "  endpoint: http://p", `  token: "\${NOPE_KEY:-${KEY}}"`);
+    expect(token).toMatch(/^prices\.token holds a secret/);
+    expect(token).not.toContain(KEY);
     // A reference alone, or with an empty default, holds nothing.
-    expect(load(...HEAD, "prices:", "  endpoint: http://p", '  apiKey: "${NOPE_KEY:-}"')).toBeNull();
+    expect(load(...HEAD, "prices:", "  endpoint: http://p", '  token: "${NOPE_KEY:-}"')).toBeNull();
     process.env.NOPE_KEY = "from-env";
-    expect(load(...HEAD, "prices:", "  endpoint: http://p", '  apiKey: "${NOPE_KEY}"')).toBeNull();
+    expect(load(...HEAD, "prices:", "  endpoint: http://p", '  token: "${NOPE_KEY}"')).toBeNull();
+  });
+
+  it("holds the price endpoint's URLs to the keyed-URL rule, each of them", () => {
+    process.env.PRICE_KEY = KEY;
+    for (const [setting, yaml] of [
+      ["prices.endpoint", `  endpoint: https://pro.example/${KEY}`],
+      ["prices.restUrl", `  restUrl: https://pro.example/${KEY}`],
+      ["prices.symbolsUrl", `  symbolsUrl: https://pro.example/v1?key=${KEY}`],
+      ["prices.streamUrls[1]", `  streamUrls: [wss://a.example/v1/stream, wss://b.example/${KEY}/v1/stream]`],
+    ] as const) {
+      const msg = load(...HEAD, "prices:", ...(setting === "prices.endpoint" ? [] : ["  endpoint: pyth"]), yaml);
+      expect(msg, setting).toContain(`${setting} is a URL with a key in its`);
+      expect(msg, setting).not.toContain(KEY);
+    }
+    // The same URLs with the key as a reference load.
+    const f = join(dir, "p.yaml");
+    writeFileSync(f, [...HEAD, "prices:", "  endpoint: pyth", "  token: ${PRICE_KEY}", "  restUrl: https://pro.example/${PRICE_KEY}"].join("\n"));
+    expect(loadConfig(f).prices).toMatchObject({ token: KEY, restUrl: `https://pro.example/${KEY}` });
   });
 
   it("checks a URL's ${NAME:-default} default for a key, whole or inside the URL", () => {
@@ -93,16 +111,32 @@ describe("the secrets rule", () => {
     expect(loadConfig(f).rpc.http).toBe(`https://arb-mainnet.g.alchemy.com/v2/${KEY}`);
   });
 
+  it("tells a file that still holds prices.apiKey what the setting is now, before any variable is filled, never quoting it", () => {
+    const message =
+      "prices.apiKey is not a setting: the Pyth Pro access token goes in prices.token (a Pyth Core or Hermes key does not work), " +
+      "and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service";
+    delete process.env.GONE_PYTH_API_KEY;
+    // The variable it names is gone: the rename is what is reported, not the missing variable.
+    expect(load(...HEAD, "prices:", "  endpoint: pyth", "  apiKey: ${GONE_PYTH_API_KEY}")).toBe(message);
+    // A value written into the file is not echoed, and not judged as a secret first.
+    const literal = load(...HEAD, "prices:", "  endpoint: https://hermes.example", `  apiKey: ${KEY}`);
+    expect(literal).toBe(message);
+    expect(literal).not.toContain(KEY);
+    // Present and filled, it is still refused: the keeper never sends a Pyth Core key anywhere.
+    process.env.GONE_PYTH_API_KEY = KEY;
+    expect(load(...HEAD, "prices:", "  endpoint: pyth", "  apiKey: ${GONE_PYTH_API_KEY}")).toBe(message);
+  });
+
   it("loads the shipped example config, with its secrets in the environment", () => {
     process.env.RPC_HTTP_URL = `https://arb-sepolia.g.alchemy.com/v2/${KEY}`;
-    process.env.PYTH_API_KEY = KEY;
+    process.env.PYTH_PRO_TOKEN = KEY;
     process.env.KEEPER_KEYSTORE_PASSWORD = "pw";
     const f = join(dir, "bazaar-keeper.yaml");
     // Its factory placeholder is the zero address: give it a real-looking one, as the comment asks.
     writeFileSync(f, readFileSync(EXAMPLE, "utf8").replace(/factory: "0x0{40}"/, `factory: "${FACTORY}"`));
     const cfg = loadConfig(f);
     expect(cfg.rpc.http).toBe(process.env.RPC_HTTP_URL);
-    expect(cfg.prices).toMatchObject({ endpoint: "pyth", apiKey: KEY });
+    expect(cfg.prices).toMatchObject({ endpoint: "pyth", token: KEY, channel: "fixed_rate@200ms" });
     expect(cfg.wallets.default).toMatchObject({ type: "keystore", password: "pw" });
   });
 });

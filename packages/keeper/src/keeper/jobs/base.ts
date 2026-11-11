@@ -1,6 +1,6 @@
 /** What every job shares: its scope, its cooldowns, and the price it acts on. */
 
-import { MAX_LIQUIDATION_PRICE_AGE, MAX_PRICE_STALENESS, type Market, Status, marketStatus, pair } from "@liberta-labs/bazaar-sdk";
+import { MAX_LIQUIDATION_PRICE_AGE, type Market, Status, marketStatus } from "@liberta-labs/bazaar-sdk";
 import type { Address, Hex } from "viem";
 import { JobConfig } from "../../config/index.js";
 import { Action, type ActionInit, type ActionResult } from "../../exec/executor.js";
@@ -16,10 +16,12 @@ export const LIVE_OR_ADL: ReadonlySet<Status> = new Set([Status.Live, Status.Adl
 export const ALL_STATUSES: ReadonlySet<Status> = new Set(Object.values(Status));
 
 /**
- * The price a planner judges by and the update payload its call carries.
+ * The price a planner judges by and the update payload its call carries: the print's update when the
+ * call is judged at the print, none when it is judged at the pair's stored price.
  *
  * `updates` is built on first use (most plans find nothing to do and never need it); a planner reads
- * it before its first await, so it carries the very print `price` came from.
+ * it before its first await, so the update attached is the one that carried the print the price was
+ * judged at.
  */
 export class PricedCall {
   private built: Hex[] | null;
@@ -29,6 +31,12 @@ export class PricedCall {
     readonly price: bigint,
     updates: readonly Hex[] | (() => Hex[]),
     readonly fresh: boolean,
+    /**
+     * The second the price the call relies on was generated or stored in, when the call needs it to
+     * be within the pair's 3 s window as it lands (the executor checks it again just before sending);
+     * null when it does not (the stored price on a closed session market).
+     */
+    readonly priceTime: number | null = null,
   ) {
     if (typeof updates === "function") {
       this.built = null;
@@ -42,31 +50,6 @@ export class PricedCall {
   get updates(): Hex[] {
     if (this.built === null) this.built = this.build!();
     return this.built;
-  }
-}
-
-/**
- * Seconds past updateTs + MAX_PRICE_STALENESS (on the chain clock) at which an early re-plan runs, so
- * the block it simulates against no longer serves the cached price. Pyth's getPriceNoOlderThan keeps a
- * price fresh while block.timestamp - publishTime <= MAX_PRICE_STALENESS (inclusive), and block
- * timestamps are whole seconds, so the first block that ignores the cache is at updateTs + 4: one
- * second plus a 0.2 s margin past the 3 s window.
- */
-export const CACHE_REPLAN_MARGIN = 1.2;
-
-const PAIR = pair();
-
-/**
- * Whether a refusal may be the pair judging by Pyth's on-chain cache: the call ran (no revert, no RPC
- * failure) and `countFn`'s returned count (liquidatedCount, executedCount) is zero, so nothing crossed
- * at the price the pair used, although the planner saw it cross at the attached print.
- */
-function nothingCrossed(r: ActionResult, countFn: string): boolean {
-  if (r.sent || r.error !== null || r.returned === "0x") return false;
-  try {
-    return PAIR.decode<bigint>(countFn, r.returned) === 0n;
-  } catch {
-    return false;
   }
 }
 
@@ -98,8 +81,6 @@ export class Job<C extends JobConfig = JobConfig> {
   readonly cfg: C;
   /** cooldown key -> monotonic time it ends */
   private readonly coolUntil = new Map<string, number>();
-  /** key -> monotonic time until which its early retry (see {@link coolRefused}) counts as used */
-  private readonly earlyUsed = new Map<string, number>();
 
   constructor(
     readonly k: Keeper,
@@ -136,68 +117,54 @@ export class Job<C extends JobConfig = JobConfig> {
     this.coolUntil.set(key, monotonic() + (seconds ?? this.k.cfg.engine.simCooldownSeconds));
   }
 
-  /**
-   * Cool down the keys of a price-driven candidate the chain refused: engine.simCooldownSeconds, except
-   * once in a row for a refusal Pyth's on-chain cache likely explains. While the market's stored price
-   * is younger than MAX_PRICE_STALENESS, the pair judges by Pyth's cached price, not the update the
-   * call attached, so a move inside that window crosses nothing (`countFn` returns 0) until the cache
-   * ages out at updateTs + MAX_PRICE_STALENESS. Then the keys cool only until just after that, and the
-   * engine re-plans this job on the market at that moment instead of after the full cooldown. A
-   * refusal of that retry takes the fixed cooldown. Another pair on the same feed can refresh Pyth's
-   * cache too, so a young stored price is a signal, not a proof: it costs one early simulation at most.
-   */
-  protected coolRefused(action: Action, result: ActionResult, countFn: string): void {
-    const m = action.market;
-    const st = m?.state ?? null;
-    const now = this.k.chainTime();
-    const at =
-      m !== null && st !== null && st.updateTs > 0 && now - st.updateTs < MAX_PRICE_STALENESS && nothingCrossed(result, countFn)
-        ? st.updateTs + MAX_PRICE_STALENESS + CACHE_REPLAN_MARGIN
-        : null;
-    if (at === null) {
-      for (const key of action.locks) this.cool(key);
-      return;
-    }
-    const mono = monotonic();
-    const delay = Math.max(0, at - now);
-    if (this.earlyUsed.size > 256) for (const [k, t] of this.earlyUsed) if (t <= mono) this.earlyUsed.delete(k);
-    let early = false;
-    for (const key of action.locks) {
-      const used = this.earlyUsed.get(key);
-      if (used !== undefined && used > mono) {
-        this.earlyUsed.delete(key);
-        this.cool(key); // the early retry was refused as well: the fixed cooldown is the backstop
-      } else {
-        this.earlyUsed.set(key, mono + delay + MAX_PRICE_STALENESS);
-        this.cool(key, delay);
-        early = true;
-      }
-    }
-    if (early) this.k.replanAt(this, m!, at);
-  }
-
-  /** A sent candidate starts afresh: its next refusal may take an early retry again. */
-  protected clearEarly(keys: readonly string[]): void {
-    if (this.earlyUsed.size > 0) for (const key of keys) this.earlyUsed.delete(key);
-  }
-
   action(m: Market | null, target: Address, data: Hex, summary: string, extras: ActionExtras = {}): Action {
     return new Action({ wallet: this.cfg.wallet, ...extras, job: this.name, market: m, target, data, summary });
   }
 
   // ---- prices ----
-  /** A fresh print and its update, or, when allowed, the stored price on a closed session market. */
+  /**
+   * The price a call on `m` is judged at now and the update it carries: a fresh print's, or, when
+   * allowed, the stored price on a closed session market (with no update).
+   *
+   * A pair stores an update's price only when it was generated in a later second than the price it
+   * holds (for a composite, when its older leg was), and otherwise judges the call at the price it
+   * holds (BazaarPair._buildAndStorePairPrice). So while the market's stored price is from the
+   * print's second or a later one, the planner judges at the stored price as the pair will: a
+   * candidate that crosses only at the print is left for the next second's print, and one that
+   * crosses at the stored price is not missed. The call then carries no update: the chain's stored
+   * price is at least as new as the one read here (it never goes back), so the print could never be
+   * stored, and attaching it would only cost its fee and revert the call once the print aged past the
+   * window, where the call without it runs on the stored price, which is at least as fresh.
+   */
   priced(m: Market, allowStale = false): PricedCall | null {
     const prices = this.k.prices;
-    if (prices.fresh(m)) {
-      const pp = prices.price(m)!;
-      return new PricedCall(pp.spot, () => prices.updateFor(m), true);
-    }
     const st = m.state;
+    if (prices.fresh(m) && this.confident(m)) {
+      const pp = prices.price(m)!;
+      if (st !== null && st.spot > 0n && st.updateTs >= pp.publishTime) return new PricedCall(st.spot, [], true, st.updateTs);
+      return new PricedCall(pp.spot, () => prices.updateFor(m), true, pp.publishTime);
+    }
     if (allowStale && !m.continuous && st !== null && st.spot > 0n) {
       if (this.k.now() - st.updateTs <= MAX_LIQUIDATION_PRICE_AGE - 30) return new PricedCall(st.spot, [], false);
     }
     return null;
+  }
+
+  /**
+   * Whether every print `m` prices from carries a confidence. BazaarOracle reads a zero confidence as
+   * an absent one and reverts the call (BazaarOracle__IncompleteFeed), so such a print is never
+   * attached: the market is planned as one without a fresh print, and no confidence is made up for
+   * it. The SDK's client yields no print for such a feed; this holds whatever the print's source.
+   */
+  private confident(m: Market): boolean {
+    const legs = this.k.prices.legs(m);
+    if (legs === null) return false;
+    for (const p of legs) {
+      if (p.conf > 0n) continue;
+      this.k.unusablePrint(m, `the print for feed ${p.feedId} carries no confidence, and the oracle refuses a live price without one`);
+      return false;
+    }
+    return true;
   }
 
   /** Per-market jobs: what to send on `m` now. */
@@ -217,7 +184,7 @@ export class Job<C extends JobConfig = JobConfig> {
 /** The constructor every job class has (the config is the job's own schema type). */
 export type JobClass = new (keeper: Keeper, cfg: never) => Job;
 
-// ---- formatting, as the Python's f-strings ----
+// ---- formatting ----
 
 /** `{x:,.0f}`: rounded, with thousands separators. */
 export function thousands(x: number): string {

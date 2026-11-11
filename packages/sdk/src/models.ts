@@ -80,7 +80,7 @@ export interface Market {
   address: Address;
   pairId: Hex;
   baseFeedId: Hex;
-  /** raw Pyth feed ids: one, or two for a composite */
+  /** raw Pyth Pro feed ids, each a bytes32 holding the feed's number: one, or two for a composite */
   legs: Hex[];
   invertQuote: boolean;
   /** traded 24/7, as opposed to a market with trading hours */

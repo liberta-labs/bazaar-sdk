@@ -6,8 +6,8 @@ import { dirname, join, resolve } from "node:path";
 import { redactUrl, urlCredential } from "@liberta-labs/bazaar-sdk";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml } from "yaml";
-import type { ZodError } from "zod";
-import { KeeperConfig } from "./schema.js";
+import type { ZodError, ZodIssue } from "zod";
+import { KeeperConfig, PRICES_API_KEY_MESSAGE } from "./schema.js";
 
 export const DEFAULT_CONFIG = "bazaar-keeper.yaml";
 const VAR = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g;
@@ -20,7 +20,7 @@ const VAR_ONLY = /^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}$/;
  * environment whole or with its key as a ${NAME} inside it. prices.headers values are held to the same
  * rule, and so is the default of a ${NAME:-default} reference.
  */
-export const SECRET_KEYS = new Set(["key", "password", "phrase", "apiKey", "botToken", "webhook"]);
+export const SECRET_KEYS = new Set(["key", "password", "phrase", "apiKey", "token", "botToken", "webhook"]);
 
 /** A configuration problem, phrased for the person fixing it. */
 export class ConfigError extends Error {
@@ -107,8 +107,26 @@ function checkSecrets(value: unknown, path = ""): void {
   }
 }
 
+/** For a key the schema refuses whose value belongs under another key: where it goes. */
+function misplaced(e: ZodIssue): string {
+  if (e.code === "unrecognized_keys" && e.path.join(".") === "prices" && e.keys.includes("apiKey")) return ` (${PRICES_API_KEY_MESSAGE})`;
+  return "";
+}
+
+/**
+ * Refuse a file that still holds `prices.apiKey`, before any `${NAME}` in it is filled: an operator
+ * whose old variable is gone is told what the setting is now, not that the variable is unset. The
+ * value is neither read nor shown.
+ */
+function checkRenamed(raw: object): void {
+  const prices = (raw as Record<string, unknown>).prices;
+  if (prices !== null && typeof prices === "object" && !Array.isArray(prices) && Object.hasOwn(prices, "apiKey")) {
+    throw new ConfigError(PRICES_API_KEY_MESSAGE);
+  }
+}
+
 function format(err: ZodError): string {
-  const lines = err.issues.map((e) => `  ${e.path.join(".") || "config"}: ${e.message}`);
+  const lines = err.issues.map((e) => `  ${e.path.join(".") || "config"}: ${e.message}${misplaced(e)}`);
   return "the config is not valid:\n" + lines.join("\n");
 }
 
@@ -131,6 +149,7 @@ export function loadConfig(path?: string | null): KeeperConfig {
     throw new ConfigError(`${file} is not valid YAML: ${(e as Error).message}`);
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ConfigError(`${file} must be a YAML mapping`);
+  checkRenamed(raw);
   checkSecrets(raw);
   return parseConfig(interpolate(raw, ""));
 }

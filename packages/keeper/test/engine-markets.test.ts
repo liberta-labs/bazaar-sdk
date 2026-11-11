@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { ORACLE_DEAD_THRESHOLD, SubgraphError } from "@liberta-labs/bazaar-sdk";
 import type { Hex } from "viem";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { ConfigError } from "../src/config/index.js";
 import { type Action, ActionResult } from "../src/exec/executor.js";
 import type { Keeper } from "../src/keeper/engine.js";
 import { findOpportunities } from "../src/keeper/ops/opportunities.js";
@@ -103,7 +104,7 @@ describe("labels several markets share", () => {
 describe("names from outside", () => {
   it("labels are cleaned of control characters, shell metacharacters and mentions where they are made", async () => {
     const f = fake(dir);
-    f.k.hermes.priceFeeds = async () => [{ id: FEED.slice(2), attributes: { symbol: "Crypto.BTC/USD\x1b[2J; rm -rf ~ @everyone" } }] as never;
+    f.k.pro.symbols = async () => [{ feedId: FEED, symbol: "Crypto.BTC/USD\x1b[2J; rm -rf ~ @everyone" }] as never;
     const a = marketAt(5, [FEED]);
     const b = marketAt(6, [FEED2]); // no symbol: labelled by its description
     b.description = "Gold`id`\n#spot";
@@ -165,6 +166,8 @@ describe("first start", () => {
       inside(f.k).label = async () => {};
       f.k.tail = { scan: async (from: number, to: number) => (scans.push([from, to]), new Effects()) } as never;
       f.k.chain.block = async () => ({ number: 1_000, hash: `0x${"cd".repeat(32)}`, timestamp: f.now, baseFee: 1n }) as never;
+      // no startBlock configured: the keeper finds the factory's deployment block (here 120) on chain
+      f.k.chain.code = (async (_a: string, at: number | string = "latest") => (at === "latest" || Number(at) >= 120 ? "0x60" : "0x")) as never;
       inside(f.k).subgraph = {
         meta: async () => [900, `0x${"00".repeat(32)}`, false],
         descriptions: async () => {
@@ -177,10 +180,36 @@ describe("first start", () => {
         close: async () => {},
       };
       await inside(f.k).bootstrapIndex();
-      expect(scans, err.message).toEqual([[f.k.net.startBlock, 1_000]]);
+      expect(scans, err.message).toEqual([[120, 1_000]]);
       expect(f.k.store.head).toBe(1_000);
       expect(f.k.store.headHash).toBe(`0x${"cd".repeat(32)}`);
       expect(warnings().at(-1)).toBe(`subgraph unavailable (${err.message}); indexing from chain logs instead`);
     }
+  });
+
+  it("starts the log scan at a configured startBlock without searching, and refuses when the node keeps no history", async () => {
+    const f = fake(dir);
+    const scans: number[][] = [];
+    let codeReads = 0;
+    f.k.tail = { scan: async (from: number, to: number) => (scans.push([from, to]), new Effects()) } as never;
+    f.k.chain.block = async () => ({ number: 1_000, hash: `0x${"cd".repeat(32)}`, timestamp: f.now, baseFee: 1n }) as never;
+    f.k.chain.code = (async () => (codeReads++, "0x60")) as never;
+    inside(f.k).subgraph = null;
+    (f.k as unknown as { net: unknown }).net = { ...f.k.net, startBlock: 77 };
+    await inside(f.k).bootstrapIndex();
+    expect(scans).toEqual([[77, 1_000]]);
+    expect(codeReads).toBe(0);
+
+    const g = fake(dir);
+    g.k.tail = { scan: async () => new Effects() } as never;
+    g.k.chain.code = (async (_a: string, at: number | string = "latest") => {
+      if (at !== "latest" && Number(at) < 1_000) throw new Error("missing trie node");
+      return "0x60";
+    }) as never;
+    inside(g.k).subgraph = null;
+    (g.k as unknown as { net: unknown }).net = { ...g.k.net, startBlock: null };
+    const err = await inside(g.k).bootstrapIndex().catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ConfigError);
+    expect((err as Error).message).toMatch(/could not find the factory's deployment block .*Set startBlock in the config/);
   });
 });

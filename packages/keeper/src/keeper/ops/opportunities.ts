@@ -1,10 +1,11 @@
 /** Manual operations that are available right now, each confirmed by a simulation. */
 
 import { ORACLE_DEAD_THRESHOLD, SubgraphError, TERMINAL_SETTLEMENT_ESCAPE, factory as factoryCodec } from "@liberta-labs/bazaar-sdk";
-import { type Address, type Hex, getAddress, isAddress } from "viem";
-import type { ActionResult } from "../../exec/executor.js";
+import { type Address, type Hex, formatUnits, getAddress, isAddress } from "viem";
+import { ActionResult } from "../../exec/executor.js";
 import { safeLabel } from "../../observe/logs.js";
 import type { Keeper } from "../engine.js";
+import type { ScheduledTermination } from "./manual.js";
 
 const FACTORY = factoryCodec();
 const ZERO32: Hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -33,6 +34,25 @@ export class Opportunity {
     } else when = "not ready";
     return `${this.operation} ${this.market}: ${this.detail} (${when}) — bazaar keeper ${this.command}`;
   }
+}
+
+/**
+ * Why a scheduled termination is offered: the rule it settles under and the price it fixes. A
+ * settlement at the stored price says so, since no Pyth update proves that price and the command
+ * sends it only once told to.
+ */
+function scheduledDetail(planned: ScheduledTermination): string {
+  const price = planned.plan.settlementPrice === null ? "?" : formatUnits(planned.plan.settlementPrice, 18);
+  if (planned.plan.under === "tick") {
+    return `its scheduled cutoff has passed; it settles under UMA's rule at ${price}, the price Pyth's one-second update at the cutoff carries`;
+  }
+  if (planned.plan.under === "chain") {
+    return `its scheduled cutoff has passed; it settles under the chain rule at ${price}, the median of five chained Pyth prices`;
+  }
+  return (
+    `its scheduled cutoff has passed and no Pyth update proves a settlement price: only the stored-price fallback is open, at ${price}. ` +
+    "It is irreversible: the command shows the plan, and sends it only with --accept-stored-price"
+  );
 }
 
 type Row = Record<string, unknown>;
@@ -73,9 +93,15 @@ export async function findOpportunities(k: Keeper): Promise<Opportunity[]> {
     const name = safeLabel(m.label) || m.address;
     const at = m.address;
     if (st.scheduledTs && !st.settlementFixedTs && now > st.scheduledTs) {
-      await check("terminateScheduledPair", name, "its scheduled cutoff has passed", `run terminate-scheduled --market ${at}`, () =>
-        ops.terminateScheduledPair(m.address, { dryRun: true }),
-      );
+      // The default policy: the stored-price call is planned only when the archive has no update for it.
+      const planned = await ops.planScheduledTermination(m.address);
+      if (planned instanceof ActionResult) {
+        if (planned.opensAt) out.push(new Opportunity("terminateScheduledPair", name, "its scheduled cutoff has passed", `run terminate-scheduled --market ${at}`, false, planned.opensAt));
+      } else {
+        await check("terminateScheduledPair", name, scheduledDetail(planned), `run terminate-scheduled --market ${at}`, () =>
+          ops.sendScheduledTermination(planned, { dryRun: true }),
+        );
+      }
     }
     if (st.settlementFixedTs && !st.terminated && ((st.longOi === 0n && st.shortOi === 0n) || now >= st.settlementFixedTs + TERMINAL_SETTLEMENT_ESCAPE)) {
       await check(

@@ -38,7 +38,8 @@ as `${RPC_HTTP_URL}`, or only its key, as in `https://arb-mainnet.g.alchemy.com/
 
 The keeper connects to any JSON-RPC provider (Alchemy, Infura, QuickNode, your own node). It needs
 `eth_call` state overrides to measure rewards before sending (`doctor` checks), and `eth_getLogs` over
-`rpc.logChunk` blocks. Full guide: [packages/keeper](packages/keeper/README.md).
+`rpc.logChunk` blocks. Prices come from Pyth Pro: give it your own Pyth Pro access token (`prices.token`),
+or the URL of a Pyth Pro compatible service. Full guide: [packages/keeper](packages/keeper/README.md).
 
 ## Frontends
 
@@ -48,7 +49,7 @@ import { Bazaar, OrderType, parseUnits18 } from "@liberta-labs/bazaar-sdk";
 const bz = await Bazaar.connect({
   transport: window.ethereum,            // any EIP-1193 provider, a viem client, or an RPC URL
   factory: "0x...",
-  prices: "https://hermes.example",      // Hermes-compatible endpoint (your own key, or a proxy)
+  prices: { token: pythToken },          // Pyth Pro: short-lived tokens from your backend, never the API key
   subgraph: "https://subgraph.example",  // optional: history
   integrator: "0xYourFrontend",          // optional: earns the integrator fee on your users' fills
 });
@@ -80,10 +81,10 @@ npm run build-probe      # rebuild the simulation probe (solc 0.8.34; on Windows
 npm run gen-bindings     # refresh the Bazaar facade's bindings after adding a client function
 ```
 
-The end-to-end tests replay a recorded Bazaar deployment on a fresh Anvil, build a market, then run
-the real keeper and the frontend SDK against it; see
+The end-to-end tests replay a Bazaar deployment on a fresh Anvil, build a market, then run the real
+keeper and the frontend SDK against it, with prices from the keeper's mock Pyth Pro server; see
 [packages/keeper/test/e2e/fixtures/README.md](packages/keeper/test/e2e/fixtures/README.md) for how the
-recording is made. Start Anvil with
+deployment is computed from a Bazaar build. Start Anvil with
 
 ```bash
 anvil --port 8546 --block-time 1 --base-fee 10000000 --code-size-limit 100000

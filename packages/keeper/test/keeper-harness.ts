@@ -15,6 +15,7 @@ import {
   STOP_LOSS,
   ZERO_ADDRESS,
   emptyInventory,
+  feedIdHex,
 } from "@liberta-labs/bazaar-sdk";
 import { type Address, type Hex, getAddress } from "viem";
 import { parseConfig } from "../src/config/index.js";
@@ -23,8 +24,9 @@ import { LocalSigner } from "../src/exec/wallets.js";
 import { Keeper } from "../src/keeper/engine.js";
 
 export const S = 10n ** 18n;
-export const FEED = `0x${"01".repeat(32)}` as Hex;
-export const FEED2 = `0x${"02".repeat(32)}` as Hex;
+/** Two Pyth Pro feeds, neither of them ETH/USD: gas is priced at the fallback unless a test prints ETH/USD. */
+export const FEED = feedIdHex(101);
+export const FEED2 = feedIdHex(102);
 /** Anvil's first key, and its address: the keeper's own wallet in these tests. */
 export const KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 export const ME = getAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
@@ -146,17 +148,29 @@ export function recordOf(o: Order): OrderRecord {
   };
 }
 
-/** A Pyth print for `feed` at `usd` (expo -8), published `age` seconds before `now`. */
-export function print(feed: Hex, usd: number, publishTime: number): Print {
+let printed = 0n;
+
+/**
+ * A Pyth Pro print for `feed` at `usd` (expo -8), its price generated in second `publishTime`. Each
+ * print is generated a microsecond later within that second than the one made before it, so the
+ * newest one made is the one a PriceService keeps.
+ */
+export function print(feed: Hex, usd: number, publishTime: number, over: Partial<Print> = {}): Print {
+  printed = (printed + 1n) % 1_000_000n;
+  const generatedUs = BigInt(publishTime) * 1_000_000n + printed;
   return {
     feedId: feed,
     price: BigInt(Math.round(usd * 1e8)),
     conf: 10_000_000n,
     expo: -8,
     publishTime,
-    prevPublishTime: publishTime - 1,
+    generatedUs,
+    timestampUs: generatedUs,
+    channel: 3,
+    signer: null,
     blob: "0xaa",
     received: 0,
+    ...over,
   };
 }
 

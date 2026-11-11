@@ -42,9 +42,10 @@ const errorText = (e: unknown): string => {
 };
 
 export class SubgraphClient {
-  readonly url: string;
-  private readonly apiKey: string | null;
-  private readonly headers: Record<string, string>;
+  // The URL, the key and the headers are private fields, which printing or serializing the client never shows.
+  readonly #url: string;
+  readonly #apiKey: string | null;
+  readonly #headers: Record<string, string>;
   private readonly timeoutMs: number;
   private readonly fetchFn: typeof fetch;
   private readonly maxResponseBytes: number;
@@ -52,13 +53,18 @@ export class SubgraphClient {
 
   /** `apiKey`, when given, is sent as `Authorization: Bearer <key>`. */
   constructor(url: string, apiKey?: string | null, opts: SubgraphOptions = {}) {
-    this.url = url;
-    this.apiKey = apiKey || null;
-    this.headers = { "content-type": "application/json", ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}) };
+    this.#url = url;
+    this.#apiKey = apiKey || null;
+    this.#headers = { "content-type": "application/json", ...(this.#apiKey ? { authorization: `Bearer ${this.#apiKey}` } : {}) };
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.fetchFn = opts.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.maxResponseBytes = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
     this.maxPages = opts.maxPages ?? SUBGRAPH_MAX_PAGES;
+  }
+
+  /** The endpoint's URL as given. It may hold a key: print it through `redactUrl`. */
+  get url(): string {
+    return this.#url;
   }
 
   /** Nothing to release (fetch keeps no client); kept so callers can close every client alike. */
@@ -66,8 +72,8 @@ export class SubgraphClient {
 
   /** Text fit for an error message: the URL redacted, the key masked. */
   private scrub(s: string): string {
-    let out = s.split(this.url).join(redactUrl(this.url));
-    if (this.apiKey) out = out.split(this.apiKey).join("***");
+    let out = s.split(this.#url).join(redactUrl(this.#url));
+    if (this.#apiKey) out = out.split(this.#apiKey).join("***");
     return out;
   }
 
@@ -75,9 +81,9 @@ export class SubgraphClient {
   async query<T = Record<string, unknown>>(q: string, variables: Record<string, unknown> = {}): Promise<T> {
     let r: Response;
     try {
-      r = await this.fetchFn(this.url, {
+      r = await this.fetchFn(this.#url, {
         method: "POST",
-        headers: this.headers,
+        headers: this.#headers,
         body: JSON.stringify({ query: q, variables }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });

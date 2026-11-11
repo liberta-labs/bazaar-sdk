@@ -30,7 +30,7 @@ const entry = (ts: number, costUsd: number, kind = "profit", job = "liquidation"
   new Entry({ ts, job, market: "ETH/USD", wallet: ME, tx: "0x", status: "confirmed", kind, costUsd, rewardUsd });
 
 describe("ledger", () => {
-  it("appends one Python-format line per entry and reads it back", () => {
+  it("appends one snake_case JSON line per entry and reads it back", () => {
     const path = join(dir, "state", "ledger.jsonl");
     const l = new Ledger(path);
     l.record(new Entry({ ...entry(1_731_000_000.25, 0.0123, "unpaid", "terminalSettlement"), gasUsed: 123_456n, extra: { big: 2n ** 70n } }));
@@ -48,7 +48,7 @@ describe("ledger", () => {
     expect(again.entries[0]!.lossUsd).toBeCloseTo(0.0123);
   });
 
-  it("reads the Python keeper's lines, skips broken ones, and never continues a cut-off line", () => {
+  it("reads snake_case lines, skips broken ones, and never continues a cut-off line", () => {
     const path = join(dir, "ledger.jsonl");
     const now = Date.now() / 1000;
     writeFileSync(
@@ -324,6 +324,47 @@ describe("executor", () => {
     expect(chain.calls.filter((c) => c === "nonce")).toHaveLength(1);
   });
 
+  it("does not sign a call whose price aged past the pair's window less prices.sendMarginSeconds", async () => {
+    const { chain, ledger, lane, ex, events, job } = setup();
+    // The chain's time is 1000.5; sendMarginSeconds is 1 by default, so a call may carry a 2 s old price.
+    ex.clock = () => 1000.5;
+    const r = await ex.run(action({ priceTime: 998 }), { jobCfg: job });
+    expect(r.status).toBe("skipped");
+    expect(r.priceAged).toBe(true);
+    expect(r.sent).toBe(false);
+    expect(r.reason).toBe(
+      "not sent: the price it relies on is from second 998, 2.5 s before the chain's time now, past the 2 s a call may carry " +
+        "(the pair's 3 s window less prices.sendMarginSeconds); planned again with a newer price",
+    );
+    // Judged after the simulation and the balance check, before the nonce is read or anything signed.
+    expect(chain.calls).toContain("probe");
+    expect(chain.calls).not.toContain("nonce");
+    expect(chain.sent).toHaveLength(0);
+    expect(lane.nonce).toBeNull();
+    expect(ledger.entries).toHaveLength(0);
+    expect(ledger.reserved).toBe(0);
+    expect(events.filter(([k]) => k === "sent")).toEqual([]);
+
+    // A price inside the limit, at its edge, or none to judge (the stored price on a closed market): sent.
+    for (const priceTime of [999, null]) {
+      const ok = await ex.run(action({ priceTime }), { jobCfg: job });
+      expect(ok.status, String(priceTime)).toBe("confirmed");
+      expect(ok.priceAged).toBe(false);
+    }
+    ex.clock = () => 1000;
+    expect((await ex.run(action({ priceTime: 998 }), { jobCfg: job })).status).toBe("confirmed");
+    expect(chain.sent).toHaveLength(3);
+  });
+
+  it("judges the price's age with the margin configured", async () => {
+    const { chain, ex, job } = setup({ prices: { endpoint: "http://p", sendMarginSeconds: 2.5 } });
+    ex.clock = () => 1000.6;
+    const r = await ex.run(action({ priceTime: 1000 }), { jobCfg: job });
+    expect(r.priceAged).toBe(true);
+    expect(r.reason).toContain("0.6 s before the chain's time now, past the 0.5 s a call may carry");
+    expect(chain.sent).toHaveLength(0);
+  });
+
   it("stops at a revert, a dry run, a watch-only lane and a fee ceiling", async () => {
     const { chain, ex, job } = setup();
     chain.probeResult = { ...chain.probeResult, ok: false };
@@ -396,12 +437,12 @@ describe("executor", () => {
   });
 });
 
-// ---- the security audit's findings (K1, K3, K4, K6, K7) ----
+// ---- budgets, sends and fee ceilings against hostile inputs ----
 
 const sweep = (i: number) =>
   new Action({ job: "sweepExpired", market: null, target: TARGET, data: "0x01", summary: "sweep", paid: false, locks: [`sweep:${i}`] });
 
-describe("budgets hold under concurrency (K4)", () => {
+describe("budgets hold under concurrency", () => {
   it("concurrent unpaid calls stay within the job's daily loss budget", async () => {
     // each call: 200k gas × 0.1 gwei × $2000 = $0.04 of loss; a $0.05 budget lets one through
     const { chain, ledger, ex, cfg } = setup({ jobs: { sweepExpired: { lossBudgetUsdPerDay: 0.05, maxLossUsdPerCall: 0.05 } } });
@@ -444,7 +485,7 @@ describe("budgets hold under concurrency (K4)", () => {
   });
 });
 
-describe("costs cannot be made to look free (K1)", () => {
+describe("costs cannot be made to look free", () => {
   it("prices gas at no less than gas.ethUsdFloor, so a $0.0001 ETH/USD print does not zero the budgets", async () => {
     const { chain, ledger, ex, cfg } = setup({
       budget: { maxSpendUsdPerDay: 0.06, maxLossUsdPerDay: 0.06 },
@@ -484,7 +525,7 @@ describe("costs cannot be made to look free (K1)", () => {
     expect(rs[3]!.reason).toBe("daily ETH spend cap reached (0.000045 of 0.00006 ETH spent; budget.maxSpendEthPerDay)");
   });
 
-  it("keeps each entry's wei under extra.cost_wei, which the Python keeper's reader accepts, across restarts", () => {
+  it("keeps each entry's wei under extra.cost_wei across restarts", () => {
     const path = join(dir, "ledger.jsonl");
     const now = Date.now() / 1000;
     const l = new Ledger(path);
@@ -512,7 +553,7 @@ describe("costs cannot be made to look free (K1)", () => {
   });
 });
 
-describe("a send is never signed twice blindly (K3)", () => {
+describe("a send is never signed twice blindly", () => {
   // Chain.sendRaw's contract: SendError (with the hash) when the outcome is unknown, RpcError when
   // the node refused, TypeError when the bytes could not be sent at all.
   const unanswered = (raw: Hex) => new SendError(`the transaction ${keccak256(raw)} was submitted but no answer settled it`, keccak256(raw));
@@ -636,7 +677,7 @@ describe("a send is never signed twice blindly (K3)", () => {
   });
 });
 
-describe("force keeps the safety rails (K6) and the ceiling caps the fee (K7)", () => {
+describe("force keeps the safety rails and the ceiling caps the fee", () => {
   it("force keeps the daily spend caps, the low-balance halt and the fee ceilings", async () => {
     const s = setup({ budget: { maxSpendUsdPerDay: 0.01 } });
     let r = await s.ex.run(action(), { jobCfg: s.job, force: true });

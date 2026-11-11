@@ -2,7 +2,8 @@
  * End-to-end: the frontend SDK on the replayed ETH/USD scenario.
  *
  * The SDK connects with `connect()` over a JsonRpc transport, takes prices from the keeper's mock
- * Hermes server through `hermesPriceSource`, and signs and sends through small test EIP-1193
+ * Pyth Pro server through `proPriceSource` (with the signer check `connect()` installs: the local
+ * verifier trusts the server's test key), and signs and sends through small test EIP-1193
  * wallets: a viem local account answering eth_accounts, eth_chainId, eth_signTypedData_v4 and
  * eth_sendTransaction (signed here, sent raw), and forwarding everything else to Anvil. Every write is
  * simulated first (`simulate`), then sent and checked on chain.
@@ -13,11 +14,10 @@
  * The cases share one chain and run in order: each builds on the state the last left. Clock warps
  * (13 days for the insurance exit, 48 hours for a listing) come late, and the termination last: a
  * UMA claim and an insurer vote that schedules the market, the claim settled on the mock oracle,
- * the settlement price fixed from the mock's archived prints after the cutoff, and finalize after
+ * the settlement price fixed from the mock's archived one-second updates after the cutoff, and finalize after
  * the 14-day escape hatch (no keeper settles positions here).
  *
- * markets.ts, account.ts, live.ts and prices.ts are imported from their sources: the SDK index does
- * not export them yet.
+ * markets.ts, account.ts, live.ts and prices.ts are imported from their source files.
  *
  *     anvil --port 8546 --block-time 1 --base-fee 10000000 --code-size-limit 100000
  *     npx vitest run -c vitest.e2e.config.ts packages/keeper/test/e2e/frontend.e2e.test.ts
@@ -42,6 +42,7 @@ import {
   allowance,
   bazaarPairAbi,
   connect,
+  feedIdHex,
   governance,
   insurance,
   listings,
@@ -57,18 +58,18 @@ import {
   waitForReceipt,
 } from "@liberta-labs/bazaar-sdk";
 import type { CostedCall } from "../../../sdk/src/client/uma.js";
-import { hermesPriceSource } from "../../../sdk/src/client/prices.js";
+import { proPriceSource } from "../../../sdk/src/client/prices.js";
 import * as markets from "../../../sdk/src/client/markets.js";
 import * as account from "../../../sdk/src/client/account.js";
 import * as live from "../../../sdk/src/client/live.js";
-import { MockHermes, startMockHermes } from "../../src/index.js";
-import type { MockHermesServer } from "../../src/devtools/mock-hermes.js";
+import { MockPro, type MockProServer, startMockPro, streamSocket } from "../../src/index.js";
 import { Anvil, E18, FACTORY, FEED, LENS, MOCKS, PAIR, Scenario, clientVersion, deploy, keys } from "./chain.js";
 
 const RPC = process.env.BAZAAR_E2E_RPC ?? "http://127.0.0.1:8546";
-const BROADCAST = fileURLToPath(new URL("./fixtures/run-latest.json", import.meta.url));
+const BROADCAST = fileURLToPath(new URL("./fixtures/deployment.json", import.meta.url));
 const ARBSYS_ARTIFACT = fileURLToPath(new URL("./fixtures/MockArbSys.json", import.meta.url));
-const BTC_FEED: Hex = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+/** BTC/USD: Pyth Pro feed 1. */
+const BTC_FEED: Hex = feedIdHex(1);
 const USDC = 10n ** 6n;
 
 const version = await clientVersion(RPC);
@@ -164,7 +165,7 @@ describe.skipIf(!anvilUp)(`frontend SDK end to end on ${version}`, () => {
   const rpc = new JsonRpc(RPC, { perSecond: 1_000, timeoutMs: 60_000 });
   let snap: Hex | null = null;
   let sc: Scenario;
-  let srv: MockHermesServer | null = null;
+  let srv: MockProServer | null = null;
   let ctx: BazaarContext;
   let pair: Address;
   const k = keys();
@@ -215,8 +216,11 @@ describe.skipIf(!anvilUp)(`frontend SDK end to end on ${version}`, () => {
     for (const who of [user.address, relayer.address]) {
       await anvil.send(sc.w[0]!, sc.usdc, MOCKS.encode("mint", who, 2_000_000n * USDC));
     }
-    srv = await startMockHermes(new MockHermes(RPC, sc.pyth, { [FEED]: 2000.0 }, { [FEED]: "Crypto.ETH/USD" }), { port: 0 });
-    ctx = await connect({ transport: rpc, factory: names.BazaarFactory!, prices: hermesPriceSource(srv.url), chainId: 31337 });
+    // Updates stamped with the chain's time; BTC/USD is served (and in the registry) for the listing below.
+    const mock = new MockPro({ rpc: RPC, prices: { [FEED]: 2000.0, [BTC_FEED]: 60_000 }, symbols: { [FEED]: "Crypto.ETH/USD", [BTC_FEED]: "Crypto.BTC/USD" } });
+    srv = await startMockPro(mock, { port: 0 });
+    const prices = proPriceSource({ restUrl: srv.url, symbolsUrl: srv.url, streamUrls: [srv.streamUrl], WebSocket: streamSocket });
+    ctx = await connect({ transport: rpc, factory: names.BazaarFactory!, prices, chainId: 31337 });
   });
 
   afterAll(async () => {
@@ -566,13 +570,7 @@ describe.skipIf(!anvilUp)(`frontend SDK end to end on ${version}`, () => {
   // ---- listings and governance ----
 
   it("listings: propose a second market (BTC/USD) and settle it after the liveness", async () => {
-    const [, t] = await anvil.latest();
-    const p = 60_000n * 10n ** 8n;
-    const blob = MOCKS.decode<Hex>(
-      "createPriceFeedUpdateData",
-      await anvil.call(sc.pyth, MOCKS.encode("createPriceFeedUpdateData", BTC_FEED, p, p / 10_000n, -8, p, p / 10_000n, BigInt(t), BigInt(t - 1))),
-    );
-    await anvil.send(sc.w[0]!, sc.pyth, MOCKS.encode("updatePriceFeeds", [blob]));
+    // The feed is checked against the price source's symbols registry, which lists it.
     const call = await listings.proposePairDeployment(ctx, {
       baseFeedId: BTC_FEED,
       isContinuouslyTraded: true,
@@ -584,8 +582,13 @@ describe.skipIf(!anvilUp)(`frontend SDK end to end on ${version}`, () => {
     const ids2 = listings.listingFromReceipt(ctx, r);
     expect(ids2).not.toBeNull();
     expect((await listings.deploymentProposal(ctx, ids2!.assertionId))?.resolved).toBe(false);
+    // No subgraph here: the open listings come from the factory's logs.
+    const open = await listings.openListings(ctx, { fromBlock: 0 });
+    expect(open.source).toBe("logs");
+    expect(open.listings.map((l) => [l.assertionId, l.status])).toEqual([[ids2!.assertionId, "inReview"]]);
     await anvil.warp(48 * 3600 + 1);
     await runCosted(user, await listings.settleDeploymentProposal(ctx, { assertionId: ids2!.assertionId, from: user.address }), "settleDeploymentProposal");
+    expect((await listings.openListings(ctx, { fromBlock: 0 })).listings).toEqual([]);
     const pairs = await read<Address[]>(ctx.factory, FACTORY, "getAllPairs");
     expect(pairs).toHaveLength(2);
     expect(await read<Address>(ctx.factory, FACTORY, "getPairAddress", ids2!.pairId)).not.toBe("0x0000000000000000000000000000000000000000");
@@ -650,14 +653,16 @@ describe.skipIf(!anvilUp)(`frontend SDK end to end on ${version}`, () => {
     console.log(`   after the claim: phase ${st.phase}, cutoff ${st.scheduledTerminationTs}, accepted ${st.acceptedTerminationAssertionId}, UMA cap ${st.umaCutoffCap}`);
     expect(st.acceptedTerminationAssertionId).toBe(claim);
   });
-  it("termination: past the cutoff, terminateScheduledPair fixes the settlement price from archived prints", async () => {
+  it("termination: past the cutoff, terminateScheduledPair fixes the settlement price from archived one-second updates", async () => {
     const st0 = await termination.terminationStatus(ctx, pair);
     const [, now] = await anvil.latest();
     // Past the cutoff and the five chained samples (600 s apart) the chain rule reads.
     await anvil.warp(st0.scheduledTerminationTs! - now + 6 * 600);
     const plan = await termination.terminateScheduledPair(ctx, { pair, from: user.address });
-    console.log(`   settlement plan: under ${plan.under}, ${plan.prints.length} prints, reason ${plan.reason}`);
+    console.log(`   settlement plan: under ${plan.under}, ${plan.updates.length} updates, reason ${plan.reason}`);
     expect(plan.call, plan.reason ?? "").not.toBeNull();
+    // A bare insurer vote: the chain rule, five samples of a feed that prices every second, one update each.
+    expect([plan.under, plan.updates.length, plan.settlementPrice]).toEqual(["chain", 5, 2000n * E18]);
     await runCosted(user, plan.call!, "terminateScheduledPair");
     const st = await termination.terminationStatus(ctx, pair);
     expect([st.phase, st.settlementPrice]).toEqual(["settling", 2000n * E18]);

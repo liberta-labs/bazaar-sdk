@@ -4,6 +4,9 @@
  * {@link KEEPER_HINTS} are written for someone running the keeper. Frontends show
  * `DecodedError.message`, which prefers the user-facing text in `errors/messages.ts` and falls back
  * to the hint, then to the error's name.
+ *
+ * Pyth's verifier reverts with plain reason strings rather than custom errors;
+ * {@link VERIFIER_REASON_HINTS} explains those the same way.
  */
 
 import { type Hex, decodeAbiParameters } from "viem";
@@ -20,7 +23,7 @@ export const KEEPER_HINTS: Readonly<Record<string, string>> = {
   "BazaarPair__LiquidationPriceTooOld":
     "The market is closed and its last stored price is more than 10 minutes old, so it cannot be used to seize collateral. Liquidation resumes when the market reopens and a fresh print exists.",
   "BazaarPair__NoPriceUpdatesProvided":
-    "No fresh price was available: Pyth's on-chain cache was stale and the call carried no update. Check the price endpoint.",
+    "No fresh price was available: the call carried no update and the pair's own stored price is more than 3 seconds old. Check the price endpoint.",
   "BazaarPair__InsufficientPythFee":
     "The call did not send enough ETH for the Pyth update fee.",
   "BazaarPair__TradingHalted":
@@ -50,9 +53,27 @@ export const KEEPER_HINTS: Readonly<Record<string, string>> = {
   "BazaarOracle__ConfidenceTooHigh":
     "Pyth's confidence interval for this print is wider than 2% of the price, so the pair refuses it. Wait for a tighter print.",
   "BazaarOracle__InvalidPrice":
-    "Pyth reported a non-positive price for this feed.",
+    "Pyth reported a non-positive price for this feed, or none at all.",
+  "BazaarOracle__InvalidFeedId":
+    "The feed id is neither a raw Pyth Pro feed id nor a registered composite.",
+  "BazaarOracle__FeeMismatch":
+    "The oracle was sent an amount other than Pyth's verification fee for the updates it was given: the fee is per update, and must be exact.",
+  "BazaarOracle__FeedNotInUpdate":
+    "No update the call carried holds this feed. Under UMA's rule this is also what a settlement call without the cutoff's update reverts with until the grace ends.",
+  "BazaarOracle__IncompleteFeed":
+    "An update carries the feed without a property the call needs: a live price needs its price, exponent, a non-zero confidence and a feed update timestamp. Check the properties the price client requests.",
+  "BazaarOracle__StalePrice":
+    "The update's price was generated more than 3 seconds from the block's time: the update is old, the market is closed and its last price is being carried forward, or this machine's or the chain's clock is off.",
+  "BazaarOracle__WrongTick":
+    "A settlement update is not from Pyth's one-second channel or is not stamped on the second required.",
   "BazaarOracle__SampleCountMismatch":
-    "The settlement prints do not hold one update per leg for each of the five chain-rule samples.",
+    "The settlement updates ran out before five chain-rule samples were proven, or hold updates beyond them.",
+  "BazaarOracle__SampleNotProven":
+    "An update does not prove a chain-rule sample for its target: it is stamped before the target, or after it without the quiet update of the second before. Rebuild the set, deriving each target from the sample before.",
+  "BazaarOracle__SampleTooLate":
+    "A chain-rule sample is stamped after the latest second allowed (the UMA cutoff that caps the chain): no chain exists under that bound.",
+  "LazerPayloadLib__Malformed":
+    "An update's signed payload cannot be parsed.",
   "BazaarPairTerminator__TerminationTimeNotReached":
     "The market's scheduled cutoff has not passed yet.",
   "BazaarPairTerminator__NoScheduledTermination":
@@ -60,7 +81,7 @@ export const KEEPER_HINTS: Readonly<Record<string, string>> = {
   "BazaarPairTerminator__AlreadyTerminated":
     "The market's settlement price is already fixed.",
   "BazaarPairTerminator__OracleNotStaleEnough":
-    "The oracle has printed within the last 21 days.",
+    "The pair stored a price within the last 21 days.",
   "BazaarPairTerminator__InsurerScheduleSettlesPair":
     "A vote-set cutoff has passed, so this market settles through terminateScheduledPair.",
   "BazaarPairTerminator__InsurerVerdictPending":
@@ -71,6 +92,8 @@ export const KEEPER_HINTS: Readonly<Record<string, string>> = {
     "That insurer proposal does not exist or is already resolved.",
   "BazaarPairTerminator__InsufficientPythFee":
     "The call did not send enough ETH for the Pyth fee.",
+  "Factory__InvalidFeedId":
+    "The listing's feed id is neither a raw Pyth Pro feed id nor a registered composite.",
   "Factory__DeploymentNotExpired":
     "The listing proposal cannot be released yet.",
   "Factory__IdentifierUpgradeNotExpired":
@@ -87,13 +110,38 @@ export const KEEPER_HINTS: Readonly<Record<string, string>> = {
     "No proposal has that assertion id.",
 };
 
+/**
+ * What each reason string Pyth's verifier reverts with means for a keeper. Its contract checks an
+ * update's envelope, signature, signer and fee, and reverts with these strings, which reach a caller
+ * through BazaarOracle unchanged.
+ */
+export const VERIFIER_REASON_HINTS: Readonly<Record<string, string>> = {
+  "invalid signer":
+    "Pyth's verifier does not trust the address that signed an update: Pyth has retired that signer, or the update is not Pyth's. An archived update it signed can never verify again; a settlement that needs one reaches the stored price once its last resort opens.",
+  "invalid signature":
+    "An update's signature recovers to no address: the update is corrupted.",
+  "Insufficient fee provided":
+    "Pyth's verifier was sent less than its verification fee for an update.",
+  "input too short":
+    "An update is shorter than its envelope says: it is truncated.",
+  "invalid evm magic":
+    "An update is not in Pyth Pro's EVM format: the price client must request the evm format.",
+};
+
 const TIME_ARGS = new Set(["deadline", "effectiveTs", "expiryTs", "opensAt", "scheduledTs"]);
 
 /** User-facing messages, registered by errors/messages.ts so this module stays small for the keeper. */
 const userMessages = new Map<string, (args: Record<string, unknown>) => string>();
+/** User-facing messages for plain revert reasons, by the reason string. */
+const reasonMessages = new Map<string, string>();
 
 export function registerUserMessages(m: Readonly<Record<string, string | ((args: Record<string, unknown>) => string)>>): void {
   for (const [k, v] of Object.entries(m)) userMessages.set(k, typeof v === "string" ? () => v : v);
+}
+
+/** Register user-facing messages for plain revert reasons (`Error(string)`), by the reason string. */
+export function registerReasonMessages(m: Readonly<Record<string, string>>): void {
+  for (const [k, v] of Object.entries(m)) reasonMessages.set(k, v);
 }
 
 export class DecodedError {
@@ -113,8 +161,15 @@ export class DecodedError {
     return null;
   }
 
-  /** The text to show an end user: a user message when one is registered, else the hint, else the name. */
+  /**
+   * The text to show an end user: a user message when one is registered (for a plain revert reason,
+   * by its string), else the hint, else the name.
+   */
   get message(): string {
+    if (this.name === "Error" && typeof this.args.message === "string") {
+      const r = reasonMessages.get(this.args.message);
+      if (r) return r;
+    }
     const m = userMessages.get(this.name);
     if (m) return m(this.args);
     return this.hint || this.name;
@@ -143,7 +198,8 @@ export function decodeError(data: Hex | null | undefined): DecodedError {
     } catch {
       msg = body;
     }
-    return new DecodedError("Error", { message: msg }, msg, d);
+    // Looked up as an own key: a reason such as "constructor" must not read Object.prototype's.
+    return new DecodedError("Error", { message: msg }, Object.hasOwn(VERIFIER_REASON_HINTS, msg) ? VERIFIER_REASON_HINTS[msg]! : msg, d);
   }
   if (sel === PANIC) {
     let code = -1n;
@@ -163,5 +219,5 @@ export function decodeError(data: Hex | null | undefined): DecodedError {
   } catch {
     args = {};
   }
-  return new DecodedError(spec.name, args, KEEPER_HINTS[spec.name] ?? "", d);
+  return new DecodedError(spec.name, args, Object.hasOwn(KEEPER_HINTS, spec.name) ? KEEPER_HINTS[spec.name]! : "", d);
 }

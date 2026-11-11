@@ -37,7 +37,7 @@ export class AdlJob extends Job<AdlJobConfig> {
       if (s.totalPnl > 0n) pnl.set(acct, { total: s.totalPnl, collateral: p.collateral, isLong: p.isLong });
     }
     if (pnl.size === 0) return [];
-    const updates = pc.updates; // before the first await: the print `price` came from
+    const updates = pc.updates; // before the first await: the update of the print `price` is from, or none for the stored price
     const deposits = await this.k.reader.windowDeposits(m.address, [...pnl.keys()]);
     const threshold = adlThreshold(st.adlAuctionStart, this.k.now());
     const scored: { score: bigint; acct: Address; isLong: boolean }[] = [];
@@ -57,12 +57,12 @@ export class AdlJob extends Job<AdlJobConfig> {
         m.address,
         PAIR.encode("executeAdl", longBucket, shortBucket, updates),
         `ADL batch: ${longBucket.length} short(s) vs the long bucket, ${shortBucket.length} long(s) vs the short bucket`,
-        { value: fee, locks: [lock], rewardPair: m.address },
+        { value: fee, priceTime: pc.priceTime, locks: [lock], rewardPair: m.address },
       ),
     ];
   }
 
   override note(action: Action, result: ActionResult): void {
-    if (!result.sent && action.market) this.cool(lockKey("adl", action.market.address));
+    if (!result.sent && !result.priceAged && action.market) this.cool(lockKey("adl", action.market.address));
   }
 }

@@ -134,7 +134,7 @@ describe("proposeUmaIdentifierUpgrade", () => {
     expect(decodeCall(erc20Codec(), "approve", c.approvals[0]!.data)).toEqual([ADDR.factory, 5_000n * USDC]);
   });
 
-  // Audit F10: the bond is quoted at build time and pulled at execution.
+  // The bond is quoted at build time and pulled at execution.
   it("refuses a bond quote below the 5,000 USDC floor, and warns when the allowance exceeds the quote", async () => {
     s.st.bond = 0n;
     await expect(proposeUmaIdentifierUpgrade(s.ctx, { newIdentifier: "ASSERT_TRUTH3", from: ADDR.alice })).rejects.toThrow(BondQuoteError);

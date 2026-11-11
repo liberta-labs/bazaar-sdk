@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { JsonRpc, redactUrl, urlCredential } from "../src/index.js";
+import { JsonRpc, redactUrl, redactUrls, urlCredential, urlSecrets } from "../src/index.js";
 
 // Made-up keys in each provider's shape.
 const ALCHEMY = "https://arb-mainnet.g.alchemy.com/v2/pz2BQ3JpUyM2t-2nXpbt3aTvP8vTtM-a";
@@ -16,8 +16,9 @@ const PLAIN = [
   "https://sepolia-rollup.arbitrum.io/rpc",
   "https://arbitrum-one-rpc.publicnode.com",
   "http://127.0.0.1:8545",
-  "https://hermes.pyth.network",
-  "https://pyth.dourolabs.app/hermes",
+  "https://pyth-lazer.dourolabs.app",
+  "wss://pyth-lazer-0.dourolabs.app/v1/stream",
+  "https://pyth.dourolabs.app/auth/token",
   "https://api.studio.thegraph.com/query/12345/bazaar-arbitrum-sepolia/v0.0.1",
   "http://localhost:8000/subgraphs/name/bazaar",
   "https://lb.drpc.org/ogrpc?network=arbitrum",
@@ -57,7 +58,7 @@ describe("credentials in URLs", () => {
   });
 });
 
-// The shapes a recognise-the-key-by-its-look rule missed (the transport audit's list): [what, URL, a
+// Key shapes a recognise-the-key-by-its-look rule would miss: [what, URL, a
 // piece of the secret that must not survive redaction].
 const MISSED: [string, string, string][] = [
   ["32 letters, no digit", "https://arb-mainnet.g.alchemy.com/v2/AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEf", "AbCdEfGh"],
@@ -103,8 +104,11 @@ const PUBLIC = [
   "https://lb.drpc.org/ogrpc?network=arbitrum&dkey=",
   "https://api.studio.thegraph.com/query/48211/bazaar-arbitrum-sepolia/version/latest",
   "https://gateway.thegraph.com/api/subgraphs/id/",
-  "https://hermes.pyth.network/v2/updates/price/latest?ids%5B%5D=0x" + "ab".repeat(32) + "&encoding=hex&parsed=true&ignore_invalid_price_ids=true",
-  "https://hermes.pyth.network/v2/price_feeds",
+  "https://pyth-lazer.dourolabs.app/v1/latest_price",
+  "https://pyth-lazer.dourolabs.app/v1/price",
+  "wss://pyth-lazer-2.dourolabs.app/v1/stream",
+  "https://pyth.dourolabs.app/v1/symbols?asset_type=crypto",
+  "https://pyth.dourolabs.app/v1/symbols?query=&asset_type=funding-rate",
   "http://[::1]:8545/",
   "http://localhost:8000/subgraphs/name/bazaar/graphql",
   "https://@rpc.example.com/rpc",
@@ -195,5 +199,23 @@ describe("redaction by structure", () => {
       const once = redactUrl(url);
       expect(redactUrl(once), url).toBe(once);
     }
+  });
+});
+
+describe("URLs inside text", () => {
+  it("redactUrls redacts every URL in a message and leaves the sentence around it", () => {
+    expect(redactUrls(`failed for ${ALCHEMY}, then (${INFURA}). Retrying ${TOKEN_PARAM}`)).toBe(
+      "failed for https://arb-mainnet.g.alchemy.com/v2/***, then (https://arbitrum-mainnet.infura.io/v3/***). Retrying wss://rpc.example.com/ws?token=***",
+    );
+    expect(redactUrls(`a "${USERINFO}/rpc" b`)).toBe('a "https://***@rpc.example.com/rpc" b');
+    expect(redactUrls("no URL here, nor in http-like words")).toBe("no URL here, nor in http-like words");
+  });
+
+  it("urlSecrets lists what redactUrl masks, so each part can be masked where it appears alone", () => {
+    expect(urlSecrets(USERINFO)).toEqual(["keeper:hunter2", "hunter2"]); // the password, not the user name on its own
+    expect(urlSecrets(ALCHEMY)).toEqual(["pz2BQ3JpUyM2t-2nXpbt3aTvP8vTtM-a"]);
+    expect(urlSecrets(TOKEN_PARAM)).toEqual(["abc"]);
+    expect(urlSecrets("https://pyth-lazer.dourolabs.app")).toEqual([]);
+    expect(urlSecrets("not a URL")).toEqual([]);
   });
 });

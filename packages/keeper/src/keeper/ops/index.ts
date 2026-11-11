@@ -6,6 +6,8 @@ export {
   type ManualOptions,
   type OpOptions,
   Operations,
+  type ScheduledTermination,
+  type ScheduledTerminationOptions,
   type SettleOptions,
   type SweepOptions,
   type TriggerOptions,

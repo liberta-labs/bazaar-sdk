@@ -1,4 +1,4 @@
-import { type Abi, type Hex, decodeFunctionData, encodePacked, getAddress, keccak256, toBytes } from "viem";
+import { type Abi, type Hex, decodeFunctionData, getAddress, keccak256, toBytes } from "viem";
 import { describe, expect, it } from "vitest";
 import { bazaarPairAbi } from "../src/abi/index.js";
 import { ERC20_ABI, approveUsdc, usdcFunding } from "../src/client/allowance.js";
@@ -37,6 +37,7 @@ import {
   depositCollateral,
   executeTriggeredOrders,
   findPredecessor,
+  PriceUpdateError,
   pairPriceFromUpdate,
   parsePriceUpdate,
   withdrawCollateral,
@@ -44,6 +45,12 @@ import {
 import { LIMIT, MARKET, STOP_LIMIT, STOP_LOSS, TAKE_PROFIT } from "../src/constants.js";
 import { pairPrice } from "../src/formulas/index.js";
 import { FEED, INTEGRATOR, PAIR, USDC, alice, bob, bucket, fakeContext, mockUpdate, storedOrder } from "./client-writes-fake.js";
+import { type FeedSpec, fid, unsigned } from "./pro-fakes.js";
+import type { PriceUpdateSource } from "../src/client/context.js";
+import { NoFreshPriceError, priceUpdateFor, updateProblem } from "../src/client/feeds.js";
+import { NO_HINTS } from "../src/client/orders.js";
+import { errorMessage } from "../src/errors/messages.js";
+import { NoLivePriceError, ProError } from "../src/prices/pro.js";
 
 const E18 = 10n ** 18n;
 const I = INTEGRATOR;
@@ -430,32 +437,31 @@ describe("executeTriggeredOrders", () => {
 });
 
 describe("price updates", () => {
-  const msg = (feed: Hex, price: bigint, conf: bigint, expo: number, pub: number) =>
-    encodePacked(["uint8", "bytes32", "int64", "uint64", "int32", "int64", "int64", "int64", "uint64"], [0, feed, price, conf, expo, BigInt(pub), BigInt(pub - 1), price, conf]);
-  function accumulator(msgs: Hex[]): Hex {
-    const updates = msgs.map((m) => encodePacked(["uint16", "bytes", "uint8", "bytes20"], [(m.length - 2) / 2, m, 1, ("0x" + "77".repeat(20)) as Hex]));
-    return encodePacked(["bytes4", "uint8", "uint8", "uint8", "uint8", "uint16", "bytes3", "uint8", ...updates.map(() => "bytes" as const)], [
-      "0x504e4155", 1, 0, 0, 0, 3, "0xaabbcc", msgs.length, ...updates,
-    ] as never);
-  }
+  const feed2 = fid(0xcd);
 
-  it("reads accumulator and MockPyth updates", () => {
-    const feed2 = ("0x" + "cd".repeat(32)) as Hex;
-    const out = parsePriceUpdate([accumulator([msg(FEED, 123n, 4n, -5, 1000), msg(feed2, -7n, 1n, 2, 999)]), mockUpdate(FEED, 55n, 1001, 3n)]);
-    expect(out.map((m) => [m.feedId, m.price, m.conf, m.expo, m.publishTime, m.prevPublishTime])).toEqual([
-      [FEED, 123n, 4n, -5, 1000, 999],
-      [feed2, -7n, 1n, 2, 999, 998],
-      [FEED, 55n, 3n, -8, 1001, 1000],
-    ]);
-    expect(() => parsePriceUpdate(["0x1234"])).toThrow(/unrecognized/);
+  it("reads the live prices a Pyth Pro update carries, from its signed payload", () => {
+    const two = unsigned({ at: 1000, feeds: [{ id: 0xab, price: 123n, conf: 4n, expo: -5 }, { id: 0xcd, price: 7n, conf: 1n, expo: 2, generated: 999 }, { id: 0xef, price: -7n }] });
+    const out = parsePriceUpdate([two, mockUpdate(FEED, 55n, 1001, 3n)]);
+    expect(out.map((m) => [m.feedId, m.price, m.conf, m.expo, m.publishTime, m.generatedUs])).toEqual([
+      [FEED, 123n, 4n, -5, 1000, 1_000_000_000n],
+      [feed2, 7n, 1n, 2, 999, 999_000_000n],
+      [FEED, 55n, 3n, -8, 1001, 1_001_000_000n],
+    ]); // a price below zero is no live price: the oracle refuses it
+    // a feed without a usable live price is left out: no price, no confidence, a property not requested
+    const none = unsigned({ at: 1000, feeds: [{ id: 1, price: 0n }, { id: 2, conf: 0n }, { id: 3, omit: ["feedUpdateTimestamp"] }] });
+    expect(parsePriceUpdate([none])).toEqual([]);
+    expect(() => parsePriceUpdate(["0x1234"])).toThrow(PriceUpdateError);
+    expect(() => parsePriceUpdate(["0x1234"])).toThrow("malformed Pyth Pro update: shorter than an envelope");
+    expect(() => parsePriceUpdate([`${two}00` as Hex])).not.toThrow(); // bytes after the payload are outside it
+    expect(() => parsePriceUpdate([two.slice(0, -2) as Hex])).toThrow(PriceUpdateError);
   });
 
-  it("composes a composite pair's price as the oracle does, from the newest message per feed", async () => {
+  it("composes a composite pair's price as the oracle does, from each leg's most recently generated price", async () => {
     const { fake, ctx } = fakeContext();
-    const base = ("0x" + "01".repeat(32)) as Hex;
-    const quote = ("0x" + "02".repeat(32)) as Hex;
+    const [base, quote] = [fid(1), fid(2)];
     fake.oracle("composites", { baseId: base, quoteId: quote, invertQuote: true });
-    const update = [accumulator([msg(base, 300_000_000n, 30_000n, -8, 100), msg(quote, 150_000_000n, 15_000n, -8, 90)]), mockUpdate(base, 310_000_000n, 99, 0n)];
+    const both = unsigned({ at: 100, feeds: [{ id: 1, price: 300_000_000n, conf: 30_000n }, { id: 2, price: 150_000_000n, conf: 15_000n, generated: 90 }] });
+    const update = [both, mockUpdate(base, 310_000_000n, 99, 1n)]; // an older price for the base leg: not taken
     const got = await pairPriceFromUpdate(ctx, PAIR, update);
     const want = pairPrice(
       [
@@ -466,7 +472,16 @@ describe("price updates", () => {
     );
     expect(got).toEqual(want);
     expect(got!.spot).toBe(2n * E18);
+    // one update per leg composes the same price
+    expect(await pairPriceFromUpdate(ctx, PAIR, [mockUpdate(quote, 150_000_000n, 90, 15_000n), mockUpdate(base, 300_000_000n, 100, 30_000n)])).toEqual(want);
+    // a leg no update carries
     expect(await pairPriceFromUpdate(ctx, PAIR, [mockUpdate(base, 1n, 1)])).toBeNull();
+    // the oracle reads each leg from its newest entry, usable or not: a later one without a confidence refuses the call
+    const noConf = unsigned({ at: 101, feeds: [{ id: 1, price: 300_000_000n, conf: 0n }] });
+    expect(await pairPriceFromUpdate(ctx, PAIR, [both, noConf])).toBeNull();
+    const noPrice = unsigned({ at: 101, feeds: [{ id: 2, price: 0n }] });
+    expect(await pairPriceFromUpdate(ctx, PAIR, [both, noPrice])).toBeNull();
+    await expect(pairPriceFromUpdate(ctx, PAIR, ["0xdead"])).rejects.toThrow(PriceUpdateError);
   });
 });
 
@@ -586,5 +601,70 @@ describe("describeOrder", () => {
     const tp = buildOrderSpec({ orderType: TAKE_PROFIT, isLong: false, size: E18, triggerPrice: 2100n * E18, bounty: 10n ** 12n, maxSlippageBp: 50n }, I);
     expect(describeOrder(tp)).toMatch(/\$0\.000001 keeper bounty/);
     expect(describeOrder(buildOrderSpec(limit({ size: 10000005n * 10n ** 11n }), I))).toBe("Buy 1.0000005 at 2000 (limit, GTC)");
+  });
+});
+
+describe("the price update a builder attaches", () => {
+  const AT = 1_700_000_000; // the fake chain's time
+  /** The update a source answers with: the pair's feed (0xab) as `spec` says, stamped at AT. */
+  const updateWith = (spec: Omit<FeedSpec, "id"> = {}) => [unsigned({ at: AT, channel: "real_time", feeds: [{ id: 0xab, ...spec }] })];
+  const sourceOf = (spec: Omit<FeedSpec, "id"> = {}): PriceUpdateSource => ({ latest: async () => ({ update: updateWith(spec), publishTime: AT }) });
+  const CARRIED = "feed 171's price was generated 3600 s before the update carrying it: Pyth is carrying an older price forward (a closed venue, or a quiet feed)";
+  /** A context over `prices` on a market that is, or is not, continuously traded, with a flat account. */
+  function scene(prices: PriceUpdateSource, continuous: boolean) {
+    const { fake, ctx } = fakeContext({ prices });
+    fake.pair("isContinuouslyTraded", continuous);
+    fake.pair("lastPairPrice", { spotPrice: 2000n * E18, emaVarianceBp: 0n, updateTs: BigInt(AT - 600), lowPrice: 2000n * E18, highPrice: 2000n * E18 });
+    stockAccount(fake);
+    return { fake, ctx };
+  }
+
+  it("names what the oracle would refuse in an update", () => {
+    const feeds = { legs: [FEED], invertQuote: false };
+    expect(updateProblem(updateWith(), feeds)).toBeNull();
+    expect(updateProblem(updateWith({ generated: AT - 3 }), feeds)).toBeNull(); // three seconds behind its update: still accepted
+    expect(updateProblem(updateWith({ generated: AT - 3_600 }), feeds)).toBe(CARRIED);
+    expect(updateProblem(updateWith({ conf: 5_000_000_000n }), feeds)).toBe("Pyth's confidence interval is wider than the oracle's 2% cap");
+    expect(updateProblem(updateWith({ conf: 0n }), feeds)).toBe("feed 171: Pyth reports no confidence for it, and the oracle refuses a live price without one");
+    expect(updateProblem(updateWith({ price: -1n }), feeds)).toBe("feed 171: its price -1 is below zero, and the oracle refuses a price at or below zero");
+    expect(updateProblem([], feeds)).toBe("the price source returned no update");
+    expect(updateProblem(updateWith(), { legs: [FEED, fid(0xcd)], invertQuote: false })).toBe("no update carries feed 205");
+    expect(updateProblem(["0x1234"], feeds)).toMatch(/^the price source's update cannot be read \(malformed Pyth Pro update/);
+  });
+
+  it("attaches the update when the oracle would accept it", async () => {
+    const { ctx } = scene(sourceOf(), true);
+    expect(await priceUpdateFor(ctx, PAIR)).toEqual({ update: updateWith(), fee: 7n, publishTime: AT, attached: true, reason: null });
+  });
+
+  it("leaves the update out on a market that keeps trading hours when the oracle would refuse it, so the stored price serves the call", async () => {
+    const { fake, ctx } = scene(sourceOf({ generated: AT - 3_600 }), false);
+    expect(await priceUpdateFor(ctx, PAIR)).toEqual({ update: [], fee: 0n, publishTime: null, attached: false, reason: CARRIED });
+    const call = await createOrder(ctx, PAIR, alice.address, limit({ limitPrice: 1990n * E18 }), { hints: NO_HINTS });
+    expect((decodeFunctionData({ abi: pairAbi, data: call.data }).args as readonly unknown[])[2]).toEqual([]);
+    expect([call.value, call.priceTime, call.noFreshPrice]).toEqual([0n, undefined, CARRIED]);
+    expect(fake.callsTo("getUpdateFee")).toHaveLength(0);
+    // a source with no live price at all for the feed reads the same way
+    const noPrice = new NoLivePriceError("the price endpoint has no live price for feed 171: Pyth has no price for it at the update's time");
+    const none = scene({ latest: () => Promise.reject(noPrice) }, false);
+    expect(await priceUpdateFor(none.ctx, PAIR)).toMatchObject({ attached: false, reason: noPrice.message });
+    // a source that cannot be asked still fails the build
+    const down = scene({ latest: () => Promise.reject(new ProError("price endpoint unreachable: timeout")) }, false);
+    await expect(priceUpdateFor(down.ctx, PAIR)).rejects.toThrow("price endpoint unreachable: timeout");
+  });
+
+  it("refuses on a continuously traded market, which has no stale fallback, unless the call reads no price", async () => {
+    const { fake, ctx } = scene(sourceOf({ generated: AT - 3_600 }), true);
+    const e = await createOrder(ctx, PAIR, alice.address, limit({ limitPrice: 1990n * E18 }), { hints: NO_HINTS }).catch((x) => x);
+    expect(e).toBeInstanceOf(NoFreshPriceError);
+    expect((e as NoFreshPriceError).reason).toBe(CARRIED);
+    expect(errorMessage(e)).toBe("No fresh price is available for this market right now, and this action needs one. Try again in a moment.");
+    // a flat account's withdrawal reads no price, so it goes without one
+    const w = await withdrawCollateral(ctx, PAIR, alice.address, 3n * E18);
+    expect((decodeFunctionData({ abi: pairAbi, data: w.data }).args as readonly unknown[])[1]).toEqual([]);
+    expect([w.value, w.noFreshPrice]).toEqual([0n, CARRIED]);
+    // one with a position reads a price: refused here rather than on chain
+    stockAccount(fake, bucket({ size: E18 }));
+    await expect(withdrawCollateral(ctx, PAIR, alice.address, 3n * E18)).rejects.toBeInstanceOf(NoFreshPriceError);
   });
 });

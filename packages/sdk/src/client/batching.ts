@@ -58,9 +58,9 @@ const PRICE_STORING = new Set(["createOrder", "amendOrders", "executeTriggeredOr
  * Carry the Pyth update once per pair: the first call that always stores a price (createOrder,
  * amendOrders, executeTriggeredOrders, refreshPrice) keeps its update and fee; later calls in the
  * batch to the same pair are re-encoded with an empty `priceUpdate` and no ETH, since they find the
- * price that call stored (the pair reads the on-chain price first and parses an update only when it
- * is more than 3 s old). Calls to other contracts are left as they are. The batch must run in one
- * transaction, in this order.
+ * price that call stored (a call without an update resolves against the pair's own stored price
+ * while it is at most 3 s old, and Pyth's fee is charged per update verified). Calls to other
+ * contracts are left as they are. The batch must run in one transaction, in this order.
  */
 export function shareOnePriceUpdate(calls: readonly PreparedCall[]): PreparedCall[] {
   const pc = pairCodec();

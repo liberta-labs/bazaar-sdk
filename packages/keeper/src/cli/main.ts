@@ -4,11 +4,11 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { inventorySize, marketStatus } from "@liberta-labs/bazaar-sdk";
+import { inventorySize, isRawFeedId, listings, marketStatus, proFeedId, type termination } from "@liberta-labs/bazaar-sdk";
 import { Argument, Command, CommanderError, InvalidArgumentError, Option } from "commander";
 import { type Address, type Hex, getAddress, isAddress } from "viem";
 import { ConfigError, DEFAULT_CONFIG, JOB_NAMES, type JobName, expandHome, loadConfig } from "../config/index.js";
-import type { ActionResult } from "../exec/executor.js";
+import { ActionResult } from "../exec/executor.js";
 import { Ledger, type SummaryRow } from "../exec/ledger.js";
 import { KEYS_DIR, LocalSigner, WalletError, newKey, writeKeystore } from "../exec/wallets.js";
 import type * as Engine from "../keeper/engine.js";
@@ -81,6 +81,10 @@ export interface RunArgs extends ConfigArgs {
   dryRun: boolean;
   force: boolean;
   yes: boolean;
+  /** terminate-scheduled: when the settlement at the market's stored price may be planned (the SDK's storedPrice) */
+  storedPrice?: termination.StoredPricePolicy;
+  /** terminate-scheduled: send a settlement at the market's stored price */
+  acceptStoredPrice?: boolean;
 }
 export interface WalletArgs extends ConfigArgs {
   action: "new" | "import" | "list";
@@ -89,11 +93,12 @@ export interface WalletArgs extends ConfigArgs {
 }
 export interface MockPricesArgs {
   rpc: string;
-  pyth: string;
-  /** USD by feed id (lowercase, no 0x) */
+  /** USD by Pyth Pro feed number */
   price: Record<string, number>;
   host: string;
   port: number;
+  /** the environment variable that holds the token every client must present */
+  tokenEnv?: string;
 }
 
 /** A command's body: resolves to its exit code (nothing = 0), or throws CliExit / ConfigError / WalletError. */
@@ -176,12 +181,20 @@ function parsePort(v: string): number {
   return n;
 }
 
+/** `FEED_ID=USD`, the feed as its Pyth Pro number or the bytes32 that holds it: added to `prev` under the number. */
 function collectPrice(v: string, prev: Record<string, number>): Record<string, number> {
+  const usage = "expected FEED_ID=USD with a Pyth Pro feed id (a number, or the bytes32 a pair reports), e.g. 2=3000 for ETH/USD";
   const i = v.indexOf("=");
-  const feed = i > 0 ? v.slice(0, i).trim().toLowerCase().replace(/^0x/, "") : "";
-  const price = i > 0 ? Number(v.slice(i + 1)) : NaN;
-  if (!feed || !Number.isFinite(price)) throw new InvalidArgumentError("expected FEED_ID=USD, e.g. 0xff61…0ace=3000");
-  return { ...prev, [feed]: price };
+  const price = i > 0 && v.slice(i + 1).trim() !== "" ? Number(v.slice(i + 1)) : NaN;
+  if (i <= 0 || !Number.isFinite(price) || price < 0) throw new InvalidArgumentError(usage);
+  let id: Hex;
+  try {
+    id = listings.asFeedId("feed", v.slice(0, i).trim());
+  } catch {
+    throw new InvalidArgumentError(usage);
+  }
+  if (!isRawFeedId(id)) throw new InvalidArgumentError(usage); // a composite id: its legs are what is priced
+  return { ...prev, [String(proFeedId(id))]: price };
 }
 
 // ---- run: the operations ----
@@ -224,7 +237,7 @@ export const OPERATIONS: Readonly<Record<Operation, string>> = {
   "sweep-expired": "unlink expired orders and return stranded bounties (--orders names them)",
   finalize: "finalize a terminated market once its positions are settled",
   "terminate-stale": "end a market whose stored price is more than 21 days old",
-  "terminate-scheduled": "end a market at its scheduled cutoff, with the settlement prints its rule asks for",
+  "terminate-scheduled": "end a market at its scheduled cutoff, with the settlement updates its rule asks for (irreversible)",
   "settle-termination": "settle a UMA termination claim (--assertion)",
   "execute-insurer-termination": "resolve an insurer vote on a market (--proposal)",
   "settle-listing": "settle a listing proposal (--assertion)",
@@ -293,7 +306,8 @@ const AUTO_OPS: Readonly<Record<AutoOperation, (ops: Operations, a: RunArgs) => 
 const MANUAL_OPS: Readonly<Record<ManualOperation, (ops: Operations, a: RunArgs, dryRun: boolean) => Promise<ActionResult>>> = {
   finalize: (ops, a, dryRun) => ops.finalizeTermination(a.market!, { dryRun }),
   "terminate-stale": (ops, a, dryRun) => ops.terminateStalePair(a.market!, { dryRun }),
-  "terminate-scheduled": (ops, a, dryRun) => ops.terminateScheduledPair(a.market!, { dryRun }),
+  "terminate-scheduled": (ops, a, dryRun) =>
+    ops.terminateScheduledPair(a.market!, { dryRun, storedPrice: a.storedPrice, acceptStoredPrice: a.acceptStoredPrice === true }),
   "settle-termination": (ops, a, dryRun) => ops.settleTerminationProposal(a.assertion!, { dryRun }),
   "execute-insurer-termination": (ops, a, dryRun) => ops.executeInsurerTermination(a.market!, a.proposal!, { dryRun }),
   "settle-listing": (ops, a, dryRun) => ops.factory.settleDeploymentProposal(a.assertion!, { dryRun }),
@@ -329,7 +343,7 @@ export function renderResult(r: ActionResult, out: Output): void {
   if (opens) out.out(`   opens at ${utcTime(opens)}`);
 }
 
-/** status.json as the engine writes it (the Python keeper's shape). */
+/** status.json as the engine writes it. */
 export interface StatusFile {
   /** seconds since the epoch */
   updated: number;
@@ -519,6 +533,10 @@ async function cmdRun(a: RunArgs, d: CliDeps): Promise<void> {
       for (const r of await AUTO_OPS[op](k.run, a)) renderResult(r, d.out);
       return;
     }
+    if (op === "terminate-scheduled") {
+      await runScheduledTermination(k, a, d);
+      return;
+    }
     const manual = MANUAL_OPS[op];
     const preview = await manual(k.run, a, true);
     if (a.dryRun || preview.status !== "simulated" || !preview.wouldSend) {
@@ -543,6 +561,46 @@ async function cmdRun(a: RunArgs, d: CliDeps): Promise<void> {
   } finally {
     await k.close();
   }
+}
+
+/**
+ * `run terminate-scheduled`: show the plan, then send exactly the call shown. The send plans again
+ * and stops when the settlement changed meanwhile (another rule, price or set of updates), so the
+ * operator's yes never applies to another settlement. A settlement at the market's stored price is
+ * sent only with --accept-stored-price, even with --yes.
+ */
+async function runScheduledTermination(k: Keeper, a: RunArgs, d: CliDeps): Promise<void> {
+  const planned = await k.run.planScheduledTermination(a.market!, { storedPrice: a.storedPrice });
+  if (planned instanceof ActionResult) {
+    renderResult(planned, d.out);
+    return;
+  }
+  const preview = await k.run.sendScheduledTermination(planned, { dryRun: true });
+  renderResult(preview, d.out);
+  const stored = planned.plan.under === "storedPrice";
+  if (a.dryRun || preview.status !== "simulated" || !preview.wouldSend) return;
+  if (stored && !a.acceptStoredPrice) {
+    d.out.out("Not sent: this settles the market at its stored price, which no Pyth update proves. Pass --accept-stored-price to send it.");
+    return;
+  }
+  if (!a.yes) {
+    if (!d.isTTY) {
+      d.out.out("Not sent: pass --yes to send without confirming.");
+      return;
+    }
+    let send = false;
+    try {
+      const what = stored ? "at the market's stored price, which no Pyth update proves" : "at the price shown";
+      send = await d.prompts.confirm({ message: `Send it? It fixes the settlement price for good, ${what}.`, default: false });
+    } catch (e) {
+      if (!isPromptExit(e)) throw e;
+    }
+    if (!send) return;
+  }
+  renderResult(
+    await k.run.terminateScheduledPair(a.market!, { storedPrice: a.storedPrice, acceptStoredPrice: a.acceptStoredPrice === true, expect: planned }),
+    d.out,
+  );
 }
 
 async function cmdWallet(a: WalletArgs, d: CliDeps): Promise<number | void> {
@@ -610,8 +668,16 @@ async function cmdDoctor(a: ConfigArgs, d: CliDeps): Promise<number> {
 }
 
 async function cmdMockPrices(a: MockPricesArgs): Promise<void> {
-  const { serveMockHermes } = await import("../devtools/mock-hermes.js");
-  await serveMockHermes(a.rpc, a.pyth, a.price, { host: a.host, port: a.port });
+  const { listenRefusal, serveMockPro } = await import("../devtools/mock-pro.js");
+  // From the environment, never from the command line, where other users' process listings show it.
+  let token: string | null = null;
+  if (a.tokenEnv !== undefined) {
+    token = process.env[a.tokenEnv] ?? "";
+    if (token === "") throw new CliExit(2, c.red(`--token-env names ${a.tokenEnv}, which is not set or is empty`));
+  }
+  const refusal = listenRefusal(a.host, token);
+  if (refusal !== null) throw new CliExit(2, c.red(refusal));
+  await serveMockPro(a.rpc, a.price, { host: a.host, port: a.port, token });
 }
 
 export const DEFAULT_HANDLERS: Handlers = {
@@ -731,12 +797,23 @@ export function buildProgram(d: CliDeps, setCode: (code: number) => void): Comma
     .option("--dry-run", "simulate only")
     .option("--force", "send even when the profit and loss rules would skip it")
     .option("-y, --yes", "send manual operations without confirming")
+    .addOption(
+      new Option(
+        "--stored-price <policy>",
+        "terminate-scheduled: when the settlement at the market's stored price may be planned once its last resort is open: " +
+          "whenAbsent (default: only when Pyth's archive answers and has no update for it), always, or never",
+      ).choices(["whenAbsent", "always", "never"]),
+    )
+    .option("--accept-stored-price", "terminate-scheduled: send a settlement at the market's stored price (irreversible); without it such a plan is only shown")
     .addHelpText("after", "\nOperations:\n" + operationList())
     .action(async (operation: string | undefined, o: Omit<RunArgs, "operation" | "dryRun" | "force" | "yes"> & { dryRun?: boolean; force?: boolean; yes?: boolean }) => {
       if (!operation) throw new CliExit(2, `${c.red("bazaar keeper run needs an operation.")}\n${operationList()}`);
       if (!isOperation(operation)) throw new CliExit(2, `${c.red(`unknown operation '${operation}'.`)}\n${operationList()}`);
       for (const [field, flag, ops] of NEEDS) {
         if (ops.includes(operation) && !o[field]) throw new CliExit(2, c.red(`${operation} needs ${flag}`));
+      }
+      if (operation !== "terminate-scheduled" && (o.storedPrice !== undefined || o.acceptStoredPrice)) {
+        throw new CliExit(2, c.red("--stored-price and --accept-stored-price apply to terminate-scheduled only"));
       }
       const args: RunArgs = {
         config: o.config,
@@ -750,6 +827,8 @@ export function buildProgram(d: CliDeps, setCode: (code: number) => void): Comma
         dryRun: Boolean(o.dryRun),
         force: Boolean(o.force),
         yes: Boolean(o.yes),
+        storedPrice: o.storedPrice,
+        acceptStoredPrice: Boolean(o.acceptStoredPrice),
       };
       done(await d.handlers.run(args, d));
     });
@@ -772,15 +851,24 @@ export function buildProgram(d: CliDeps, setCode: (code: number) => void): Comma
 
   program
     .command("mock-prices")
-    .summary("serve Hermes-style prints from a MockPyth (local testing)")
-    .description("Serve Hermes-style prints from a MockPyth on a local chain, until Ctrl-C.")
-    .option("--rpc <url>", "the local chain's RPC", "http://127.0.0.1:8545")
-    .requiredOption("--pyth <address>", "the MockPyth address")
-    .option("--price <FEED_ID=USD>", "a feed's starting price in USD; repeatable", collectPrice, {} as Record<string, number>)
-    .option("--host <host>", "the address to listen on", "127.0.0.1")
+    .summary("serve a mock Pyth Pro price endpoint for a local chain (local testing)")
+    .description(
+      "Serve a mock Pyth Pro price endpoint for a local chain, until Ctrl-C: the price stream, the request API\n" +
+        "and the symbols registry. Its updates are signed with the public test key that only a local deployment's\n" +
+        "mock verifier trusts, and stamped with the chain's time. Point a keeper at it with prices.endpoint.",
+    )
+    .option("--rpc <url>", "the local chain's RPC, whose clock the updates follow", "http://127.0.0.1:8545")
+    .option(
+      "--price <FEED_ID=USD>",
+      "a feed's starting price in USD, the feed as its Pyth Pro number or bytes32 (2=3000 is ETH/USD); repeatable",
+      collectPrice,
+      {} as Record<string, number>,
+    )
+    .option("--host <host>", "the address to listen on: one other machines reach needs --token-env", "127.0.0.1")
     .option("--port <port>", "the port to listen on", parsePort, 8787)
+    .option("--token-env <NAME>", "the environment variable holding a token every client must present (the symbols registry excepted)")
     .action(async (o: MockPricesArgs) =>
-      done(await d.handlers.mockPrices({ rpc: o.rpc, pyth: o.pyth, price: o.price, host: o.host, port: o.port }, d)),
+      done(await d.handlers.mockPrices({ rpc: o.rpc, price: o.price, host: o.host, port: o.port, ...(o.tokenEnv !== undefined ? { tokenEnv: o.tokenEnv } : {}) }, d)),
     );
 
   return program;
@@ -790,7 +878,7 @@ export function buildProgram(d: CliDeps, setCode: (code: number) => void): Comma
 
 /**
  * One readable line for a failed command, and its exit code: 2 for a usage, config or wallet
- * problem (as argparse and the Python CLI used), 1 for anything else. --debug adds the stack trace.
+ * problem, 1 for anything else. --debug adds the stack trace.
  */
 export function reportError(e: unknown, out: Output, debug: boolean): number {
   if (e instanceof CommanderError) return e.exitCode === 0 ? 0 : 2; // commander has printed it

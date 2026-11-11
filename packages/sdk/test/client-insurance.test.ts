@@ -171,8 +171,8 @@ describe("insurance writes", () => {
 describe("quotes at the live price", () => {
   it("prices a deposit at the composed live price, and a redemption at a given one", async () => {
     const { fake, ctx, prices } = fakeContext();
-    const base = ("0x" + "01".repeat(32)) as Hex;
-    const quote = ("0x" + "02".repeat(32)) as Hex;
+    const base = ("0x" + "00".repeat(31) + "01") as Hex;
+    const quote = ("0x" + "00".repeat(31) + "02") as Hex;
     fake.oracle("composites", { baseId: base, quoteId: quote, invertQuote: false });
     prices!.set(base, 2_500_000_000n).set(quote, 80_000_000n);
     fake.lens("quoteInsuranceDeposit", ([, amount, price]: readonly [unknown, bigint, bigint]) => amount + price);

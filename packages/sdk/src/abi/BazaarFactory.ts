@@ -1296,17 +1296,6 @@ export const bazaarFactoryAbi = [
   },
   {
     "type": "error",
-    "name": "Factory__FeedNotOnPyth",
-    "inputs": [
-      {
-        "name": "feedId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "Factory__IdentifierNotAssertTruth",
     "inputs": [
       {
@@ -1356,6 +1345,17 @@ export const bazaarFactoryAbi = [
         "name": "opensAt",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "Factory__InvalidFeedId",
+    "inputs": [
+      {
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
       }
     ]
   },

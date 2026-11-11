@@ -198,20 +198,21 @@ let nextId = 1;
 
 /**
  * A small JSON-RPC client over HTTP(S): rate limited, retried on transient failures except for sends,
- * with response bodies capped. Its errors never show the raw URL or a header's value.
+ * with response bodies capped. Its errors never show the raw URL or a header's value, and neither does
+ * printing or serializing it: the URL and the headers are private fields.
  */
 export class JsonRpc implements Transport {
-  readonly url: string;
   /** The URL as it may be printed: with any key in it masked. */
   readonly displayUrl: string;
   private readonly limiter: RateLimiter;
   private readonly timeoutMs: number;
   private readonly retries: number;
   private readonly maxResponseBytes: number;
-  private readonly headers: Record<string, string>;
-  private readonly fetchFn: typeof fetch;
+  readonly #url: string;
+  readonly #headers: Record<string, string>;
+  readonly #fetch: typeof fetch;
   /** Text that must not reach an error message, longest first, with what replaces it. */
-  private readonly secrets: readonly (readonly [string, string])[];
+  readonly #secrets: readonly (readonly [string, string])[];
 
   constructor(url: string, opts: JsonRpcOptions = {}) {
     const extra = opts.headers ?? {};
@@ -224,14 +225,14 @@ export class JsonRpc implements Transport {
         );
       }
     }
-    this.url = url;
+    this.#url = url;
     this.displayUrl = redactUrl(url);
     this.limiter = new RateLimiter(opts.perSecond ?? 25);
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.retries = Math.max(0, opts.retries ?? 3);
     this.maxResponseBytes = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
-    this.headers = { "content-type": "application/json", ...extra };
-    this.fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);
+    this.#headers = { "content-type": "application/json", ...extra };
+    this.#fetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
     const secrets = new Map<string, string>();
     for (const v of Object.values(extra)) {
       for (const s of [v.trim(), ...v.split(/\s+/).filter((p) => p.length >= 8)]) if (s.length >= 4) secrets.set(s, "***");
@@ -243,13 +244,18 @@ export class JsonRpc implements Transport {
     } catch {
       // not a URL fetch can read: it fails with the text as given, which is covered
     }
-    this.secrets = [...secrets].sort((a, b) => b[0].length - a[0].length);
+    this.#secrets = [...secrets].sort((a, b) => b[0].length - a[0].length);
+  }
+
+  /** The URL as given. It often holds a provider's key: print {@link displayUrl}. */
+  get url(): string {
+    return this.#url;
   }
 
   /** `text` with the URL redacted and every header value masked. */
   private safe(text: string): string {
     let out = text;
-    for (const [s, by] of this.secrets) if (out.includes(s)) out = out.split(s).join(by);
+    for (const [s, by] of this.#secrets) if (out.includes(s)) out = out.split(s).join(by);
     return out;
   }
 
@@ -287,9 +293,9 @@ export class JsonRpc implements Transport {
       await this.limiter.wait();
       let out: JsonRpcAnswer;
       try {
-        const r = await this.fetchFn(this.url, {
+        const r = await this.#fetch(this.#url, {
           method: "POST",
-          headers: this.headers,
+          headers: this.#headers,
           body,
           signal: AbortSignal.timeout(this.timeoutMs),
         });

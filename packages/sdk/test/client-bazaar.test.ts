@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { type Address, type Hex, encodeAbiParameters } from "viem";
 import { describe, expect, it } from "vitest";
-import { Bazaar, Chain, type BazaarContext, type Transport, factory, lens, pair, trade } from "../src/index.js";
+import { Bazaar, Chain, type BazaarContext, InputError, type Transport, factory, lens, pair, trade } from "../src/index.js";
 import { CTX_FUNCTIONS } from "../src/client/bindings.generated.js";
 
 const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
@@ -51,5 +51,16 @@ describe("the Bazaar facade", () => {
 
   it("keeps the generated bindings up to date", () => {
     expect(() => execFileSync(process.execPath, ["scripts/gen-bindings.mjs", "--check"], { cwd: ROOT, stdio: "pipe" })).not.toThrow();
+  });
+});
+
+describe("Bazaar.connect's prices option", () => {
+  it("refuses a value of another shape instead of reading it as client options", async () => {
+    for (const prices of ["https://pro.example", { url: "https://pro.example", apiKey: "not-a-real-key" }, { tokn: "typo" }]) {
+      const e = await Bazaar.connect({ transport: "http://127.0.0.1:1", factory: PAIR, prices: prices as never }).catch((x) => x);
+      expect(e).toBeInstanceOf(InputError);
+      expect((e as Error).message).toMatch(/^prices: (A URL is not a price source|Unknown option)/);
+      expect((e as Error).message).not.toContain("not-a-real-key");
+    }
   });
 });

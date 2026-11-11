@@ -10,7 +10,7 @@ import { TriggersJob } from "./triggers.js";
 import { UnloadJob } from "./unload.js";
 
 export { AdlJob } from "./adl.js";
-export { ALL_STATUSES, type ActionExtras, CACHE_REPLAN_MARGIN, Job, type JobClass, LIVE, LIVE_OR_ADL, PricedCall, monotonic } from "./base.js";
+export { ALL_STATUSES, type ActionExtras, Job, type JobClass, LIVE, LIVE_OR_ADL, PricedCall, monotonic } from "./base.js";
 export { CollectJob } from "./collect.js";
 export { LiquidationJob, belowMaintenance } from "./liquidation.js";
 export { RefreshJob } from "./refresh.js";

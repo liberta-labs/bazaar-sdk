@@ -408,14 +408,10 @@ export class Reader {
     return out;
   }
 
-  /** The oracle's fee, in wei, for verifying `updates`. */
+  /** The oracle's fee, in wei, for having `updates` verified: Pyth's fee per update times their number. */
   async updateFee(updates: readonly Hex[]): Promise<bigint> {
     if (!updates.length) return 0n;
-    return this.one<bigint>(this.d.oracle, oracle(), "getUpdateFee", updates);
-  }
-
-  async sampleSetFee(baseFeedId: Hex, updates: readonly Hex[]): Promise<bigint> {
-    return this.one<bigint>(this.d.oracle, oracle(), "getSampleSetFee", baseFeedId, updates);
+    return this.one<bigint>(this.d.oracle, oracle(), "getUpdateFee", BigInt(updates.length));
   }
 
   async usdcBalance(account: Address): Promise<bigint> {

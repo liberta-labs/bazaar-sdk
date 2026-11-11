@@ -378,6 +378,20 @@ describe("unload", () => {
     f.printAt(2_000, 10); // stale: the walk would sell nothing
     expect(await f.job.plan(f.m)).toEqual([]);
   });
+
+  it("plans again at the next tick when its call was held back for an aged price, not after recheckSeconds", async () => {
+    const f = unload({ recheckSeconds: 300 });
+    f.printAt(2_000);
+    f.m.state = { ...f.m.state!, longInv: inv(S) };
+    const [a] = await f.job.plan(f.m);
+    expect(a!.priceTime).toBe(f.k.now());
+    f.job.note(a!, skippedResult(a!)); // the book had nothing: wait for recheckSeconds
+    expect(await f.job.plan(f.m)).toEqual([]);
+    const aged = skippedResult(a!);
+    aged.priceAged = true;
+    f.job.note(a!, aged);
+    expect(await f.job.plan(f.m)).toHaveLength(1);
+  });
 });
 
 // ---- adl ----

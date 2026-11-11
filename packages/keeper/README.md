@@ -21,7 +21,7 @@ them, naming the market on each call. `bazaar keeper opportunities` tells you wh
 
 ## Install
 
-Node 20 or later.
+Node 20 or later. The price stream runs on the `ws` package, so no global WebSocket is needed.
 
 ```bash
 npm install -g @liberta-labs/bazaar-keeper     # or, from this repository: npm install && npm run build
@@ -57,10 +57,18 @@ readable line; add `--debug` for the full trace. URLs and keys are masked in eve
   `rpc.logChunk` blocks (refused ranges are split automatically). `rpc.send: sequencer` submits straight
   to Arbitrum One's sequencer.
 - **Subgraph.** `subgraph.url` is any deployment of Bazaar's subgraph, or `none` to index from chain
-  logs. The subgraph only finds accounts and orders; every decision is made from chain state.
-- **Prices.** `prices.endpoint` is `pyth` (with your own `apiKey`), any Hermes-compatible URL, or
-  `bazaar` once Bazaar's shared endpoint exists. A stream that goes silent for
-  `prices.streamIdleTimeoutSeconds` (10) is dropped and reconnected.
+  logs. The subgraph only finds accounts and orders; every decision is made from chain state. Without
+  one, the first start replays every Bazaar log from the factory's deployment block (`startBlock`);
+  left out, the keeper finds that block itself with about 30 historical `eth_getCode` reads, which
+  needs an RPC that keeps historical state (hosted providers do). Later starts tail from the snapshot.
+- **Prices.** Pyth Pro. `prices.endpoint` is `pyth` (with your own Pyth Pro access token in
+  `prices.token`), the URL of a Pyth Pro compatible service (`bazaar mock-prices` on a local chain,
+  a proxy), or `bazaar` once Bazaar's shared endpoint exists; `prices.streamUrls`, `prices.restUrl` and
+  `prices.symbolsUrl` replace one place each. The keeper streams `prices.channel`
+  (`fixed_rate@200ms` by default) with one subscription per market, and uses only updates signed by a
+  signer the deployment's Pyth verifier trusts (`prices.checkSigners`). A stream that brings no new
+  update for `prices.streamIdleTimeoutSeconds` (10) is dropped and reconnected. Feed ids are Pyth Pro
+  feed numbers (ETH/USD, which prices gas, is 2).
 - **Wallets.** `keystore` (recommended; `bazaar wallet new` makes one), `privateKey` from the
   environment, `mnemonic`, or a `remote` signer. Each wallet is its own nonce queue: give
   latency-critical jobs their own (`wallet: fast`). With no wallet the keeper is watch-only.

@@ -61,7 +61,7 @@ export const ORACLE_DEAD_THRESHOLD = 21 * 86_400;
 export const SETTLEMENT_SAMPLE_COUNT = 5;
 export const SETTLEMENT_SAMPLE_SPACING = 600;
 export const SETTLE_NOTHING = 0;
-export const SETTLE_WINDOW = 1;
+export const SETTLE_TICK = 1;
 export const SETTLE_CHAIN = 2;
 export const SETTLE_AWAIT_VERDICT = 3;
 
@@ -90,8 +90,8 @@ export const ORDER_TYPE_NAMES: Readonly<Record<number, string>> = {
 /** An order's trigger price sits in the low 128 bits; its keeper bounty in the high 128. */
 export const TRIGGER_PRICE_MASK = (1n << 128n) - 1n;
 
-/** Pyth ETH/USD, used to price gas. */
-export const ETH_USD_FEED: Hex = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace";
+/** Pyth Pro ETH/USD (feed 2) as a bytes32 feed id, used to price gas. */
+export const ETH_USD_FEED: Hex = "0x0000000000000000000000000000000000000000000000000000000000000002";
 
 export const ZERO_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
 export const MAX_UINT256 = (1n << 256n) - 1n;

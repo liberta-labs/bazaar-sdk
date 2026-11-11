@@ -260,13 +260,13 @@ describe("store snapshots", () => {
     expect([t.head, t.headHash]).toEqual([123_456, s.headHash]);
   });
 
-  it("ignore what they cannot use: none, unreadable, the Python keeper's, another factory's, malformed", () => {
+  it("ignore what they cannot use: none, unreadable, version 1, another factory's, malformed", () => {
     const dir = tmpDir();
     const path = join(dir, "snapshot.json");
     expect(Store.load(path, 1, FACTORY)).toBeNull();
     writeFileSync(path, "{not json");
     expect(Store.load(path, 1, FACTORY)).toBeNull();
-    // The Python keeper's format: version 1, snake_case, integers as JSON numbers.
+    // A version-1 snapshot: snake_case, integers as JSON numbers.
     writeFileSync(path, JSON.stringify({ version: 1, chain_id: 1, factory: FACTORY, head: 5, head_hash: "", markets: [], positions: {}, orders: {} }));
     expect(Store.load(path, 1, FACTORY)).toBeNull();
 

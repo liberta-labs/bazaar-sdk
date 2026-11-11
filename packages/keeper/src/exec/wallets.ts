@@ -1,10 +1,10 @@
 /**
  * Signers: a local key (from the environment, a keystore or a mnemonic) or a remote signer.
  *
- * Keystores are Ethereum's JSON keystore, version 3, as eth-account (the Python keeper) and geth read
- * and write them: scrypt or PBKDF2-HMAC-SHA256 for the key, AES-128-CTR for the private key, and
- * mac = keccak256(derivedKey[16..32] ++ ciphertext). New keystores use the Python keeper's parameters
- * (scrypt n = 2^18, r = 8, p = 1, 16-byte salt), so either keeper opens the other's files.
+ * Keystores are Ethereum's JSON keystore, version 3, as geth and eth-account read and write them:
+ * scrypt or PBKDF2-HMAC-SHA256 for the key, AES-128-CTR for the private key, and
+ * mac = keccak256(derivedKey[16..32] ++ ciphertext). New keystores use scrypt n = 2^18, r = 8, p = 1
+ * and a 16-byte salt, so those tools open them too.
  *
  * Keys, passwords and phrases never appear in an error or a log line; a remote signer's URL appears
  * only through `redactUrl`.
@@ -261,7 +261,7 @@ export interface KeystoreV3 {
   version: 3;
 }
 
-/** The Python keeper's (eth-account's) parameters for new keystores. */
+/** Parameters for new keystores: geth's standard scrypt settings. */
 const SCRYPT_N = 262_144;
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
@@ -362,7 +362,7 @@ export async function decryptKeystore(keyfile: unknown, password: string): Promi
   return ctr(derived.slice(0, 16), iv).decrypt(ciphertext);
 }
 
-/** A v3 keystore for `key`, with the Python keeper's parameters and field order. */
+/** A v3 keystore for `key`, with the parameters above. */
 export async function encryptKeystore(key: Hex | string | Uint8Array, password: string): Promise<KeystoreV3> {
   const hex = keyHex(key);
   const address = privateKeyToAccount(hex).address;
@@ -386,7 +386,7 @@ export async function encryptKeystore(key: Hex | string | Uint8Array, password: 
   };
 }
 
-/** Python's json.dumps spacing, so a keystore file reads the same whichever keeper wrote it. */
+/** JSON with `": "` and `", "` separators. */
 function pyJson(v: unknown): string {
   if (v && typeof v === "object") {
     return "{" + Object.entries(v).map(([k, x]) => `${JSON.stringify(k)}: ${pyJson(x)}`).join(", ") + "}";
@@ -563,7 +563,7 @@ export async function loadSigner(name: string, cfg: WalletConfig): Promise<Signe
       } catch (e) {
         return named(e);
       }
-      // m/44'/60'/0'/0/{index}, as the Python keeper derives it.
+      // The standard Ethereum path, m/44'/60'/0'/0/{index}.
       const pk = mnemonicToAccount(phrase, { addressIndex: cfg.index }).getHdKey().privateKey;
       if (!pk) throw new WalletError(`wallet ${name}: the mnemonic did not derive a key`);
       return new LocalSigner(pk);

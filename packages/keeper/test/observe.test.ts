@@ -4,7 +4,7 @@ import { Alerter } from "../src/observe/alerts.js";
 import { formatMessage, getLogger, printable, safeLabel, setup } from "../src/observe/logs.js";
 
 describe("logs", () => {
-  it("fills %-templates the way Python's logging does", () => {
+  it("fills printf-style %-templates", () => {
     expect(formatMessage("%s %s: sent %s (%d)", ["liquidation", "-", "0xab", 3.7]).text).toBe("liquidation -: sent 0xab (3)");
     expect(formatMessage("100% sure", []).text).toBe("100% sure"); // no args: not formatted
     const e = new Error("boom");

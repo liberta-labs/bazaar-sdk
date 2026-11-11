@@ -19,6 +19,19 @@ export * from "./sync/index.js";
 export * from "./keeper/index.js";
 export { runDoctor } from "./cli/doctor.js";
 export { runWizard } from "./cli/wizard.js";
-export { startMockHermes, serveMockHermes, MockHermes } from "./devtools/mock-hermes.js";
+export {
+  type FeedEntries,
+  type FeedRef,
+  type MockClock,
+  type MockFeedState,
+  MockPro,
+  type MockProOptions,
+  type MockProServer,
+  type MockUpdate,
+  type MockUpdateSpec,
+  feedNumber,
+  serveMockPro,
+  startMockPro,
+} from "./devtools/mock-pro.js";
 
 export const VERSION = "0.1.0";

@@ -24,13 +24,15 @@ import {
 } from "../constants.js";
 import { adlThreshold, effectiveMmrBp, mulDiv, pairPrice } from "../formulas/index.js";
 import { type Market, type MarketState, type MarketStatic, Status, freeCapital, marketFromStatic, marketStatus } from "../models.js";
-import { PUBLIC_FEED_METADATA_URL } from "../networks.js";
-import { HermesClient, type PriceFeedMetadata, type Print } from "../prices/hermes.js";
-import { fetchSymbols, marketLabel } from "../prices/service.js";
+import type { Print, ProSymbol } from "../prices/pro.js";
+import { marketLabel } from "../prices/service.js";
 import { Reader } from "../sync/reader.js";
 import { InputError } from "./calls.js";
 import type { BazaarContext } from "./context.js";
 import { descriptionProblem } from "./listings.js";
+import { type SymbolSource, feedInfoFor } from "./registry.js";
+
+export type { SymbolSource } from "./registry.js";
 
 // =====================================================================================================
 // Static facts
@@ -47,22 +49,21 @@ export interface MarketInfo extends MarketStatic {
    * until the first fresh price at the reopen (docs: Trading, "Stocks & FX after hours").
    */
   readonly hours: TradingHours;
-  /** Priced from two Pyth feeds (an asset and an FX leg) composed by the oracle. */
+  /** Priced from two Pyth Pro feeds (an asset and an FX leg) composed by the oracle. */
   readonly composite: boolean;
-  /** Each leg's Pyth symbol ("Crypto.BTC/USD", "Equity.US.AAPL/USD"); "" where the feed metadata has none. */
+  /** Each leg's Pyth symbol ("Crypto.BTC/USD", "Equity.US.AAPL/USD"); "" where the symbols registry has none. */
   readonly legSymbols: readonly string[];
+  /**
+   * Each leg's entry in Pyth Pro's symbols registry (asset type, fastest channel, state, schedule);
+   * null where the registry has none or was not read.
+   */
+  readonly legFeeds: readonly (ProSymbol | null)[];
   /** The market's position in the factory's pair list. */
   readonly index: number;
 }
 
 /** A market as callers name it: its info, its pair address, its pair id, or its label. */
 export type MarketRef = MarketInfo | Address | Hex | string;
-
-/** Where feed symbols come from: a Hermes base URL, or anything with Hermes' `/v2/price_feeds`. */
-export interface FeedMetadataSource {
-  readonly base?: string;
-  priceFeeds(): Promise<PriceFeedMetadata[]>;
-}
 
 export interface ListMarketsOptions {
   /**
@@ -71,11 +72,12 @@ export interface ListMarketsOptions {
    */
   refresh?: boolean;
   /**
-   * Where market labels come from. Default: the context's Hermes (a {@link hermesPriceSource}), and
-   * {@link PUBLIC_FEED_METADATA_URL} when that serves no symbols. `null` skips symbols: labels are
-   * then the short address (never the subgraph's description, which is not verified).
+   * Where market labels come from. Default: the symbols registry of the context's Pyth Pro client (a
+   * {@link proPriceSource}), and Pyth's own registry (networks.ts `PYTH_PRO.symbolsUrl`) when that
+   * lists none of the feeds. `null` skips symbols: labels are then the short address (never the
+   * subgraph's description, which is not verified).
    */
-  metadata?: string | FeedMetadataSource | null;
+  metadata?: string | SymbolSource | null;
 }
 
 interface MarketCache {
@@ -102,44 +104,6 @@ export function readerFor(ctx: BazaarContext): Reader {
     readers.set(ctx, r);
   }
   return r;
-}
-
-// Feed metadata (every Pyth feed, ~1 MB) is fetched once per endpoint and shared by every context.
-const metadataCache = new Map<string, Promise<PriceFeedMetadata[]>>();
-
-function cachedMetadata(src: string | FeedMetadataSource): FeedMetadataSource {
-  const client = typeof src === "string" ? new HermesClient(src) : src;
-  const key = typeof src === "string" ? src.replace(/\/+$/, "") : (src.base ?? null);
-  if (key === null) return client; // nothing to key a cache on: the caller's source caches, or not
-  return {
-    base: key,
-    priceFeeds() {
-      let p = metadataCache.get(key);
-      if (!p) {
-        p = client.priceFeeds();
-        metadataCache.set(key, p);
-        p.catch(() => metadataCache.delete(key));
-      }
-      return p;
-    },
-  };
-}
-
-/** The HermesClient behind the context's price source, when it is a {@link hermesPriceSource}. */
-function contextHermes(ctx: BazaarContext): FeedMetadataSource | null {
-  const c = (ctx.prices as { client?: unknown } | null)?.client;
-  return c instanceof HermesClient ? c : null;
-}
-
-async function symbolsFor(ctx: BazaarContext, feeds: readonly Hex[], opt: ListMarketsOptions["metadata"]): Promise<Map<Hex, string>> {
-  if (opt === null || feeds.length === 0) return new Map();
-  if (opt !== undefined) return fetchSymbols(cachedMetadata(opt), feeds);
-  const own = contextHermes(ctx);
-  if (own) {
-    const s = await fetchSymbols(cachedMetadata(own), feeds);
-    if (s.size > 0 || own.base?.replace(/\/+$/, "") === PUBLIC_FEED_METADATA_URL) return s;
-  }
-  return fetchSymbols(cachedMetadata(PUBLIC_FEED_METADATA_URL), feeds);
 }
 
 /**
@@ -190,16 +154,17 @@ async function loadMarkets(ctx: BazaarContext, cache: MarketCache, opts: ListMar
   const fresh = addresses.filter((a) => !cache.byAddress.has(a));
   if (fresh.length > 0) {
     const [described, descriptions] = await Promise.all([reader.describe(fresh), descriptionsFor(ctx, fresh)]);
-    const feeds = [...new Set(described.flatMap((m) => m.legs))];
-    let symbols = new Map<Hex, string>();
+    const feeds = [...new Set(described.flatMap((m) => m.legs.map((l) => l.toLowerCase() as Hex)))];
+    let registry = new Map<Hex, ProSymbol>();
     try {
-      symbols = await symbolsFor(ctx, feeds, opts.metadata !== undefined ? opts.metadata : cache.metadata);
+      registry = await feedInfoFor(ctx, feeds, opts.metadata !== undefined ? opts.metadata : cache.metadata);
     } catch {
       // Labels fall back to the address.
     }
     for (const m of described) {
       m.description = descriptions.get(m.address) ?? "";
-      const legSymbols = m.legs.map((l) => symbols.get(l) ?? "");
+      const legFeeds = m.legs.map((l) => registry.get(l.toLowerCase() as Hex) ?? null);
+      const legSymbols = legFeeds.map((f) => f?.symbol ?? "");
       const info: MarketInfo = {
         address: m.address,
         pairId: m.pairId,
@@ -212,6 +177,7 @@ async function loadMarkets(ctx: BazaarContext, cache: MarketCache, opts: ListMar
         hours: m.continuous ? "24/7" : "trading-hours",
         composite: m.legs.length === 2,
         legSymbols,
+        legFeeds,
         index: 0,
       };
       cache.byAddress.set(m.address, info);
@@ -240,8 +206,8 @@ async function loadMarkets(ctx: BazaarContext, cache: MarketCache, opts: ListMar
  *
  * Reads `factory.getAllPairs`, then {@link Reader.describe} (pair id, base feed, calendar, composite
  * legs: two batched reads), the listing descriptions from the subgraph when the context has one, and
- * the legs' Pyth symbols. Cached per context: later calls return the cached list without any request
- * until `refresh` is passed.
+ * the legs' entries in Pyth Pro's symbols registry. Cached per context: later calls return the cached
+ * list without any request until `refresh` is passed.
  */
 export async function listMarkets(ctx: BazaarContext, opts: ListMarketsOptions = {}): Promise<MarketInfo[]> {
   let cache = marketCaches.get(ctx);
@@ -304,8 +270,8 @@ export async function getMarket(ctx: BazaarContext, ref: MarketRef): Promise<Mar
 // =====================================================================================================
 
 /**
- * Seconds a trading-hours market's feed may go without a print, while the price endpoint is otherwise
- * delivering, before its venue counts as closed (PriceService.closed's default).
+ * Seconds a trading-hours market's feed may go without generating a price, while the price endpoint
+ * is otherwise delivering, before its venue counts as closed (PriceService.closed's default).
  */
 export const VENUE_CLOSED_AFTER = 15;
 
@@ -337,14 +303,14 @@ export interface LivePriceView {
 
 /** The price a snapshot valued an account at, and where it came from. */
 export interface PriceQuote extends LivePriceQuote {
-  /** "given" by the caller, "live" from a LivePrices stream, "hermes" from one request, "stored" on the pair */
-  readonly source: "given" | "live" | "hermes" | "stored";
+  /** "given" by the caller, "live" from a LivePrices stream, "pro" from one Pyth Pro request, "stored" on the pair */
+  readonly source: "given" | "live" | "pro" | "stored";
 }
 
 /** @internal */
 export interface ResolvedPrice {
   readonly price: PriceQuote | null;
-  /** null when nothing could judge it (no live prices and no Hermes source) */
+  /** null when nothing could judge it (no live prices and no Pyth Pro source) */
   readonly venueClosed: boolean | null;
 }
 
@@ -364,9 +330,9 @@ export interface ResolveOptions {
 }
 
 /**
- * Each market's live price and venue state: from the caller's price, a live view, or one Hermes
- * request for every leg involved (only when the context's source is a {@link hermesPriceSource} and
- * no live view is given). Never throws: what cannot be judged is null.
+ * Each market's live price and venue state: from the caller's price, a live view, or one Pyth Pro
+ * request for every leg involved (only when the context's source is a {@link proPriceSource} and no
+ * live view is given). Never throws: what cannot be judged is null.
  * @internal
  */
 export async function resolvePrices(ctx: BazaarContext, markets: readonly MarketStatic[], opts: ResolveOptions): Promise<Map<Address, ResolvedPrice>> {
@@ -410,7 +376,7 @@ export async function resolvePrices(ctx: BazaarContext, markets: readonly Market
     let price: PriceQuote | null = given;
     if (!price && all && opts.needPrice) {
       const pp = pairPrice(all, m.invertQuote);
-      if (pp) price = { spot: pp.spot, low: pp.low, high: pp.high, publishTime: pp.publishTime, source: "hermes" };
+      if (pp) price = { spot: pp.spot, low: pp.low, high: pp.high, publishTime: pp.publishTime, source: "pro" };
     }
     let venueClosed: boolean | null = m.continuous ? false : null;
     if (!m.continuous && fetched) venueClosed = all ? all.some((p) => now - p.publishTime > VENUE_CLOSED_AFTER) : null;
@@ -436,7 +402,7 @@ export interface MarketFlags {
   /**
    * A trading-hours market whose venue is closed: no fresh Pyth price, so the pair runs on its last
    * stored one (fills boxed to 10% of it). Null when nothing could judge it (no live prices given and
-   * the context has no Hermes source); always false for a 24/7 market.
+   * the context has no Pyth Pro source); always false for a 24/7 market.
    */
   readonly venueClosed: boolean | null;
   /**
@@ -673,7 +639,7 @@ export interface SnapshotOptions {
   /** Live prices to judge the venue of trading-hours markets with ({@link LivePrices}). */
   readonly prices?: LivePriceView | null;
   /**
-   * Without live prices, ask the context's Hermes (a {@link hermesPriceSource}) for the legs of
+   * Without live prices, ask the context's Pyth Pro source (a {@link proPriceSource}) for the legs of
    * trading-hours markets, in parallel with the chain read, to judge their venue. Default true.
    */
   readonly fetchPrices?: boolean;
@@ -878,7 +844,7 @@ export async function headFor(ctx: BazaarContext, block: Pick<Block, "number" | 
  * Several markets' live state at one block: {@link Reader.marketStates} and the snapshot's own reads
  * (mark, funding rates, the stored price's band, ADL epoch and clocks, termination stamps and ratios,
  * the vault's ledger figures, the book's heads) in two batched calls sent together, plus, for
- * trading-hours markets without live prices, one Hermes request to judge the venue. A market whose
+ * trading-hours markets without live prices, one Pyth Pro request to judge the venue. A market whose
  * core reads fail is left out of the map.
  */
 export async function marketSnapshots(

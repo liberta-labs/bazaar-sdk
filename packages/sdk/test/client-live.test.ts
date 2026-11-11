@@ -69,7 +69,7 @@ describe("decodeLiveLog", () => {
     expect(decodeLiveLog({ ...toRaw(t)[0]!, topics: [h32("99")] })).toBeNull();
   });
 
-  // Audit F14: the event's ABI calls the payout usdcAmount, but it is BAZAAR precision.
+  // The event's ABI calls the payout usdcAmount, but it is BAZAAR precision.
   it("names InsuranceWithdrawalExecuted's 18-decimal payout `amount`", () => {
     const t = new FakeTransport(10, TS);
     t.emit(A, "InsuranceWithdrawalExecuted", { pairId: PAIR_ID, user: ALICE, shareAmount: 3n * E18, usdcAmount: 1_234_500_000_000_000_000n });
@@ -164,7 +164,7 @@ describe("LogFollower", () => {
     f.stop();
   });
 
-  // Audit F14: one bogus head number sent the follower through every block up to it (5e8 eth_getLogs for 1e12).
+  // One bogus head number must not send the follower through every block up to it (5e8 eth_getLogs for 1e12).
   it("does not follow a head far ahead of what it has read until the node serves the blocks before it", async () => {
     class Bogus extends FakeTransport {
       fake: number | null = null;
@@ -312,7 +312,7 @@ describe("watchMarket", () => {
     expect(h.stopped).toBe(true);
   });
 
-  // Audit F14: one log that failed to decode rejected the whole batch, and the rest of it was never delivered.
+  // One log that fails to decode must not cost the rest of its batch.
   it("reports a log it cannot decode and still delivers the rest of its batch", async () => {
     const { t, ctx } = marketSetup();
     await listMarkets(ctx, { metadata: null });

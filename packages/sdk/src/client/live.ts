@@ -480,7 +480,7 @@ export class LogFollower {
 export interface WatchOptions extends FollowOptions {
   /** Live prices ({@link LivePrices}): the venue for the snapshots, and the price accounts are valued at. */
   readonly prices?: LivePriceView | null;
-  /** Without live prices, let snapshots ask the context's Hermes source (see {@link SnapshotOptions.fetchPrices}); default true. */
+  /** Without live prices, let snapshots ask the context's Pyth Pro source (see {@link SnapshotOptions.fetchPrices}); default true. */
   readonly fetchPrices?: boolean;
   /** Refresh snapshots at least this often (ms) even without events: funding accrues and clocks run. Default 15000; 0 for events only. */
   readonly refreshMs?: number;

@@ -47,7 +47,7 @@ export interface DecideOptions {
   force?: boolean;
 }
 
-/** Python's `{x:g}`: up to six significant digits, no trailing zeros. */
+/** Up to six significant digits, no trailing zeros. */
 export function fmtG(x: number): string {
   return String(Number(x.toPrecision(6)));
 }

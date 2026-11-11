@@ -8,7 +8,7 @@
  * - **Insurer vote** (`proposeInsurerTermination`, `voteForInsurerTermination`,
  *   `executeInsurerTermination`): matured insurance shares reaching 60% of the snapshot latch a
  *   cutoff, no later than one hour before it.
- * - **Stale oracle** (`terminateStalePair`): no price for 21 days.
+ * - **Stale oracle** (`terminateStalePair`): the pair has stored no price for 21 days.
  * - **Autonomous**: the pair's own insolvency checks (nothing to call).
  *
  * Every path is two-stage: the terminator fixes the settlement price (`terminateScheduledPair` at a
@@ -27,22 +27,25 @@ import { type DecodedError, decodeError } from "../chain/errors.js";
 import { toRpcError } from "../chain/rpc.js";
 import {
   BP_SCALE,
+  ETH_USD_FEED,
   LIMBO_LEAD,
-  MAX_PRICE_STALENESS,
   ORACLE_DEAD_THRESHOLD,
   SETTLEMENT_SAMPLE_COUNT,
   SETTLEMENT_SAMPLE_SPACING,
   SETTLE_AWAIT_VERDICT,
   SETTLE_CHAIN,
   SETTLE_NOTHING,
-  SETTLE_WINDOW,
+  SETTLE_TICK,
   TERMINAL_SETTLEMENT_ESCAPE,
   USDC_TO_BAZAAR,
   ZERO_ADDRESS,
 } from "../constants.js";
+import { CHAIN_PROPERTIES, CHANNEL_FIXED_RATE_1000, HAS_FEED_UPDATE_TIMESTAMP, MICROS_PER_SECOND, TICK_PROPERTIES } from "../prices/lazer.js";
+import { type ProUpdate, printable } from "../prices/pro.js";
+import { redactUrls } from "../urls.js";
 import { InputError, simulate } from "./calls.js";
 import { type BazaarContext, ConnectError, type PriceUpdateSource, type SubgraphSource } from "./context.js";
-import { pairFeeds, updateFee } from "./feeds.js";
+import { pairFeeds } from "./feeds.js";
 import { SubgraphError } from "./history.js";
 import {
   type Cost,
@@ -102,7 +105,7 @@ export const INSURER_LEVY_FLOOR_BP = 1_000n;
 export const CLAIM_VERDICT_GRACE = 14 * 86_400;
 /** Yes-voters of a costed outcome stay locked this long after the price fix: the insurance withdrawal cooldown (seconds). */
 export const INSURER_POST_FIX_LOCK = 13 * 86_400;
-/** Under UMA's rule only the precise print settles for this long after the cutoff (or the verdict); then an empty call settles at the stored price (seconds). */
+/** Under UMA's rule only the cutoff's update settles for this long after the cutoff (or the verdict); then an empty call settles at the stored price (seconds). */
 export const SCHEDULED_TERMINATION_GRACE = 12 * 3_600;
 /** The settlement price (BAZAAR precision) a pair that never stored a price settles at under the stored-price paths (NEVER_PRICED_SETTLEMENT_PRICE). */
 export const NEVER_PRICED_SETTLEMENT_PRICE = 1n;
@@ -114,7 +117,7 @@ export const TerminationCategory = {
   OracleDecommission: 1,
   AssetCessation: 2,
   StructuralChange: 3,
-  PythContractMigration: 4,
+  PythVerifierMigration: 4,
 } as const;
 export type TerminationCategory = (typeof TerminationCategory)[keyof typeof TerminationCategory];
 
@@ -123,7 +126,7 @@ export const TERMINATION_CATEGORY_INFO: Readonly<Record<TerminationCategory, { r
   1: {
     name: "Oracle decommission",
     description:
-      "The market's Pyth feed (either leg of a composite) has stopped publishing, or is scheduled to be decommissioned or to stop publishing.",
+      "The market's Pyth Pro feed (either leg of a composite) has stopped publishing, or is scheduled to be decommissioned or to stop publishing.",
   },
   2: {
     name: "Asset cessation",
@@ -136,17 +139,18 @@ export const TERMINATION_CATEGORY_INFO: Readonly<Record<TerminationCategory, { r
       "An officially scheduled event makes the price series discontinuous: a split or reverse split, spinoff, rights offering, special distribution over 5%, redenomination or migration, or an index re-basing. Regular dividends and market moves of any size do not count.",
   },
   4: {
-    name: "Pyth contract migration",
-    description: "The Pyth oracle contract the market reads has been deprecated or is migrating to a new address.",
+    name: "Pyth verifier migration",
+    description:
+      "The Pyth Pro verifier contract the market's oracle uses has been deprecated, is being replaced by a contract at a new address, or no longer verifies the updates Pyth distributes.",
   },
 };
 
-export type SettlementRuleKey = "nothing" | "window" | "chain" | "awaitVerdict";
+export type SettlementRuleKey = "nothing" | "tick" | "chain" | "awaitVerdict";
 
 /** settlementRule's answers, by number. */
 export const SETTLEMENT_RULE_KEYS: Readonly<Record<number, SettlementRuleKey>> = {
   [SETTLE_NOTHING]: "nothing",
-  [SETTLE_WINDOW]: "window",
+  [SETTLE_TICK]: "tick",
   [SETTLE_CHAIN]: "chain",
   [SETTLE_AWAIT_VERDICT]: "awaitVerdict",
 };
@@ -154,10 +158,10 @@ export const SETTLEMENT_RULE_KEYS: Readonly<Record<number, SettlementRuleKey>> =
 /** What each settlement rule means. */
 export const SETTLEMENT_RULE_TEXT: Readonly<Record<SettlementRuleKey, string>> = {
   nothing: "Nothing to settle: the market has no scheduled cutoff, or its settlement price is already fixed.",
-  window:
-    "UMA's rule: the market settles at the first Pyth print in the 3 seconds ending at its cutoff, one print per feed leg. Only that print settles it until the grace ends; after that, a call with no print settles at the market's last stored price.",
+  tick:
+    "UMA's rule: the market settles at the price Pyth's one-second update stamped at its cutoff carries, for every feed leg (a quiet feed's update carries its last price forward). Only that update settles it until the grace ends; after that, a call without it settles at the market's last stored price.",
   chain:
-    "The chain rule: the market settles at the median of five Pyth prints chained from its cutoff, each the first published at least 10 minutes after the one before. There is no stored-price fallback until the last resort opens (21 days after the cutoff, or 12 hours after a UMA cutoff that caps the chain).",
+    "The chain rule: the market settles at the median of five Pyth prices chained from its cutoff, the first from the earliest one-second update carrying a price generated at or after the cutoff and each later one from the earliest carrying a price generated at least 10 minutes after the update before. There is no stored-price fallback until the last resort opens (21 days after the cutoff, or 12 hours after a UMA cutoff that caps the chain).",
   awaitVerdict:
     "Waiting for UMA's verdict on the claim behind the insurer vote that set the cutoff: if UMA upholds it the market settles under UMA's rule, otherwise under the chain rule.",
 };
@@ -204,7 +208,7 @@ const short = (h: Hex) => `${h.slice(0, 10)}…`;
 
 /** The terminator's public constants, read from the chain, plus the live bond. */
 export interface TerminatorConstants {
-  readonly categories: Readonly<Record<"oracleDecommission" | "assetCessation" | "structuralChange" | "pythContractMigration", number>>;
+  readonly categories: Readonly<Record<"oracleDecommission" | "assetCessation" | "structuralChange" | "pythVerifierMigration", number>>;
   readonly outcomes: Readonly<Record<OutcomeName, number>>;
   readonly verdicts: Readonly<Record<VerdictName, number>>;
   readonly settleRules: Readonly<Record<SettlementRuleKey, number>>;
@@ -224,7 +228,7 @@ export async function terminatorConstants(ctx: BazaarContext): Promise<Terminato
     "CATEGORY_ORACLE_DECOMMISSION",
     "CATEGORY_ASSET_CESSATION",
     "CATEGORY_STRUCTURAL_CHANGE",
-    "CATEGORY_PYTH_CONTRACT_MIGRATION",
+    "CATEGORY_PYTH_VERIFIER_MIGRATION",
     "OUTCOME_NONE",
     "OUTCOME_TRUE",
     "OUTCOME_FALSE",
@@ -233,7 +237,7 @@ export async function terminatorConstants(ctx: BazaarContext): Promise<Terminato
     "VERDICT_TRUE",
     "VERDICT_FALSE",
     "SETTLE_NOTHING",
-    "SETTLE_WINDOW",
+    "SETTLE_TICK",
     "SETTLE_CHAIN",
     "SETTLE_AWAIT_VERDICT",
     "TERMINATION_PROPOSAL_BOND",
@@ -246,10 +250,10 @@ export async function terminatorConstants(ctx: BazaarContext): Promise<Terminato
   const v = (await readMany(ctx, names.map((fn) => ({ to: ctx.terminator, codec: T(), fn })))).map((x) => x as number | bigint);
   const n = (i: number) => Number(v[i]);
   return {
-    categories: { oracleDecommission: n(0), assetCessation: n(1), structuralChange: n(2), pythContractMigration: n(3) },
+    categories: { oracleDecommission: n(0), assetCessation: n(1), structuralChange: n(2), pythVerifierMigration: n(3) },
     outcomes: { none: n(4), true: n(5), false: n(6), unjudged: n(7) },
     verdicts: { pending: n(8), true: n(9), false: n(10) },
-    settleRules: { nothing: n(11), window: n(12), chain: n(13), awaitVerdict: n(14) },
+    settleRules: { nothing: n(11), tick: n(12), chain: n(13), awaitVerdict: n(14) },
     terminationProposalBondUsdc: BigInt(v[15]!),
     requiredTerminationBondUsdc: BigInt(v[16]!),
     terminationProposalLiveness: n(17),
@@ -269,11 +273,11 @@ export interface SettlementRuleInfo {
   readonly rule: number;
   readonly key: SettlementRuleKey;
   readonly meaning: string;
-  /** The first (or only) print's target: the cutoff − 3 s under UMA's rule, the cutoff under the chain rule. */
+  /** Under UMA's rule the cutoff, whose update settles the market; under the chain rule the first sample's target, also the cutoff. */
   readonly firstTarget: number | null;
-  /** The latest publish time any print may carry; null when unbounded (a chain no UMA cutoff caps) or not applicable. */
+  /** Under UMA's rule the cutoff again; under the chain rule the latest second a sample's update may be stamped with. Null when unbounded (a chain no UMA cutoff caps) or not applicable. */
   readonly latestPublishTs: number | null;
-  /** After this instant a call with no prints settles at the stored price; null when not applicable or beyond any real time. */
+  /** After this instant a call with no updates settles at the stored price; null when not applicable or beyond any real time. */
   readonly lastResortTs: number | null;
   /** While waiting for a verdict: when the vote stops waiting and settles unjudged. */
   readonly verdictDeadline: number | null;
@@ -779,7 +783,7 @@ export async function proposeTermination(
   const from = asAddress("from", args.from);
   const category = args.category;
   if (!Number.isInteger(category) || category < 1 || category > 4) {
-    throw new InputError("category", "Choose one of the four grounds: oracle decommission, asset cessation, structural change or Pyth contract migration.");
+    throw new InputError("category", "Choose one of the four grounds: oracle decommission, asset cessation, structural change or Pyth verifier migration.");
   }
   const lastTradingTs = requireTime("lastTradingTs", args.lastTradingTs);
   const why = reasonProblem(args.reason);
@@ -1203,14 +1207,14 @@ export async function executeInsurerTermination(
 // ---------------------------------------------------------------------------------------------
 
 /**
- * End a market whose oracle has been dead for more than 21 days, at its last stored price (or at a
+ * End a market that has stored no price for more than 21 days, at its last stored price (or at a
  * nominal price of 1 when it never stored one, aged from its creation). Anyone may call it; it pays
- * nothing and costs only gas. The oracle is read only as a liveness probe: any confidence-cleared
- * Pyth tick newer than 21 days blocks it.
+ * nothing and costs only gas. The pair's own stored price is the evidence: a pair stores one whenever
+ * a call lands on it with a fresh update, and one `refreshPrice` restarts the 21 days.
  *
  * Refused up front: an unregistered or fixed market, one whose vote-set cutoff has passed (it settles
- * through terminateScheduledPair), and one whose stored price or Pyth's latest tick is 21 days old or
- * less (with the time it opens).
+ * through terminateScheduledPair), and one whose stored price is 21 days old or less (with the time
+ * it opens).
  */
 export async function terminateStalePair(ctx: BazaarContext, args: { pair: Address; from?: Address }): Promise<CostedCall> {
   const pair = asAddress("pair", args.pair);
@@ -1222,7 +1226,6 @@ export async function terminateStalePair(ctx: BazaarContext, args: { pair: Addre
       { to: pair, codec: P(), fn: "scheduledTerminationTs" },
       { to: pair, codec: P(), fn: "lastPairPrice" },
       { to: pair, codec: P(), fn: "auxState" },
-      { to: pair, codec: P(), fn: "baseFeedId" },
     ]),
     chainNow(ctx),
   ]);
@@ -1235,12 +1238,12 @@ export async function terminateStalePair(ctx: BazaarContext, args: { pair: Addre
   const last = r[4] as { spotPrice: bigint; updateTs: bigint };
   const created = Number((r[5] as { pairCreatedTs: bigint }).pairCreatedTs);
   const asOf = last.spotPrice === 0n ? created : Number(last.updateTs);
-  const [probe] = await readMany(ctx, [{ to: ctx.oracle, codec: oracleCodec(), fn: "tryReadStalePrice", args: [r[6] as Hex] }], { allowFailure: true });
-  const pr = probe as { found: boolean; publishTime: bigint } | undefined;
-  const newest = Math.max(asOf, pr?.found ? Number(pr.publishTime) : 0);
-  if (now - newest <= ORACLE_DEAD_THRESHOLD) {
-    const opens = newest + ORACLE_DEAD_THRESHOLD + 1;
-    throw new InputError("pair", `This market's oracle printed within the last ${durationText(ORACLE_DEAD_THRESHOLD)}: the stale-oracle path opens at ${timeText(opens)} if it stays silent.`);
+  if (now - asOf <= ORACLE_DEAD_THRESHOLD) {
+    const opens = asOf + ORACLE_DEAD_THRESHOLD + 1;
+    throw new InputError(
+      "pair",
+      `This market stored a price within the last ${durationText(ORACLE_DEAD_THRESHOLD)}: the stale-oracle path opens at ${timeText(opens)} if it stores none until then.`,
+    );
   }
   return {
     action: "terminateStalePair",
@@ -1248,7 +1251,7 @@ export async function terminateStalePair(ctx: BazaarContext, args: { pair: Addre
     data: T().encode("terminateStalePair", pair),
     value: 0n,
     from: args.from ? asAddress("from", args.from) : null,
-    summary: "End this market at its last stored price: its oracle has been silent for more than 21 days (no cost but gas)",
+    summary: "End this market at its last stored price: it has stored no price for more than 21 days (no cost but gas)",
     costs: [],
     approvals: [],
     requires: [],
@@ -1265,149 +1268,348 @@ export async function terminateStalePair(ctx: BazaarContext, args: { pair: Addre
 // Fixing the settlement price at a scheduled cutoff
 // ---------------------------------------------------------------------------------------------
 
-/** One archived Pyth print offered as settlement evidence. Times are unix seconds. */
+/** One of Pyth's one-second updates, read for one feed, as settlement evidence. Times are unix seconds. */
 export interface SettlementPrint {
   readonly feedId: Hex;
-  /** The signed update (one `bytes` element of the call's priceUpdate), carrying this feed. */
+  /** The signed update (one `bytes` element of the call's priceUpdate). */
   readonly update: Hex;
+  /** The second the update is stamped with. */
+  readonly tick: number;
+  /** Which of the feed's properties the update carries (prices/lazer.ts HAS_* bits). */
+  readonly included: number;
+  /** Whether the feed holds a price in it: Pyth encodes "no price" as zero. */
+  readonly priced: boolean;
+  /** The feed's price mantissa as the update carries it: zero for no price. The oracle refuses to settle at a price at or below zero. */
+  readonly price: bigint;
+  /**
+   * When that price was generated, in microseconds (the feed update timestamp): the update's own
+   * instant when Pyth produced a price on that second, earlier when the price is carried forward.
+   * Zero when the update carries no generation time for the feed.
+   */
+  readonly generatedUs: bigint;
+  /** The second that price was generated in; 0 when the update carries no generation time. */
   readonly publishTime: number;
-  /** The publish time of the feed's previous print, signed inside the update; null when the source did not report it. */
-  readonly prevPublishTime: number | null;
 }
 
-/** The first print at or after `target` for one feed, or null when the archive has none. */
-export type PrintFetcher = (feedId: Hex, target: number) => Promise<SettlementPrint | null>;
+/**
+ * Pyth's one-second update stamped `second`, carrying `feedIds` together, or null when the archive
+ * has none for that second. The shape of {@link PriceUpdateSource.atTick}.
+ */
+export type TickFetcher = (feedIds: readonly Hex[], second: number) => Promise<ProUpdate | null>;
 
-/** A settlement print that could not be fetched or does not prove itself. */
+/**
+ * Why a settlement update could not be had. `absent`: the archive answered, and what it holds shows no
+ * proven settlement exists now (no update for the second, no price in it, a price the oracle refuses,
+ * no chain under its bound, or none yet). `unreachable`: the archive could not be asked, or its answer
+ * could not be used (a failed or refused request, a signer check that failed, an answer that is not
+ * the update asked for, one without the feed or without a property asked for), so a proven settlement
+ * may well exist.
+ */
+export type SettlementPrintFailure = "absent" | "unreachable";
+
+/** A settlement update that could not be fetched, or a sample that cannot be proven. */
 export class SettlementPrintError extends Error {
   override readonly name = "SettlementPrintError";
   constructor(
     message: string,
     readonly feedId: Hex,
     readonly target: number,
+    /** Whether the archive showed that no usable update exists, or could not be relied on (see {@link SettlementPrintFailure}). */
+    readonly kind: SettlementPrintFailure = "unreachable",
   ) {
     super(message);
   }
 }
 
-/**
- * A {@link PrintFetcher} over the context's price source's historical route (`atOrAfter`, Hermes'
- * `/v2/updates/price/{time}`), asking for one feed at a time: each leg's first print is its own,
- * and the chain rule needs exactly one update per leg per sample.
- */
-export function printFetcher(source: PriceUpdateSource | null): PrintFetcher {
-  if (!source?.atOrAfter) {
-    throw new ConnectError("Settling a market at its cutoff needs archived Pyth prints: connect with a price source that serves Hermes' historical route (atOrAfter).");
+/** A {@link TickFetcher} over the context's price source (its `atTick`). */
+export function tickFetcher(source: PriceUpdateSource | null): TickFetcher {
+  if (!source?.atTick) {
+    throw new ConnectError("Settling a market at its cutoff needs Pyth's archived one-second updates: connect with a Pyth Pro price source (one that serves atTick).");
   }
-  const atOrAfter = source.atOrAfter.bind(source);
-  return async (feedId, target) => {
-    const res = await atOrAfter(target, [feedId]);
-    const r = res[0];
-    if (!r || r.update.length === 0) return null;
-    if (r.update.length !== 1) {
-      throw new SettlementPrintError(`The price source returned ${r.update.length} updates for one feed at ${target}; a settlement print is exactly one update per leg.`, feedId, target);
-    }
-    return { feedId, update: r.update[0]!, publishTime: r.publishTime, prevPublishTime: r.prevPublishTime };
-  };
+  return source.atTick.bind(source);
+}
+
+/** Text from outside the SDK (an archive's or a transport's error), fit to quote: every URL in it redacted, made printable and bounded. */
+const outsideText = (text: string) => printable(redactUrls(text), 300);
+
+/**
+ * `feedId` as the one-second update `u` for `second` carries it. Throws SettlementPrintError where
+ * BazaarOracle refuses the update for this feed whatever else it holds: it is not the one-second
+ * channel's update stamped `second` (BazaarOracle__WrongTick), it does not carry the feed
+ * (BazaarOracle__FeedNotInUpdate), or the feed's entry lacks its price or its exponent
+ * (BazaarOracle__IncompleteFeed). Each counts as unreachable: an update leaves out a feed the token
+ * does not cover as well as one Pyth does not serve, so none of these shows that no price exists.
+ */
+export function settlementPrint(u: ProUpdate, feedId: Hex, second: number): SettlementPrint {
+  const id = feedId.toLowerCase() as Hex;
+  if (u.channel !== CHANNEL_FIXED_RATE_1000 || u.timestampUs !== BigInt(second) * MICROS_PER_SECOND) {
+    throw new SettlementPrintError(`The update offered for second ${second} is not Pyth's one-second update stamped on it.`, id, second, "unreachable");
+  }
+  const f = u.feeds.get(id);
+  if (!f) throw new SettlementPrintError(`Pyth's one-second update for second ${second} does not carry feed ${short(id)}.`, id, second, "unreachable");
+  if ((f.included & TICK_PROPERTIES) !== TICK_PROPERTIES) {
+    throw new SettlementPrintError(`Pyth's one-second update for second ${second} carries feed ${short(id)} without its price or its exponent.`, id, second, "unreachable");
+  }
+  const generatedUs = (f.included & HAS_FEED_UPDATE_TIMESTAMP) !== 0 ? f.feedUpdateTimestamp : 0n;
+  return { feedId: id, update: u.blob, tick: second, included: f.included, priced: f.price !== 0n, price: f.price, generatedUs, publishTime: Number(generatedUs / MICROS_PER_SECOND) };
 }
 
 /**
- * Why `p` would not settle as the first print at or after `target` published no later than
- * `latest`, or null when it proves itself. The checks mirror what Pyth's parser enforces for the
- * terminator (`parsePriceFeedUpdatesWithConfig` with uniqueness on), so a set that passes them is
- * refused only for reasons the archive cannot show (a guardian set that no longer verifies, a fee):
- *
- * 1. **publishTime ≥ target.** Pyth refuses a print published before the window's start
- *    (minPublishTime). An archive answering a different question (the latest print *before* a
- *    time) would hand back exactly that.
- * 2. **prevPublishTime < target.** This is what makes the print the *first* at or after the target,
- *    and so the only one anybody could submit: the update signs its predecessor's publish time, and
- *    Pyth checks it is earlier than minPublishTime. A print whose predecessor is itself at or after
- *    the target has an earlier qualifying print before it; Pyth refuses it, and accepting it would
- *    let whoever settles choose among prints. When the source does not report prevPublishTime the
- *    check is left to Pyth (the simulation).
- * 3. **publishTime ≤ latest.** Pyth refuses a print after maxPublishTime. Under UMA's rule that is
- *    the cutoff: a first print after it means the 3-second window was empty, and the market can only
- *    settle at its stored price once the grace ends. Under the chain rule it is the UMA cutoff that
- *    caps the chain (`umaCutoffCap`), so a reopen print past an event UMA verified cannot count.
+ * The one-second update for `second` carrying `feedIds`; throws SettlementPrintError when the archive
+ * has none (absent) or cannot be asked (unreachable).
  */
-export function settlementPrintProblem(p: SettlementPrint, target: number, latest: number | null): string | null {
-  const feed = p.feedId.slice(0, 10);
-  if (p.publishTime < target) {
-    return `The archive's print for feed ${feed} was published at ${p.publishTime}, before its target ${target}: it is not the first print at or after the target.`;
-  }
-  if (p.prevPublishTime !== null && p.prevPublishTime >= target) {
-    return `Feed ${feed} also printed at ${p.prevPublishTime}, at or after the target ${target}, before the print the archive returned: that print is not the first at or after the target.`;
-  }
-  if (latest !== null && p.publishTime > latest) {
-    return `Feed ${feed}'s first print at or after ${target} was published at ${p.publishTime}, after the latest publish time allowed (${latest}).`;
-  }
-  return null;
-}
-
-/** The first print at or after `target` for `feedId`, checked by {@link settlementPrintProblem}; throws SettlementPrintError when there is none or it does not prove itself. */
-export async function firstPrintAtOrAfter(fetch: PrintFetcher, feedId: Hex, target: number, latest: number | null): Promise<SettlementPrint> {
-  let p: SettlementPrint | null;
+async function tickAt(fetch: TickFetcher, feedIds: readonly Hex[], second: number): Promise<ProUpdate> {
+  let u: ProUpdate | null;
   try {
-    p = await fetch(feedId, target);
+    u = await fetch(feedIds, second);
   } catch (e) {
     if (e instanceof SettlementPrintError) throw e;
-    throw new SettlementPrintError(`The price archive could not serve feed ${feedId.slice(0, 10)} at ${target}: ${e instanceof Error ? e.message : String(e)}`, feedId, target);
+    throw new SettlementPrintError(
+      `Pyth's archive could not serve feed ${short(feedIds[0]!)} at second ${second}: ${outsideText(e instanceof Error ? e.message : String(e))}`,
+      feedIds[0]!,
+      second,
+      "unreachable",
+    );
   }
-  if (!p) throw new SettlementPrintError(`The price archive has no print for feed ${feedId.slice(0, 10)} at or after ${target} yet.`, feedId, target);
-  const why = settlementPrintProblem(p, target, latest);
-  if (why) throw new SettlementPrintError(why, feedId, target);
+  if (!u) throw new SettlementPrintError(`Pyth's archive has no one-second update for feed ${short(feedIds[0]!)} at second ${second} yet.`, feedIds[0]!, second, "absent");
+  return u;
+}
+
+/** What UMA's rule settles a market with: the cutoff's update for every leg. */
+export interface TickProof {
+  /** The call's priceUpdate: one update carrying every leg, or one per leg. */
+  readonly updates: Hex[];
+  /** Each leg as the cutoff's update carries it, in `legs` order. */
+  readonly prints: SettlementPrint[];
+}
+
+/**
+ * UMA's rule: Pyth's one-second update stamped `cutoff` for every leg, whose price settles the
+ * market whenever it was generated (a quiet feed's update carries its last price forward). The legs
+ * are asked for together, so a composite settles with one update; when the archive does not answer
+ * for them together, each leg is asked for on its own and the proof is one update per leg.
+ *
+ * Throws SettlementPrintError when the archive has no such update, and when it carries no price above
+ * zero for a leg: the oracle refuses a price at or below zero, and the market can then only settle at
+ * its stored price once the grace ends.
+ */
+export async function tickPrints(fetch: TickFetcher, legs: readonly Hex[], cutoff: number): Promise<TickProof> {
+  let together: ProUpdate | null = null;
+  if (legs.length > 1) {
+    try {
+      const u = await fetch(legs, cutoff);
+      if (u && legs.every((l) => u.feeds.has(l.toLowerCase() as Hex))) together = u;
+    } catch {
+      // asked for one by one below, which reports what fails
+    }
+  }
+  const updates: Hex[] = [];
+  const prints: SettlementPrint[] = [];
+  for (const leg of legs) {
+    const p = settlementPrint(together ?? (await tickAt(fetch, [leg], cutoff)), leg, cutoff);
+    if (!p.priced) {
+      throw new SettlementPrintError(`Pyth's one-second update stamped at the cutoff (${cutoff}) carries no price for feed ${short(p.feedId)}: it cannot settle the market.`, p.feedId, cutoff, "absent");
+    }
+    if (p.price < 0n) {
+      throw new SettlementPrintError(
+        `Pyth's one-second update stamped at the cutoff (${cutoff}) carries a price below zero for feed ${short(p.feedId)}, which the oracle refuses: it cannot settle the market.`,
+        p.feedId,
+        cutoff,
+        "absent",
+      );
+    }
+    prints.push(p);
+    if (!updates.includes(p.update)) updates.push(p.update);
+  }
+  return { updates, prints };
+}
+
+/** How far a chain sample may be searched for. */
+export interface ChainSearchBounds {
+  /** The latest second a sample's update may be stamped with (the UMA cutoff that caps the chain); null when unbounded. */
+  readonly latest: number | null;
+  /** The newest second the archive can hold an update for: the present. */
+  readonly newest: number;
+}
+
+/**
+ * Whether `p` carries a price generated at or after second `target` (BazaarOracle._pricedSince):
+ * true for the update a sample is taken from, false for one that shows the feed quiet (a price
+ * carried forward from before the target). Throws SettlementPrintError where the oracle refuses the
+ * update as incomplete: it was requested without the feed update timestamp (unreachable: the archive
+ * left out a property asked for), it carries no price, or it carries a price without a generation
+ * time (both absent: Pyth's own data). Such an update does not say when the feed last priced, so it
+ * cannot show the feed quiet.
+ */
+export function generatedAtOrAfter(p: SettlementPrint, target: number): boolean {
+  if ((p.included & CHAIN_PROPERTIES) !== CHAIN_PROPERTIES) {
+    throw new SettlementPrintError(
+      `Pyth's one-second update for second ${p.tick} carries feed ${short(p.feedId)} without its feed update timestamp: it proves nothing about the target ${target}.`,
+      p.feedId,
+      target,
+      "unreachable",
+    );
+  }
+  if (!p.priced) {
+    throw new SettlementPrintError(`Pyth's one-second update for second ${p.tick} carries no price for feed ${short(p.feedId)}: it proves nothing about the target ${target}.`, p.feedId, target, "absent");
+  }
+  if (p.generatedUs === 0n) {
+    throw new SettlementPrintError(
+      `Pyth's one-second update for second ${p.tick} carries a price for feed ${short(p.feedId)} without saying when it was generated: it proves nothing about the target ${target}.`,
+      p.feedId,
+      target,
+      "absent",
+    );
+  }
+  return p.generatedUs >= BigInt(target) * MICROS_PER_SECOND;
+}
+
+/** `p`, the update a sample is taken from, unless its price is one the oracle refuses to settle at (at or below zero). */
+function samplePrice(p: SettlementPrint, target: number): SettlementPrint {
+  if (p.price <= 0n) {
+    throw new SettlementPrintError(
+      `Pyth's one-second update for second ${p.tick} gives feed ${short(p.feedId)} a price at or below zero for the target ${target}, which the oracle refuses: no chain can be proven.`,
+      p.feedId,
+      target,
+      "absent",
+    );
+  }
   return p;
 }
 
-/** UMA's rule: one print per leg, each that leg's first at or after `target` (the cutoff − 3 s), published no later than `latest` (the cutoff). */
-export async function windowPrints(fetch: PrintFetcher, legs: readonly Hex[], target: number, latest: number): Promise<SettlementPrint[]> {
-  return Promise.all(legs.map((leg) => firstPrintAtOrAfter(fetch, leg, target, latest)));
+/**
+ * One leg of one chain sample: the earliest one-second update carrying a price for `feedId`
+ * generated at or after `target`, with what proves it is the earliest (BazaarOracle._sampleLeg).
+ *
+ * When the update stamped `target` carries such a price, it is its own proof and is returned alone.
+ * Otherwise the feed was quiet at the target: its updates carry the earlier price forward until it
+ * produces a new one, and since the generation time never goes backwards from one second to the
+ * next, the first second whose update carries a price generated at or after the target is found by
+ * doubling the step from the target and then bisecting. Two updates are returned, in the order the
+ * oracle reads them: that second's predecessor, still quiet, and that second's.
+ *
+ * Throws SettlementPrintError when the archive lacks an update the search needs, when the feed has
+ * produced no such price up to `bounds.newest` (the sample does not exist yet), when the sample
+ * would be stamped after `bounds.latest` (no chain exists under that bound), and when the sample's
+ * price is at or below zero (the oracle refuses it).
+ */
+export async function chainSample(fetch: TickFetcher, feedId: Hex, target: number, bounds: ChainSearchBounds): Promise<SettlementPrint[]> {
+  const leg = feedId.toLowerCase() as Hex;
+  const { latest, newest } = bounds;
+  if (latest !== null && target > latest) {
+    throw new SettlementPrintError(`The sample's target ${target} lies after the latest second a sample may be stamped with (${latest}): no chain exists under that bound.`, leg, target, "absent");
+  }
+  if (target > newest) throw new SettlementPrintError(`The sample's target ${target} has not been reached yet: its update does not exist.`, leg, target, "absent");
+  const at = async (second: number) => settlementPrint(await tickAt(fetch, [leg], second), leg, second);
+  const first = await at(target);
+  if (generatedAtOrAfter(first, target)) return [samplePrice(first, target)];
+
+  // `quiet` is the last second known to carry no price generated at or after the target, `live` the
+  // first known to carry one.
+  const limit = latest === null ? newest : Math.min(latest, newest);
+  let quiet = first;
+  let live: SettlementPrint | null = null;
+  for (let step = 1; live === null; step *= 2) {
+    if (quiet.tick >= limit) {
+      throw new SettlementPrintError(
+        latest !== null && limit === latest
+          ? `Feed ${short(leg)} produced no price from ${target} up to the latest second a sample may be stamped with (${latest}): no chain exists under that bound.`
+          : `Feed ${short(leg)} has produced no price since ${target} yet (looked up to ${limit}): its sample does not exist.`,
+        leg,
+        target,
+        "absent",
+      );
+    }
+    const p = await at(Math.min(quiet.tick + step, limit));
+    if (generatedAtOrAfter(p, target)) live = p;
+    else quiet = p;
+  }
+  while (live.tick - quiet.tick > 1) {
+    const p = await at(quiet.tick + Math.floor((live.tick - quiet.tick) / 2));
+    if (generatedAtOrAfter(p, target)) live = p;
+    else quiet = p;
+  }
+  return [quiet, samplePrice(live, target)];
+}
+
+/** What the chain rule settles a market with. */
+export interface ChainProof {
+  /** The call's priceUpdate: sample by sample, the base leg's one or two updates, then the quote leg's. */
+  readonly updates: Hex[];
+  /** The same updates as read, in the same order. */
+  readonly prints: SettlementPrint[];
+  /** Each sample's target. */
+  readonly targets: number[];
+  /** The second each sample is stamped with: for a composite, the later of its two legs'. */
+  readonly ticks: number[];
 }
 
 /**
  * The chain rule's sample set: `count` samples, the first targeting `firstTarget` (the cutoff), each
- * later one targeting the previous sample's publish time plus `spacing` (for a composite, the later
- * of its two legs'), every print published no later than `latest` when bounded. Ordered sample by
- * sample, legs in `legs` order. The targets depend on the prints, so the samples are fetched in
- * sequence; the legs of one sample in parallel.
+ * later one targeting `spacing` seconds past the second the sample before is stamped with (for a
+ * composite, the later of its two legs'), every sample stamped no later than `bounds.latest` when
+ * bounded. Each leg of each sample is found and proven by {@link chainSample}. The targets depend on
+ * the samples, so the samples are searched in sequence; the legs of one sample in parallel.
  */
 export async function chainPrints(
-  fetch: PrintFetcher,
+  fetch: TickFetcher,
   legs: readonly Hex[],
   firstTarget: number,
-  latest: number | null,
+  bounds: ChainSearchBounds,
   count = SETTLEMENT_SAMPLE_COUNT,
   spacing = SETTLEMENT_SAMPLE_SPACING,
-): Promise<{ prints: SettlementPrint[]; targets: number[] }> {
+): Promise<ChainProof> {
   const prints: SettlementPrint[] = [];
   const targets: number[] = [];
+  const ticks: number[] = [];
   let target = firstTarget;
   for (let k = 0; k < count; k++) {
     targets.push(target);
-    const sample = await Promise.all(legs.map((leg) => firstPrintAtOrAfter(fetch, leg, target, latest)));
-    prints.push(...sample);
-    target = Math.max(...sample.map((p) => p.publishTime)) + spacing;
+    const t = target;
+    const sample = await Promise.all(legs.map((leg) => chainSample(fetch, leg, t, bounds)));
+    let tick = 0;
+    for (const proof of sample) {
+      prints.push(...proof);
+      tick = Math.max(tick, proof[proof.length - 1]!.tick);
+    }
+    ticks.push(tick);
+    target = tick + spacing;
   }
-  return { prints, targets };
+  return { updates: prints.map((p) => p.update), prints, targets, ticks };
 }
 
-/** Which rule a terminateScheduledPair call settles under: UMA's window print, the chain's median, or the stored-price last resort. */
-export type SettleUnder = "window" | "chain" | "storedPrice";
+/** Which rule a terminateScheduledPair call settles under: UMA's cutoff update, the chain's median, or the stored-price last resort. */
+export type SettleUnder = "tick" | "chain" | "storedPrice";
+
+/**
+ * Why a candidate failed: the archive showed no usable update exists (`absent`), could not be asked or
+ * relied on (`unreachable`), or the oracle or the contract refused the set (`refused`).
+ */
+export type SettlementFailure = SettlementPrintFailure | "refused";
+
+/**
+ * When terminateScheduledPair offers the stored-price call once its last resort is open, as a call
+ * that settles the market irreversibly: `whenAbsent` only when every proven set failed as absent and
+ * the archive answered a control request (ETH/USD a minute ago), so its "none" is believed; `always`
+ * whenever no proven set is accepted, for a caller who has decided; `never` not at all.
+ */
+export type StoredPricePolicy = "whenAbsent" | "always" | "never";
 
 /** One candidate the builder tried. */
 export interface SettlementAttempt {
   readonly under: SettleUnder;
   /** True when the contract accepted it in simulation. */
   readonly ok: boolean;
-  /** Why it was not used (a missing or unprovable print, the oracle's or the contract's refusal), or "" when ok. */
+  /** Why it was not used (a missing update or an unprovable sample, the oracle's or the contract's refusal), or "" when ok. */
   readonly reason: string;
+  /** What kind of failure that was (see {@link SettlementFailure}); null when ok. */
+  readonly kind: SettlementFailure | null;
   /** The oracle's or the contract's decoded refusal, when one reverted. */
   readonly error: DecodedError | null;
   /**
-   * The price it would fix (BAZAAR precision): what the oracle returned when it verified the prints
-   * (fetchFirstPriceAtOrAfter or fetchChainedMedian, called as the terminator calls it), or the
-   * stored price for the fallback; null when the prints were not verified.
+   * The price it would fix (BAZAAR precision): what the oracle returned when it verified the updates
+   * (fetchPriceAtTick or fetchChainedMedian, called as the terminator calls it), or the stored price
+   * for the fallback; null when the updates were not verified.
    */
   readonly price: bigint | null;
 }
@@ -1421,11 +1623,13 @@ export interface ScheduledSettlementPlan {
   /** The call the contract accepts, or null when no candidate settles the market yet. */
   readonly call: CostedCall | null;
   readonly under: SettleUnder | null;
-  /** The prints the call carries, in calldata order. */
+  /** The call's priceUpdate. */
+  readonly updates: readonly Hex[];
+  /** The updates as read, feed by feed: under the chain rule in calldata order, under UMA's rule one per leg. */
   readonly prints: readonly SettlementPrint[];
   /**
    * The settlement price the call fixes (BAZAAR precision): the price the oracle returned for its
-   * prints, or the market's stored price under `storedPrice`; null when there is no call.
+   * updates, or the market's stored price under `storedPrice`; null when there is no call.
    */
   readonly settlementPrice: bigint | null;
   readonly attempts: readonly SettlementAttempt[];
@@ -1433,63 +1637,101 @@ export interface ScheduledSettlementPlan {
   readonly reason: string | null;
   /** When to try again, when known (the verdict, the stored-price fallback). */
   readonly retryAt: number | null;
+  /**
+   * Why the stored-price call is not offered although its last resort is open (see
+   * {@link StoredPricePolicy}): `attempts` then say which sets failed and how. Null when it is offered,
+   * and when it is not open.
+   */
+  readonly storedPriceWithheld: string | null;
 }
 
 const UNDER_TEXT: Readonly<Record<SettleUnder, string>> = {
-  window: "UMA's rule (the first print in the 3 seconds before the cutoff)",
-  chain: "the chain rule (the median of five chained prints)",
+  tick: "UMA's rule (the one-second update stamped at the cutoff)",
+  chain: "the chain rule (the median of five chained prices)",
   storedPrice: "the stored price (the last resort is open)",
 };
 
+/** Seconds before the chain's present at which the archive is asked for its control update, in the order tried. */
+const CONTROL_SECONDS_BACK = [60, 61, 62];
+
+/**
+ * Whether the archive behind `fetch` works: it serves a one-second update carrying a price for
+ * ETH/USD, which Pyth prices around the clock, at one of a few seconds a minute before `now`.
+ */
+async function archiveAnswers(fetch: TickFetcher, now: number): Promise<boolean> {
+  for (const back of CONTROL_SECONDS_BACK) {
+    const second = now - back;
+    try {
+      const u = await fetch([ETH_USD_FEED], second);
+      if (u !== null && settlementPrint(u, ETH_USD_FEED, second).price > 0n) return true;
+    } catch {
+      // not this second: the next one, until the tries run out
+    }
+  }
+  return false;
+}
+
 /**
  * Build `terminateScheduledPair(pair, priceUpdate)`: fix a scheduled market's settlement price with
- * archived Pyth prints that prove themselves, fetched for the rule that applies, and simulated as
- * `from` so the returned call is one the contract accepts.
+ * Pyth's archived one-second updates, fetched for the rule that applies, and simulated as `from` so
+ * the returned call is one the contract accepts.
  *
- * It reads `settlementRule(pair)`, then fetches, per leg, the first print at or after each target
- * from the price source's historical route (or `fetchPrint`), checking each with
- * {@link settlementPrintProblem}:
- * - `window` (UMA's rule): one print per leg at or after `firstTarget` (the cutoff − 3 s), published
- *   no later than the cutoff. Fee: `getUpdateFee`.
- * - `chain`: five samples, each target the previous sample's later leg + 600 s, every print no
- *   later than `latestPublishTs` (the UMA cap, when there is one). Fee: `getSampleSetFee`.
+ * It reads `settlementRule(pair)`, then fetches from the price source's `atTick` (or `fetchTick`):
+ * - `tick` (UMA's rule): the update stamped at the cutoff for every leg ({@link tickPrints}), whose
+ *   price settles the market.
+ * - `chain`: five samples ({@link chainPrints}), each the earliest update carrying a price generated
+ *   at or after its target, the next target 600 s past the sample's second (the later leg's), every
+ *   sample stamped no later than `latestPublishTs` (the UMA cap, when there is one).
  * - A claim-backed vote whose verdict nobody has recorded may settle under either rule, because the
  *   call records the verdict itself (UMA's rule if the DVM upheld the claim, the chain rule if not).
  *   The builder first simulates OOv3's `settleAndGetAssertionResult` (uma's `previewSettlement`) to
  *   see whether and how the DVM ruled, and builds that rule's set (an upheld claim's UMA rule has no
  *   stored-price fallback yet: its grace starts at this recording). When the verdict cannot be
  *   previewed, both sets are built and each is simulated, and the one the contract accepts is
- *   returned. Building the window set here, rather than first recording an upheld verdict on its
- *   own, also avoids starting its 12-hour grace before the print is in hand. (Trying the other
+ *   returned. Building the cutoff's set here, rather than first recording an upheld verdict on its
+ *   own, also avoids starting its 12-hour grace before the update is in hand. (Trying the other
  *   rule's set blindly is avoided once the verdict is known: past a last resort the contract would
  *   accept it by falling back to the stored price, and the call would be mislabelled.)
- * - Past `lastResortTs`, a call with no prints settles at the stored price; it is offered only when no
- *   proven set is available.
+ * - Past `lastResortTs`, a call with no updates settles at the stored price, for good. It is offered
+ *   only when no proven set is accepted, and by default (`storedPrice: "whenAbsent"`) only when every
+ *   set failed because Pyth's archive holds no usable update and the archive is shown to work: a
+ *   request that timed out, was refused, or reached the wrong URL must not settle a market at its
+ *   stored price while a proven price exists. Otherwise the plan says why it is withheld
+ *   (`storedPriceWithheld`), so the caller can try again later or decide with `storedPrice: "always"`.
  *
- * Every print set is then verified the way the terminator verifies it: an eth_call (as `from`, with
- * the fee) of the pair's oracle's `fetchFirstPriceAtOrAfter` (UMA's rule) or `fetchChainedMedian`
- * (the chain rule), with the arguments the terminator passes. Only a set that call accepts is
- * offered as a proven-print settlement, and the price it returns is shown (`settlementPrice`). This
- * matters once the fallback is open: the terminator then catches a refused set and settles at the
- * stored price instead, so the contract's simulation alone would accept prints Pyth refuses (an
- * expired guardian set, a wrong print) and the call would be labelled with a price it does not fix.
- * A refused set is reported in `attempts`, saying when a call carrying it would settle at the stored
- * price, and the stored-price call (no prints, no fee) is offered in its place when it is open.
+ * The fee for either set is `getUpdateFee(updates.length)` on the pair's oracle: Pyth's fee per
+ * update, each update verified in a call of its own.
+ *
+ * Every set is then verified the way the terminator verifies it: an eth_call (as `from`, with the
+ * fee) of the pair's oracle's `fetchPriceAtTick` (UMA's rule) or `fetchChainedMedian` (the chain
+ * rule), with the arguments the terminator passes. Only a set that call accepts is offered as a
+ * proven settlement, and the price it fixes is shown (`settlementPrice`). This matters once the
+ * fallback is open: the terminator then catches a refused set and settles at the stored price
+ * instead, so the contract's simulation alone would accept updates Pyth refuses (a signer it has
+ * retired, a wrong update) and the call would be labelled with a price it does not fix. A refused set
+ * is reported in `attempts`, saying when a call carrying it would settle at the stored price.
  *
  * The call sends the Pyth fee as `value` (any excess is refunded) and pays nothing back; the
  * returned `costs` carry the fee. Refused up front: an unregistered or fixed market, one with no
  * cutoff, and one whose cutoff has not passed yet. Otherwise a plan with `call: null` says why, and
  * when to try again if that is known.
  *
+ * @param args.pair The market to settle.
  * @param args.from The account that will send it: the simulation runs as it (the fee is sent as ETH).
- * @param args.fetchPrint Overrides the price source (tests, or a custom archive).
+ * @param args.fetchTick Overrides the price source (tests, or a custom archive).
+ * @param args.estimateGas Also estimate the call's gas in the simulation; default false.
+ * @param args.storedPrice When the stored-price call is offered once its last resort is open; default "whenAbsent" ({@link StoredPricePolicy}).
  */
 export async function terminateScheduledPair(
   ctx: BazaarContext,
-  args: { pair: Address; from: Address; fetchPrint?: PrintFetcher; estimateGas?: boolean },
+  args: { pair: Address; from: Address; fetchTick?: TickFetcher; estimateGas?: boolean; storedPrice?: StoredPricePolicy },
 ): Promise<ScheduledSettlementPlan> {
   const pair = asAddress("pair", args.pair);
   const from = asAddress("from", args.from);
+  const policy = args.storedPrice ?? "whenAbsent";
+  if (policy !== "whenAbsent" && policy !== "always" && policy !== "never") {
+    throw new InputError("storedPrice", 'It is "whenAbsent", "always" or "never".');
+  }
   const [r, now] = await Promise.all([
     readMany(ctx, [
       { to: ctx.terminator, codec: T(), fn: "isPair", args: [pair] },
@@ -1517,27 +1759,30 @@ export async function terminateScheduledPair(
   const pairOracle = getAddress(r[6] as Address);
   const storedSpot = (r[7] as { spotPrice: bigint }).spotPrice;
   const stored = storedSpot === 0n ? NEVER_PRICED_SETTLEMENT_PRICE : storedSpot;
-  const fetch = args.fetchPrint ?? printFetcher(ctx.prices);
-  const feeds = await pairFeeds(ctx, pair);
 
   const base = { pair, now, scheduledTerminationTs: cutoff, rule };
   if (rule.key === "nothing") {
-    return { ...base, call: null, under: null, prints: [], settlementPrice: null, attempts: [], reason: rule.meaning, retryAt: null };
+    return { ...base, call: null, under: null, updates: [], prints: [], settlementPrice: null, attempts: [], reason: rule.meaning, retryAt: null, storedPriceWithheld: null };
   }
+  // The source is resolved when a set is fetched, so that under "always" the stored-price call can be
+  // built without one; under the other policies a missing source is refused here, as nothing could be
+  // settled without it.
+  if (!args.fetchTick && policy !== "always") tickFetcher(ctx.prices);
+  const fetch: TickFetcher = args.fetchTick ?? ((ids, second) => tickFetcher(ctx.prices)(ids, second));
+  const feeds = await pairFeeds(ctx, pair);
 
   // Which rule the call settles under. settlementRule cannot see a verdict UMA's DVM has reached on
   // the claim behind a vote until someone records it, but the call records it itself and settles
   // under it: UMA's rule for an upheld claim, the chain rule otherwise.
-  let rules: ("window" | "chain")[] = rule.key === "window" ? ["window"] : rule.key === "chain" ? ["chain"] : [];
-  let windowAt = { target: rule.firstTarget ?? cutoff - MAX_PRICE_STALENESS, latest: rule.latestPublishTs ?? cutoff };
+  let rules: ("tick" | "chain")[] = rule.key === "tick" ? ["tick"] : rule.key === "chain" ? ["chain"] : [];
   let chainAt = { first: rule.firstTarget ?? cutoff, latest: rule.latestPublishTs };
   let lastResort = rule.lastResortTs;
   let recordsVerdict = false;
   if (!isZero32(scheduleId)) {
     const vote = toInsurerProposal(scheduleId, await readOne(ctx, ctx.terminator, T(), "insurerProposals", scheduleId), now);
     // Undisputed past its liveness, the claim reads as upheld (UMA's rule) and the call records it.
-    if (vote?.claimBacked && vote.verdict === 0 && rule.key === "window") recordsVerdict = true;
-    if (vote?.claimBacked && vote.verdict === 0 && rule.key !== "window") {
+    if (vote?.claimBacked && vote.verdict === 0 && rule.key === "tick") recordsVerdict = true;
+    if (vote?.claimBacked && vote.verdict === 0 && rule.key !== "tick") {
       const oo = await assertionOracle(ctx, scheduleId, "terminator");
       const st = statusOf(await getAssertion(ctx, oo, scheduleId), now);
       if (rule.key === "awaitVerdict" && st.phase === "liveness") {
@@ -1545,11 +1790,13 @@ export async function terminateScheduledPair(
           ...base,
           call: null,
           under: null,
+          updates: [],
           prints: [],
           settlementPrice: null,
           attempts: [],
           reason: `The vote that set the cutoff waits for UMA's verdict on its claim, which is known when the claim's liveness ends at ${timeText(st.canSettleAt!)}.`,
           retryAt: st.canSettleAt,
+          storedPriceWithheld: null,
         };
       }
       // A disputed claim: simulate settling it to see whether, and how, the DVM has ruled.
@@ -1557,8 +1804,7 @@ export async function terminateScheduledPair(
       const capped = cap;
       if (pv?.result === true) {
         // Upheld: UMA's rule at the cutoff, its grace counted from this recording, so no fallback yet.
-        rules = ["window"];
-        windowAt = { target: cutoff - MAX_PRICE_STALENESS, latest: cutoff };
+        rules = ["tick"];
         lastResort = null;
         recordsVerdict = true;
       } else if (pv?.result === false) {
@@ -1568,8 +1814,7 @@ export async function terminateScheduledPair(
         recordsVerdict = true;
       } else if (rule.key === "awaitVerdict") {
         // The verdict could not be previewed: build both sets and let the contract say which it takes.
-        rules = ["window", "chain"];
-        windowAt = { target: cutoff - MAX_PRICE_STALENESS, latest: cutoff };
+        rules = ["tick", "chain"];
         chainAt = { first: cutoff, latest: capped };
         lastResort = null;
         recordsVerdict = true;
@@ -1577,14 +1822,17 @@ export async function terminateScheduledPair(
     }
   }
 
-  type Candidate = { under: SettleUnder; build: () => Promise<{ prints: SettlementPrint[]; fee: bigint }> };
+  // Pyth's fee for `n` updates, as the terminator reads it: from the pair's own oracle.
+  const feeFor = (n: number) => (n === 0 ? Promise.resolve(0n) : readOne<bigint>(ctx, pairOracle, oracleCodec(), "getUpdateFee", BigInt(n)));
+  type Built = { updates: Hex[]; prints: SettlementPrint[]; fee: bigint };
+  type Candidate = { under: SettleUnder; build: () => Promise<Built> };
   const candidates: Candidate[] = [];
-  if (rules.includes("window")) {
+  if (rules.includes("tick")) {
     candidates.push({
-      under: "window",
+      under: "tick",
       build: async () => {
-        const prints = await windowPrints(fetch, feeds.legs, windowAt.target, windowAt.latest);
-        return { prints, fee: await updateFee(ctx, prints.map((p) => p.update)) };
+        const w = await tickPrints(fetch, feeds.legs, cutoff);
+        return { updates: w.updates, prints: w.prints, fee: await feeFor(w.updates.length) };
       },
     });
   }
@@ -1592,32 +1840,28 @@ export async function terminateScheduledPair(
     candidates.push({
       under: "chain",
       build: async () => {
-        const { prints } = await chainPrints(fetch, feeds.legs, chainAt.first, chainAt.latest);
-        const updates = prints.map((p) => p.update);
-        const fee = await readOne<bigint>(ctx, ctx.oracle, oracleCodec(), "getSampleSetFee", feeds.baseFeedId, updates);
-        return { prints, fee };
+        const c = await chainPrints(fetch, feeds.legs, chainAt.first, { latest: chainAt.latest, newest: now });
+        return { updates: c.updates, prints: c.prints, fee: await feeFor(c.updates.length) };
       },
     });
   }
-  // Past the last resort an empty call settles at the stored price; offered only after the proven sets.
-  if (rules.length === 1 && lastResort !== null && now > lastResort) {
-    candidates.push({ under: "storedPrice", build: async () => ({ prints: [], fee: 0n }) });
-  }
+  // Past the last resort an empty call settles at the stored price; tried only after the proven sets.
+  const storedOpen = rules.length === 1 && lastResort !== null && now > lastResort;
   // Whether the terminator, given a set the oracle refuses under `under`, settles at the stored price
   // instead of reverting (its try/catch past the grace or the last resort).
-  const fallsBack = (under: "window" | "chain"): boolean => {
+  const fallsBack = (under: "tick" | "chain"): boolean => {
     if (rules.length === 2) return under === "chain" && now > chainLastResort(cutoff, cap);
     return lastResort !== null && now > lastResort;
   };
-  // The oracle call the terminator makes with these prints, with its arguments, as `from` with the fee.
+  // The oracle call the terminator makes with these updates, with its arguments, as `from` with the fee.
   const U64_MAX = (1n << 64n) - 1n;
   const chainMax = capRaw === 0n || capRaw > U64_MAX ? U64_MAX : capRaw; // _insurerSettlementBounds' latestPublishTs
-  const prove = async (under: "window" | "chain", updates: Hex[], fee: bigint): Promise<{ price: bigint } | { why: string; error: DecodedError | null }> => {
+  const prove = async (under: "tick" | "chain", updates: Hex[], fee: bigint): Promise<{ price: bigint } | { why: string; error: DecodedError | null }> => {
     const oc = oracleCodec();
-    const fn = under === "window" ? "fetchFirstPriceAtOrAfter" : "fetchChainedMedian";
+    const fn = under === "tick" ? "fetchPriceAtTick" : "fetchChainedMedian";
     const data =
-      under === "window"
-        ? oc.encode(fn, feeds.baseFeedId, updates, BigInt(cutoff - MAX_PRICE_STALENESS), BigInt(cutoff))
+      under === "tick"
+        ? oc.encode(fn, feeds.baseFeedId, updates, BigInt(cutoff))
         : oc.encode(fn, feeds.baseFeedId, updates, BigInt(cutoff), chainMax, BigInt(SETTLEMENT_SAMPLE_SPACING), BigInt(SETTLEMENT_SAMPLE_COUNT));
     let ret: Hex;
     try {
@@ -1627,7 +1871,7 @@ export async function terminateScheduledPair(
       if (!rpc) throw e;
       const error = decodeError(rpc.revertData);
       // No revert data: the node refused the call itself (say, `from` cannot cover the fee); say what it said.
-      return { why: !rpc.revertData || rpc.revertData === "0x" ? rpc.rpcMessage : error.message, error };
+      return { why: !rpc.revertData || rpc.revertData === "0x" ? outsideText(rpc.rpcMessage) : error.message, error };
     }
     try {
       return { price: oc.decode<bigint>(fn, ret) };
@@ -1637,45 +1881,76 @@ export async function terminateScheduledPair(
   };
 
   const attempts: SettlementAttempt[] = [];
-  for (const c of candidates) {
-    let built: { prints: SettlementPrint[]; fee: bigint };
+  /** Build, verify and simulate one candidate: the plan when the contract accepts it, else null with its attempt recorded. */
+  const settle = async (c: Candidate): Promise<ScheduledSettlementPlan | null> => {
+    let built: Built;
     try {
       built = await c.build();
     } catch (e) {
       if (!(e instanceof SettlementPrintError)) throw e;
-      attempts.push({ under: c.under, ok: false, reason: e.message, error: null, price: null });
-      continue;
+      attempts.push({ under: c.under, ok: false, reason: e.message, kind: e.kind, error: null, price: null });
+      return null;
     }
     let price = stored;
     let fallback = false;
     if (c.under !== "storedPrice") {
       fallback = fallsBack(c.under);
-      const proof = await prove(c.under, built.prints.map((p) => p.update), built.fee);
+      const proof = await prove(c.under, built.updates, built.fee);
       if (!("price" in proof)) {
-        const refused = `The oracle would not verify these prints (${proof.why}).`;
+        const refused = `The oracle would not verify these updates (${proof.why}).`;
         attempts.push({
           under: c.under,
           ok: false,
           reason: fallback
             ? `${refused} The stored-price fallback is open, so a call carrying them would settle at the market's stored price (${priceText(stored)}) instead: they are not offered as a proven settlement.`
             : `${refused} The terminator would refuse them too.`,
+          kind: "refused",
           error: proof.error,
           price: null,
         });
-        continue;
+        return null;
       }
       price = proof.price;
     }
-    const call = scheduledCall(ctx, pair, from, c.under, built.prints, built.fee, cutoff, recordsVerdict, price, fallback ? stored : null);
+    const call = scheduledCall(ctx, pair, from, c.under, built.updates, built.fee, cutoff, recordsVerdict, price, fallback ? stored : null);
     const sim = await simulate(ctx, call, { from, estimateGas: args.estimateGas ?? false });
     if (sim.ok) {
-      attempts.push({ under: c.under, ok: true, reason: "", error: null, price });
-      return { ...base, call, under: c.under, prints: built.prints, settlementPrice: price, attempts, reason: null, retryAt: null };
+      attempts.push({ under: c.under, ok: true, reason: "", kind: null, error: null, price });
+      return { ...base, call, under: c.under, updates: built.updates, prints: built.prints, settlementPrice: price, attempts, reason: null, retryAt: null, storedPriceWithheld: null };
     }
-    attempts.push({ under: c.under, ok: false, reason: `The contract refused it: ${sim.error?.message ?? "reverted"}`, error: sim.error, price });
+    attempts.push({ under: c.under, ok: false, reason: `The contract refused it: ${sim.error?.message ?? "reverted"}`, kind: "refused", error: sim.error, price });
+    return null;
+  };
+  for (const c of candidates) {
+    const plan = await settle(c);
+    if (plan) return plan;
   }
 
-  let reason = attempts.map((a) => `Under ${UNDER_TEXT[a.under]}: ${a.reason}`).join(" ") || "No settlement prints are available yet.";
+  /** Why the open stored-price call is not offered, or null to offer it (see StoredPricePolicy). */
+  const withholdStoredPrice = async (): Promise<string | null> => {
+    if (policy === "never") return 'storedPrice is "never"';
+    if (policy === "always") return null;
+    const doubtful = attempts.filter((a) => a.kind !== "absent");
+    if (doubtful.length > 0) {
+      return `a proven settlement may still exist (${doubtful.map((a) => `${a.under}: ${a.kind}`).join(", ")}): try again later, or pass storedPrice: "always" to settle at the stored price anyway`;
+    }
+    if (await archiveAnswers(fetch, now)) return null;
+    // The archive answered nothing it must hold, so its "none" says nothing either.
+    for (let i = 0; i < attempts.length; i++) {
+      attempts[i] = { ...attempts[i]!, kind: "unreachable", reason: `${attempts[i]!.reason} (Not believed: the archive did not serve ETH/USD's one-second update from a minute ago either.)` };
+    }
+    return `Pyth's archive did not serve ETH/USD's one-second update from a minute ago, so its lack of a settlement update is not believed: try again later, or pass storedPrice: "always" to settle at the stored price anyway`;
+  };
+  let withheld: string | null = null;
+  if (storedOpen) {
+    withheld = await withholdStoredPrice();
+    if (withheld === null) {
+      const plan = await settle({ under: "storedPrice", build: async () => ({ updates: [], prints: [], fee: 0n }) });
+      if (plan) return plan;
+    }
+  }
+
+  let reason = attempts.map((a) => `Under ${UNDER_TEXT[a.under]}: ${a.reason}`).join(" ") || "No settlement updates are available yet.";
   let retryAt: number | null = null;
   if (rule.key === "awaitVerdict") {
     reason += ` The vote waits for UMA's verdict on its claim until ${timeText(rule.verdictDeadline!)}.`;
@@ -1684,7 +1959,8 @@ export async function terminateScheduledPair(
     reason += ` The stored-price fallback opens after ${timeText(lastResort)}.`;
     retryAt = lastResort + 1;
   }
-  return { ...base, call: null, under: null, prints: [], settlementPrice: null, attempts, reason, retryAt };
+  if (withheld !== null) reason += ` The stored-price fallback is open but not offered: ${withheld}.`;
+  return { ...base, call: null, under: null, updates: [], prints: [], settlementPrice: null, attempts, reason, retryAt, storedPriceWithheld: withheld };
 }
 
 /** A settlement price (BAZAAR precision) as a decimal, exactly. */
@@ -1702,40 +1978,36 @@ function scheduledCall(
   pair: Address,
   from: Address,
   under: SettleUnder,
-  prints: readonly SettlementPrint[],
+  updates: readonly Hex[],
   fee: bigint,
   cutoff: number,
   recordsVerdict: boolean,
-  /** The price it fixes: the oracle's answer for the prints, or the stored price. */
+  /** The price it fixes: the oracle's answer for the updates, or the stored price. */
   price: bigint,
   /** The stored price, when the fallback is open behind a proven set. */
   fallback: bigint | null,
 ): CostedCall {
   const notes: string[] = [];
-  if (under === "window") {
+  if (under === "tick") {
     notes.push(
-      `Settles at ${priceText(price)}: the first Pyth print in [${cutoff - MAX_PRICE_STALENESS}, ${cutoff}], one per feed leg, which the oracle verified (fetchFirstPriceAtOrAfter, as the terminator calls it).`,
+      `Settles at ${priceText(price)}: the price in Pyth's one-second update stamped at the cutoff (${cutoff}), which the oracle verified (fetchPriceAtTick, as the terminator calls it).`,
     );
   }
   if (under === "chain") {
     notes.push(
-      `Settles at ${priceText(price)}: the median of five Pyth prints chained from the cutoff, each the first at least 10 minutes after the one before, which the oracle verified (fetchChainedMedian, as the terminator calls it).`,
+      `Settles at ${priceText(price)}: the median of five Pyth prices chained from the cutoff, each from the earliest one-second update carrying a price generated at least 10 minutes after the update before, which the oracle verified (fetchChainedMedian, as the terminator calls it).`,
     );
   }
-  if (under === "storedPrice") notes.push(`Carries no prints: the stored-price fallback is open, so the market settles at its last stored price, ${priceText(price)}.`);
+  if (under === "storedPrice") notes.push(`Carries no updates: the stored-price fallback is open, so the market settles at its last stored price, ${priceText(price)}.`);
   if (fallback !== null) {
-    notes.push(`The stored-price fallback is open: if Pyth refused these prints when the call runs, the market would settle at its stored price (${priceText(fallback)}) instead, and the fee would be refunded.`);
+    notes.push(`The stored-price fallback is open: if Pyth refused these updates when the call runs, the market would settle at its stored price (${priceText(fallback)}) instead, and the fee would be refunded.`);
   }
   notes.push("Fixing the price opens the settlement window: positions settle at it, then finalizeTermination opens withdrawals.");
   if (recordsVerdict) notes.push("This call also records UMA's verdict on the claim behind the vote that set the cutoff.");
   return {
     action: "terminateScheduledPair",
     to: ctx.terminator,
-    data: T().encode(
-      "terminateScheduledPair",
-      pair,
-      prints.map((p) => p.update),
-    ),
+    data: T().encode("terminateScheduledPair", pair, updates),
     value: fee,
     from,
     summary:
@@ -1752,7 +2024,7 @@ function scheduledCall(
               unit: "ETH",
               token: null,
               payee: ctx.oracle,
-              returned: "Spent verifying the prints; anything sent beyond it is refunded.",
+              returned: "Spent verifying the updates; anything sent beyond it is refunded.",
               contingent: false,
             },
           ]

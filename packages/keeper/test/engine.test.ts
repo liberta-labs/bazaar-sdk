@@ -1,6 +1,6 @@
 /**
  * The engine around the jobs: the tick and the print path share locks (never a double send), stop()
- * is prompt and finishes what is in flight, the status file keeps the Python's keys, markets resolve
+ * is prompt and finishes what is in flight, the status file keeps its keys, markets resolve
  * by label, address or pair id, events reach listeners, and keeper.run's one-shot calls.
  */
 
@@ -192,6 +192,20 @@ describe("start and stop", () => {
     await f.k.close();
   });
 
+  it("warns at start while prices.checkSigners is off, and only then", async () => {
+    for (const checkSigners of [false, true]) {
+      logged.length = 0;
+      const f = running({ prices: { endpoint: "http://127.0.0.1:1", checkSigners } });
+      const started = f.k.start();
+      await until(() => f.ticks() >= 1);
+      await f.k.stop({ collect: false });
+      await started;
+      await f.k.close();
+      const warned = logged.filter((l) => l.includes("prices.checkSigners is off"));
+      expect(warned, String(checkSigners)).toHaveLength(checkSigners ? 0 : 1);
+    }
+  });
+
   it("start() refuses to run twice, and a failed connect rejects it", async () => {
     const f = running();
     const started = f.k.start();
@@ -210,7 +224,7 @@ describe("start and stop", () => {
 });
 
 describe("status", () => {
-  it("writes status.json with the Python keeper's keys", () => {
+  it("writes status.json with the keys bazaar keeper status reads", () => {
     const f = fake(dir, { jobs: { liquidation: {}, collect: {} } });
     f.addWallet();
     f.k.store.positionsOf(f.m.address).set(acct(1), position(acct(1), 105)); // 5% over its requirement
@@ -315,7 +329,7 @@ describe("keeper.run", () => {
     expect(f.ex.runs[1]![1]).toMatchObject({ dryRun: false, force: true });
     const a = f.ex.runs[1]![0];
     expect(a.summary).toBe("liquidate 1 account(s)");
-    expect(a.locks).toEqual([lockKey("liq", f.m.address, BOB)]); // the liquidation job's key (K15)
+    expect(a.locks).toEqual([lockKey("liq", f.m.address, BOB)]); // the liquidation job's key
     expect(decodeFunctionData({ abi: bazaarPairAbi, data: a.data }).args).toEqual([[BOB], ["0xaa"]]);
     await f.k.run.liquidate(f.m.address, { accounts: [BOB], dryRun: true });
     expect(f.ex.runs[2]![1]).toMatchObject({ dryRun: true });
@@ -350,7 +364,7 @@ describe("keeper.run", () => {
     await expect(f.k.run.settleTerminationProposal("0x1234")).rejects.toThrow("expected a 32-byte id");
   });
 
-  it("one-shots honour the running keeper's in-flight keys, and hold their own while they send (K15)", async () => {
+  it("one-shots honour the running keeper's in-flight keys, and hold their own while they send", async () => {
     const f = oneShot();
     const BOB = acct(2);
     const key = lockKey("liq", f.m.address, BOB);

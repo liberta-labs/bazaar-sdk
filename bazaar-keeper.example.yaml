@@ -5,7 +5,8 @@
 network: arbitrum-sepolia           # arbitrum-one | arbitrum-sepolia | anvil | custom
 factory: "0x0000000000000000000000000000000000000000"   # needed until the network's preset has one
 # chainId: 42161                    # custom networks only
-# startBlock: 0                     # the factory's deployment block, for indexing from logs
+# startBlock: 0                     # the factory's deployment block, where a first start without a subgraph
+#                                   # begins reading logs (left out, the keeper finds it on chain)
 
 rpc:
   http: ${RPC_HTTP_URL}             # a provider's URL usually holds its key, so it lives in .env
@@ -15,8 +16,15 @@ subgraph:
   url: none                         # default | none | a GraphQL URL
 
 prices:
-  endpoint: pyth                    # pyth | bazaar (not available yet) | any Hermes-compatible URL
-  apiKey: ${PYTH_API_KEY}
+  endpoint: pyth                    # pyth (Pyth Pro) | bazaar (not available yet) | the URL of a Pyth Pro compatible service
+  token: ${PYTH_PRO_TOKEN}          # your Pyth Pro access token
+  # channel: fixed_rate@200ms       # real_time | fixed_rate@50ms | fixed_rate@200ms | fixed_rate@1000ms
+  # checkSigners: true              # use only updates signed by a signer the deployment's Pyth verifier trusts
+  # streamIdleTimeoutSeconds: 10    # a stream that brings no new update for this long is reconnected
+  # To replace one of the endpoint's places (a proxy, a single region):
+  # streamUrls: ["wss://pyth-lazer-0.dourolabs.app/v1/stream"]   # the keeper connects to every URL listed
+  # restUrl: https://pyth-lazer.dourolabs.app                    # /v1/latest_price and /v1/price
+  # symbolsUrl: https://pyth.dourolabs.app                       # /v1/symbols
 
 # ---- Who ----
 wallets:
@@ -76,5 +84,7 @@ budget:
 #   dir: ~/.bazaar                  # the snapshot, the earnings ledger and the status file (`init` puts them next to this file)
 
 # alerts:
-#   telegram: { botToken: ${TG_BOT_TOKEN}, chatId: "123456" }
+#   telegram:
+#     botToken: ${TG_BOT_TOKEN}
+#     chatId: "123456"
 #   notify: [lowBalance, jobPaused, endpointDown, opportunity, dailySummary]

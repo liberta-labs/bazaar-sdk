@@ -9,19 +9,28 @@ import { factory as factoryCodec } from "../chain/codec.js";
 import type { Transport } from "../chain/rpc.js";
 import { ZERO_ADDRESS } from "../constants.js";
 import { installUserMessages } from "../errors/messages.js";
+import type { ProUpdate, SignerCheck } from "../prices/pro.js";
+import { verifierSignerCheck } from "./signers.js";
 
-/** Signed Pyth price updates, as the pair's calls carry them. */
+/** Signed Pyth Pro price updates, as the pair's calls carry them. */
 export interface PriceUpdateSource {
   /**
-   * The freshest signed update the endpoint has for these feeds: `update` is what a call's
-   * `priceUpdate: bytes[]` takes, `publishTime` the oldest publish time among the feeds (seconds).
+   * The freshest signed update for these feeds together: `update` is what a call's
+   * `priceUpdate: bytes[]` takes, `publishTime` the second the oldest of the feeds' prices was
+   * generated in, which is what the pair's freshness window judges.
    */
   latest(feedIds: readonly Hex[]): Promise<{ update: Hex[]; publishTime: number }>;
   /**
-   * The first update at or after `publishTime` for these feeds (Hermes' historical route), for
-   * settlement prints. Optional: only termination settlement needs it.
+   * Pyth's one-second channel's update stamped exactly `second`, carrying these feeds together, or
+   * null when there is none for that second. Optional: only termination settlement needs it.
    */
-  atOrAfter?(publishTime: number, feedIds: readonly Hex[]): Promise<{ update: Hex[]; publishTime: number; prevPublishTime: number | null }[]>;
+  atTick?(feedIds: readonly Hex[], second: number): Promise<ProUpdate | null>;
+  /**
+   * Have the source refuse updates whose signer `check` does not accept. {@link connect} calls it
+   * with the deployment's verifier ({@link verifierSignerCheck}); a source that cannot check signers
+   * leaves it out.
+   */
+  useSignerCheck?(check: SignerCheck): void;
 }
 
 /** A GraphQL endpoint serving Bazaar's subgraph. */
@@ -42,6 +51,11 @@ export interface BazaarContext {
   readonly subgraph: SubgraphSource | null;
   /** The address every order this frontend creates names as its integrator (zero for none). */
   readonly integrator: Address;
+  /**
+   * Whether Pyth Pro clients this context hands out check signers against the deployment's verifier
+   * ({@link ConnectOptions.checkSigners}); a context built by hand without it counts as true.
+   */
+  readonly checkSigners?: boolean;
 }
 
 export interface ConnectOptions {
@@ -53,6 +67,13 @@ export interface ConnectOptions {
   integrator?: Address | null;
   /** Expected chain id: connect fails on any other chain. */
   chainId?: number;
+  /**
+   * Have the price source use only updates signed by a signer the deployment's Pyth verifier trusts
+   * (verifierSignerCheck: the verifier's address is read once, and each signer's answer is cached and
+   * asked again as it ages). Default true; false leaves the source as it was given. The chain
+   * verifies every update a call carries either way.
+   */
+  checkSigners?: boolean;
 }
 
 export class ConnectError extends Error {
@@ -76,6 +97,7 @@ export async function connect(opts: ConnectOptions): Promise<BazaarContext> {
   }
   if (!res.every(([ok]) => ok)) throw new ConnectError(`${factory} does not answer as a Bazaar factory on chain ${chainId}`);
   const [lens, terminator, oracle, usdc] = res.map(([, data], i) => f.decode<Address>(names[i]!, data));
+  if (opts.checkSigners !== false) opts.prices?.useSignerCheck?.(verifierSignerCheck(chain, oracle!));
   return {
     chain,
     chainId,
@@ -87,11 +109,12 @@ export async function connect(opts: ConnectOptions): Promise<BazaarContext> {
     prices: opts.prices ?? null,
     subgraph: opts.subgraph ?? null,
     integrator: opts.integrator ? getAddress(opts.integrator) : ZERO_ADDRESS,
+    checkSigners: opts.checkSigners !== false,
   };
 }
 
 export function requirePrices(ctx: BazaarContext): PriceUpdateSource {
-  if (!ctx.prices) throw new ConnectError("this call needs a fresh Pyth price: connect with a price source (prices)");
+  if (!ctx.prices) throw new ConnectError("this call needs a fresh Pyth Pro price: connect with a price source (prices)");
   return ctx.prices;
 }
 

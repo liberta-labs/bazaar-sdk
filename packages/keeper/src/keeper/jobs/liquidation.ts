@@ -66,7 +66,7 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
       (candidates ??= []).push(acct);
     }
     if (candidates === null) return [];
-    const updates = pc.updates; // before the first await: the print `price` came from
+    const updates = pc.updates; // before the first await: the update of the print `price` is from, or none for the stored price
     const reader = this.k.reader;
     // The store follows events; the chain is re-read before anything is simulated. The fee read goes
     // out alongside, rather than after it.
@@ -99,6 +99,7 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
       actions.push(
         this.action(m, m.address, PAIR.encode("liquidate", batch, updates), `liquidate ${batch.length} account(s), $${thousands(units(notional))} notional`, {
           value: fee,
+          priceTime: pc.priceTime,
           locks: batch.map((a) => lockKey("liq", m.address, a)),
           rewardPair: m.address,
         }),
@@ -108,12 +109,8 @@ export class LiquidationJob extends Job<LiquidationJobConfig> {
   }
 
   override note(action: Action, result: ActionResult): void {
-    if (result.sent) {
-      this.clearEarly(action.locks);
-      return;
-    }
-    // Refused or unprofitable: wait before simulating the same accounts again (only until Pyth's
-    // cache ages out, when that is the likely reason).
-    this.coolRefused(action, result, "liquidate");
+    // Refused or unprofitable: wait before simulating the same accounts again. A price that aged
+    // before the send refused nothing: the next print plans them again.
+    if (!result.sent && !result.priceAged) for (const key of action.locks) this.cool(key);
   }
 }

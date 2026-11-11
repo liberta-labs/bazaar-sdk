@@ -18,21 +18,31 @@ import {
 } from "../src/client/markets.js";
 import { ADL_MAX_SCORE, LIMBO_LEAD, MAX_UINT256 } from "../src/constants.js";
 import type { MarketState } from "../src/models.js";
-import type { Print } from "../src/prices/hermes.js";
+import type { Print, ProSymbol } from "../src/prices/pro.js";
 import { E18, FACTORY, FakeTransport, LENS, type MarketFixture, addr, contextFor, h32, inventory, withMarket } from "./client-reads-fakes.js";
+import { fid, print as proPrint } from "./pro-fakes.js";
 
 const A = addr("0a");
 const B = addr("0b");
-const F1 = h32("f1");
-const F2 = h32("f2");
-const F3 = h32("f3");
+const F1 = fid(1);
+const F2 = fid(2_001);
+const F3 = fid(327);
 const TS = 1_700_000_000;
 
-const META = [
-  { id: F1.slice(2), attributes: { symbol: "Crypto.BTC/USD" } },
-  { id: F2.slice(2), attributes: { symbol: "Equity.GB.HSBA/GBP" } },
-  { id: F3.slice(2), attributes: { symbol: "FX.GBP/USD" } },
-];
+const entry = (id: number, symbol: string, assetType: string, minChannel: string): ProSymbol => ({
+  id,
+  feedId: fid(id),
+  symbol,
+  name: "",
+  description: "",
+  assetType,
+  minChannel,
+  state: "stable",
+  schedule: "",
+  exponent: -8,
+  hermesId: null,
+});
+const META = [entry(1, "Crypto.BTC/USD", "crypto", "real_time"), entry(2_001, "Equity.GB.HSBA/GBP", "equity", "fixed_rate@200ms"), entry(327, "FX.GBP/USD", "fx", "fixed_rate@200ms")];
 
 function metadata() {
   let calls = 0;
@@ -40,7 +50,7 @@ function metadata() {
     get calls() {
       return calls;
     },
-    async priceFeeds() {
+    async symbols() {
       calls += 1;
       return META;
     },
@@ -80,7 +90,12 @@ describe("listMarkets", () => {
       [B, "HSBA/USD", "trading-hours", true, 1], // a composite is priced in USD
     ]);
     expect(list[0]).toMatchObject({ pairId: h32("a1"), legs: [F1], description: "Bitcoin perpetual", legSymbols: ["Crypto.BTC/USD"] });
+    expect(list[0]!.legFeeds).toEqual([META[0]]); // the registry's entry: asset type, fastest channel, state, schedule
     expect(list[1]).toMatchObject({ legs: [F2, F3], invertQuote: false, continuous: false, description: "", legSymbols: ["Equity.GB.HSBA/GBP", "FX.GBP/USD"] });
+    expect(list[1]!.legFeeds.map((f) => [f?.assetType, f?.minChannel])).toEqual([
+      ["equity", "fixed_rate@200ms"],
+      ["fx", "fixed_rate@200ms"],
+    ]);
     expect(queries).toEqual([{ ids: [A.toLowerCase(), B.toLowerCase()] }]);
     expect(meta.calls).toBe(1);
 
@@ -98,6 +113,7 @@ describe("listMarkets", () => {
     expect(again[0]).toBe(list[0]);
     expect(t.calls.filter((c) => c.endsWith(":pairId"))).toEqual([`${C}:pairId`]);
     expect(again[2]!.label).toBe(C.slice(0, 10)); // no symbol and no description: the address
+    expect(again[2]!.legFeeds).toEqual([null]);
   });
 
   it("labels by the address when the metadata has no symbol, and survives a subgraph outage", async () => {
@@ -116,8 +132,7 @@ describe("listMarkets", () => {
 });
 
 describe("getMarket", () => {
-  // Was "...label or description": a description is the subgraph's unverified text, so it no longer
-  // resolves a name (audit F7).
+  // A description is the subgraph's unverified text, so it never resolves a name.
   it("finds a market by address, pair id or label, and reports an ambiguous label", async () => {
     const subgraph = {
       async query<T>(): Promise<T> {
@@ -149,7 +164,7 @@ describe("getMarket", () => {
     expect(ambiguous.message).toContain("matches several markets");
   });
 
-  // Audit F7: an unverified subgraph description became a label and a name, and a non-string threw.
+  // An unverified subgraph description never becomes a label or a name, and a non-string does not throw.
   it("never lets a subgraph description name a market or impersonate another's label", async () => {
     const subgraph = {
       async query<T>(): Promise<T> {
@@ -265,7 +280,7 @@ describe("marketSnapshot", () => {
     expect(s.allWithdrawalsPaused).toBe(false);
   });
 
-  it("judges a trading-hours market's venue with live prices, or one Hermes request", async () => {
+  it("judges a trading-hours market's venue with live prices, or one Pyth Pro request", async () => {
     const view: LivePriceView = { price: () => null, venueClosed: (m) => m === B };
     const { ctx } = setup();
     await listMarkets(ctx, { metadata: null });
@@ -284,7 +299,7 @@ describe("marketSnapshot", () => {
     // ...unless the context's source serves prints: only the trading-hours market's legs are asked for.
     const asked: Hex[][] = [];
     const now = Math.floor(Date.now() / 1000);
-    const print = (feedId: Hex, publishTime: number): Print => ({ feedId, price: 100_000_000n, conf: 1_000n, expo: -8, publishTime, prevPublishTime: null, blob: "0x", received: 0 });
+    const print = (feedId: Hex, publishTime: number): Print => proPrint(feedId, publishTime, { price: 100_000_000n });
     const prices = {
       async latest() {
         return { update: [], publishTime: 0 };

@@ -1,6 +1,6 @@
 /**
  * Output helpers for the `bazaar` command: colours, aligned tables, and the number and time formats
- * the Python CLI printed through Rich.
+ * the CLI prints.
  *
  * Everything that prints an error passes it through {@link errorText} or {@link redactUrls}, so a URL
  * that carries a provider's key is masked even when it turns up inside some library's message.
@@ -130,33 +130,33 @@ function group(digits: string): string {
   return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-/** Python's `f"{n:,}"` for an integer. */
+/** An integer with thousands separators: `1,234,567`. */
 export function grouped(n: number | bigint): string {
   if (typeof n === "number" && !Number.isFinite(n)) return String(n);
   const s = typeof n === "bigint" ? n.toString() : Math.trunc(n).toString();
   return s.startsWith("-") ? "-" + group(s.slice(1)) : group(s);
 }
 
-/** Python's `f"{x:.{digits}f}"`. */
+/** `x` with exactly `digits` decimals; `nan`, `inf` or `-inf` when it is not finite. */
 export function fixed(x: number, digits: number): string {
   if (Number.isNaN(x)) return "nan";
   if (!Number.isFinite(x)) return x > 0 ? "inf" : "-inf";
   return x.toFixed(digits);
 }
 
-/** Python's `f"{x:,.{digits}f}"`. */
+/** {@link fixed}, with thousands separators in the integer part. */
 export function groupedFixed(x: number, digits: number): string {
   const s = fixed(x, digits);
   const m = /^(-?)(\d+)(.*)$/.exec(s);
   return m ? m[1]! + group(m[2]!) + m[3]! : s;
 }
 
-/** Dollars, as the Python CLI printed them: `$0.0500`. */
+/** Dollars with `digits` decimals: `usd(0.05, 4)` is `$0.0500`. */
 export function usd(x: number, digits = 2): string {
   return "$" + fixed(x, digits);
 }
 
-/** Python's `f"{x:g}"`: six significant digits, trailing zeros dropped, exponent outside 1e-4..1e6. */
+/** Up to `precision` significant digits, trailing zeros dropped, in exponent form outside 1e-4..1e6. */
 export function formatG(x: number, precision = 6): string {
   if (Number.isNaN(x)) return "nan";
   if (!Number.isFinite(x)) return x > 0 ? "inf" : "-inf";

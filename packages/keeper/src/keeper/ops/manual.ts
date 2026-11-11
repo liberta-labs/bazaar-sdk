@@ -11,24 +11,15 @@
  */
 
 import {
+  type BazaarContext,
   type Deployment,
-  HermesError,
-  MAX_PRICE_STALENESS,
+  InputError,
   type Market,
-  type Print,
-  RpcError,
-  SETTLEMENT_SAMPLE_COUNT,
-  SETTLEMENT_SAMPLE_SPACING,
-  SETTLE_AWAIT_VERDICT,
-  SETTLE_CHAIN,
-  SETTLE_NOTHING,
-  SETTLE_WINDOW,
+  ProError,
   STOP_LIMIT,
-  accumulator,
-  decodeError,
+  ZERO_ADDRESS,
   factory as factoryCodec,
   marketStatus,
-  oracle as oracleCodec,
   pair as pairCodec,
   termination,
   terminator as terminatorCodec,
@@ -57,14 +48,12 @@ const log = getLogger("bazaar_sdk.ops");
 const PAIR = pairCodec();
 const TERMINATOR = terminatorCodec();
 const FACTORY = factoryCodec();
-const ORACLE = oracleCodec();
-const ZERO32: Hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
-const U64_MAX = (1n << 64n) - 1n;
 
-type SettleUnder = "window" | "chain";
-const UNDER: Readonly<Record<SettleUnder, string>> = {
-  window: "UMA's rule (the window's first print)",
-  chain: "the chain rule (five chained prints)",
+/** How a settlement call fixes the price, as a result's summary and notes word it. */
+const UNDER: Readonly<Record<termination.SettleUnder, string>> = {
+  tick: "UMA's rule (the one-second update stamped at the cutoff)",
+  chain: "the chain rule (the median of five chained prices)",
+  storedPrice: "the stored price (the last resort is open)",
 };
 /** A settlement price (BAZAAR precision, 1e18 = 1) as an exact decimal. */
 const priceText = (p: bigint): string => formatUnits(p, 18);
@@ -95,6 +84,83 @@ export interface OpOptions {
 export interface ManualOptions {
   /** simulate and report, send nothing */
   dryRun?: boolean;
+}
+
+/** How a scheduled termination is planned and sent. */
+export interface ScheduledTerminationOptions extends ManualOptions {
+  /**
+   * When the call with no updates, which settles at the market's stored price, is planned once its
+   * last resort is open (the SDK's `storedPrice`): "whenAbsent" (default) only when Pyth's archive
+   * answers and has no usable update for the settlement, "always" whenever no proven set is
+   * accepted, "never" not at all.
+   */
+  storedPrice?: termination.StoredPricePolicy;
+  /**
+   * Send a settlement at the market's stored price. Without it such a plan is simulated and reported
+   * (`dryRun`) or skipped, never sent: it fixes the market's price for good at a price no Pyth update
+   * proves.
+   */
+  acceptStoredPrice?: boolean;
+  /**
+   * A plan made earlier ({@link Operations.planScheduledTermination}): the call is sent only while the
+   * plan made now is the same (rule, settlement price and call); otherwise nothing is sent.
+   */
+  expect?: ScheduledTermination | null;
+}
+
+/** A scheduled termination as planned: the call, and what it fixes. */
+export interface ScheduledTermination {
+  readonly market: Market;
+  readonly plan: termination.ScheduledSettlementPlan;
+  /** The call that settles the market (the plan's). */
+  readonly call: NonNullable<termination.ScheduledSettlementPlan["call"]>;
+  /** The rule and the settlement price, as a result's summary words them. */
+  readonly summary: string;
+  /** Under the stored price: when the market stored it (unix seconds); null otherwise, or when it never stored one. */
+  readonly storedPriceTs: number | null;
+  /** What the builder tried and gave up on before this plan. */
+  readonly notes: readonly string[];
+}
+
+/** The settlement price a plan fixes, as text. */
+const settlementText = (p: ScheduledTermination): string => (p.plan.settlementPrice === null ? "?" : priceText(p.plan.settlementPrice));
+
+/** How `planned`'s settlement at the stored price reads for whoever approves it: irreversible, and how old the price is. */
+function storedPriceNote(planned: ScheduledTermination, now: number): string {
+  const ts = planned.storedPriceTs;
+  if (ts === null) {
+    // BazaarPairTerminator._lastStoredPrice: a pair that never stored a price settles at 1 (1e-18).
+    return `this settles the market irreversibly at ${settlementText(planned)}, the price the terminator gives a market that never stored one: no Pyth update proves it`;
+  }
+  const at = new Date(ts * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+  return `this settles the market irreversibly at its stored price, ${settlementText(planned)}, stored ${durationText(Math.max(0, now - ts))} ago (${at}): no Pyth update proves it`;
+}
+
+/** Seconds as "22 d 0 h", "3 h 5 min" or "40 s". */
+function durationText(seconds: number): string {
+  const s = Math.floor(seconds);
+  if (s >= 86_400) return `${Math.floor(s / 86_400)} d ${Math.floor((s % 86_400) / 3_600)} h`;
+  if (s >= 3_600) return `${Math.floor(s / 3_600)} h ${Math.floor((s % 3_600) / 60)} min`;
+  if (s >= 60) return `${Math.floor(s / 60)} min`;
+  return `${s} s`;
+}
+
+/** What differs between two plans of one market's settlement, or null when it is the same call. */
+function settlementChange(before: ScheduledTermination, now: ScheduledTermination): string | null {
+  if (before.market.address !== now.market.address) return "another market";
+  if (before.plan.under !== now.plan.under) return `it settles under ${UNDER[now.plan.under!]}, not ${UNDER[before.plan.under!]}`;
+  if (before.plan.settlementPrice !== now.plan.settlementPrice) return `it settles at ${settlementText(now)}, not ${settlementText(before)}`;
+  if (before.call.to !== now.call.to || before.call.data !== now.call.data) return "it carries other updates";
+  if (before.call.value !== now.call.value) return `its fee is ${now.call.value} wei, not ${before.call.value}`;
+  return null;
+}
+
+/**
+ * The SDK's text with its option named as the keeper's operator sets it: the CLI's `--stored-price`
+ * (the library's `storedPrice` takes the same values).
+ */
+function keeperWording(text: string): string {
+  return text.split('pass storedPrice: "always"').join("run with --stored-price always").split('storedPrice is "never"').join("--stored-price is never");
 }
 
 export interface LiquidateOptions extends OpOptions {
@@ -216,7 +282,7 @@ export class Operations {
       try {
         await k.prices.fetch(feeds);
       } catch (e) {
-        if (!(e instanceof HermesError)) throw e;
+        if (!(e instanceof ProError)) throw e;
         log.warning("price endpoint: %s", e.message);
       }
     }
@@ -328,6 +394,7 @@ export class Operations {
     const fee = await this.k.reader.updateFee(updates);
     const a = job.action(m, m.address, PAIR.encode("liquidate", accts, updates), `liquidate ${accts.length} account(s)`, {
       value: fee,
+      priceTime: pc?.priceTime ?? null,
       locks: accts.map((acct) => lockKey("liq", m.address, acct)), // the liquidation job's keys
       rewardPair: m.address,
     });
@@ -359,6 +426,7 @@ export class Operations {
     const fee = await this.k.reader.updateFee(updates);
     const a = job.action(m, m.address, PAIR.encode("executeTriggeredOrders", execs, updates), `execute ${execs.length} trigger order(s)`, {
       value: fee,
+      priceTime: pc.priceTime,
       locks: oids.map((oid) => lockKey("trig", m.address, oid)), // the triggers job's keys
       rewardPair: m.address,
     });
@@ -413,6 +481,7 @@ export class Operations {
     const fee = await this.k.reader.updateFee(updates);
     const a = job.action(m, m.address, PAIR.encode("executeAdl", addresses(longW ?? []), addresses(shortW ?? []), updates), "ADL batch", {
       value: fee,
+      priceTime: pc.priceTime,
       locks: [lockKey("adl", m.address)],
       rewardPair: m.address,
     });
@@ -429,6 +498,7 @@ export class Operations {
     const fee = await this.k.reader.updateFee(updates);
     const a = job.action(m, m.address, PAIR.encode("refreshPrice", updates), "refresh price", {
       value: fee,
+      priceTime: pc.priceTime,
       locks: [lockKey("refresh", m.address)],
       rewardPair: m.address,
     });
@@ -547,179 +617,86 @@ export class Operations {
   }
 
   /**
-   * End a market at its scheduled cutoff, fetching the settlement prints its rule asks for.
+   * Plan the call that ends a market at its scheduled cutoff, without sending anything: a
+   * {@link ScheduledTermination} when there is a call, or a skipped result that says why there is none
+   * (and when to try again, when that is known).
    *
-   * A print set is sent as a print settlement only once the pair's oracle has verified it the way
-   * the terminator calls it (fetchFirstPriceAtOrAfter for UMA's rule, fetchChainedMedian for the
-   * chain rule, same arguments, the fee as value), and its summary names the price that call
-   * returns. Past the grace or the last resort the terminator catches a refused set and settles at
-   * the stored price instead, so simulating terminateScheduledPair alone passes either way and would
-   * label a stored-price settlement as a print one. Past the last resort the call with no prints,
-   * which settles at the stored price, is offered when no verified set goes through.
+   * The SDK's builder (termination.terminateScheduledPair) reads the rule, fetches Pyth's archived
+   * one-second updates for it with the keeper's client, has the pair's oracle verify them as the
+   * terminator calls it, and simulates the call as the wallet that would send it. Once the last resort
+   * is open it plans the call with no updates, which settles at the market's stored price, only as
+   * `opts.storedPrice` allows: by default only when the archive answers and positively has no usable
+   * update, so an archive that cannot be asked never leads to the stored price.
    */
-  async terminateScheduledPair(market: string, opts: ManualOptions = {}): Promise<ActionResult> {
-    const dryRun = opts.dryRun ?? false;
+  async planScheduledTermination(market: string, opts: { storedPrice?: termination.StoredPricePolicy } = {}): Promise<ScheduledTermination | ActionResult> {
     const m = await this.market(market);
     const k = this.k;
-    const dep = this.dep();
-    const rule = await k.reader.one<{ rule: number | bigint; firstTarget: bigint; latestPublishTs: bigint; lastResortTs: bigint; verdictDeadline: bigint }>(
-      dep.terminator,
-      TERMINATOR,
-      "settlementRule",
-      m.address,
-    );
-    const r = Number(rule.rule);
-    const first = Number(rule.firstTarget);
-    const latest = Number(rule.latestPublishTs);
-    const lastResort = Number(rule.lastResortTs);
     const summary = `terminate ${m.label} at its cutoff`;
-    if (r === SETTLE_NOTHING) {
-      return skipped("terminateScheduledPair", m.label, summary, "the market has no scheduled cutoff, or its settlement price is already fixed");
+    const lane = k.executor.lanes.get(this.manualWallet());
+    let plan: termination.ScheduledSettlementPlan;
+    try {
+      plan = await termination.terminateScheduledPair(this.context(), {
+        pair: m.address,
+        from: lane ? lane.address : ZERO_ADDRESS,
+        fetchTick: (feeds, second) => k.pro.atTick(feeds, second),
+        storedPrice: opts.storedPrice ?? "whenAbsent",
+      });
+    } catch (e) {
+      // Refused before anything was fetched: no cutoff, a cutoff not passed yet, a price already fixed.
+      if (!(e instanceof InputError)) throw e;
+      return skipped("terminateScheduledPair", m.label, summary, e.message.slice(e.field.length + 2));
     }
-    // What the terminator settles with: the pair's own oracle, cutoff and stored price, and the UMA cap.
-    const [scheduleId, pairOracle, scheduledTs, capRaw, lastPrice] = await Promise.all([
-      k.reader.one<Hex>(dep.terminator, TERMINATOR, "insurerScheduleId", m.address),
-      k.reader.one<Address>(m.address, PAIR, "oracle"),
-      k.reader.one<bigint | number>(m.address, PAIR, "scheduledTerminationTs"),
-      k.reader.one<bigint | number>(dep.terminator, TERMINATOR, "umaCutoffCap", m.address),
-      k.reader.one<{ spotPrice: bigint }>(m.address, PAIR, "lastPairPrice"),
-    ]);
-    const vote = scheduleId.toLowerCase() !== ZERO32;
-    const cutoff = Number(scheduledTs);
-    const now = k.now();
-    // BazaarPairTerminator._lastStoredPrice: a pair that never stored a price settles at 1.
-    const stored = lastPrice.spotPrice === 0n ? termination.NEVER_PRICED_SETTLEMENT_PRICE : lastPrice.spotPrice;
-    const cap = BigInt(capRaw);
-    const chainMax = cap === 0n || cap > U64_MAX ? U64_MAX : cap; // _insurerSettlementBounds' latestPublishTs
-    // A claim-backed vote whose verdict nobody has recorded may settle under either rule, because the
-    // call records the verdict (UMA's rule if the claim was upheld, the chain rule if not). A vote
-    // with no claim, or a recorded verdict other than upheld, settles under the chain rule.
-    let either = r === SETTLE_AWAIT_VERDICT;
-    if (vote && r === SETTLE_CHAIN) {
-      const p = await k.reader.one<{ claimBacked: boolean; verdict: number | bigint }>(dep.terminator, TERMINATOR, "insurerProposals", scheduleId);
-      either = Boolean(p.claimBacked) && Number(p.verdict) === 0;
+    if (plan.call === null || plan.under === null) {
+      return skipped("terminateScheduledPair", m.label, summary, keeperWording(plan.reason ?? "no settlement updates are available yet"));
     }
-    // Where a set the oracle refuses settles at the stored price instead of reverting. UMA's rule
-    // for a verdict this call records has no fallback yet: its grace starts at the recording.
-    const chainLastResort = r === SETTLE_CHAIN ? lastResort : termination.chainLastResort(cutoff, cap === 0n ? null : Number(cap));
-    const fallsBack = (under: SettleUnder): boolean => (under === "window" ? r === SETTLE_WINDOW && now > lastResort : now > chainLastResort);
-
-    // With either rule possible the chain set goes first: under UMA's rule a chain set reverts (no
-    // fallback), so its success shows the chain rule applies, while a UMA-rule set could pass
-    // under the chain rule's stored-price fallback.
-    const sets: { under: SettleUnder; target: number; latest: number | null }[] = [];
-    if (r === SETTLE_CHAIN || either) {
-      sets.push({ under: "chain", target: r === SETTLE_CHAIN ? first : cutoff, latest: r === SETTLE_CHAIN ? latest : cap === 0n ? null : Number(cap) });
-    }
-    if (r === SETTLE_WINDOW || either) {
-      sets.push({ under: "window", target: r === SETTLE_WINDOW ? first : cutoff - MAX_PRICE_STALENESS, latest: r === SETTLE_WINDOW ? latest : cutoff });
-    }
-    const notes: string[] = [];
-    let last: ActionResult | null = null;
-    let chainRefused = false; // a verified chain set the terminator reverted on: the chain rule does not apply
-    for (const s of sets) {
-      const label = UNDER[s.under];
-      const [ups, why] = s.under === "window" ? await this.windowPrints(m, s.target, s.latest!) : await this.chainPrints(m, s.target, s.latest);
-      if (!ups.length) {
-        notes.push(why);
-        continue;
-      }
-      const fee =
-        s.under === "window"
-          ? await k.reader.one<bigint>(pairOracle, ORACLE, "getUpdateFee", ups)
-          : await k.reader.one<bigint>(pairOracle, ORACLE, "getSampleSetFee", m.baseFeedId, ups);
-      const proof = await this.provePrints(pairOracle, m.baseFeedId, s.under, ups, fee, cutoff, chainMax);
-      if (!("price" in proof)) {
-        notes.push(
-          fallsBack(s.under)
-            ? `under ${label}, the oracle would not verify the prints (${proof.why}); the stored-price fallback is open, so a call ` +
-                `carrying them would settle at the stored price (${priceText(stored)}) instead: not sent as a print settlement`
-            : `under ${label}, the oracle would not verify the prints (${proof.why}), and the terminator would refuse them too`,
-        );
-        continue;
-      }
-      if (s.under === "window" && either && now > chainLastResort && !chainRefused) {
-        notes.push(
-          `UMA's rule applies only if UMA upheld the claim behind the vote, and nobody has recorded its verdict; if it did not, ` +
-            `the chain rule's stored-price fallback is open and a call carrying these prints would settle at the stored price ` +
-            `(${priceText(stored)}). Record the verdict first (settleTerminationProposal ${scheduleId}), then run this again`,
-        );
-        continue;
-      }
-      const res = await this.manual(
-        "terminateScheduledPair",
-        m,
-        dep.terminator,
-        TERMINATOR.encode("terminateScheduledPair", m.address, ups),
-        `${summary} under ${label}, settling at ${priceText(proof.price)}`,
-        dryRun,
-        fee,
-      );
-      if (res.sent || res.status === "simulated") return res;
-      if (s.under === "chain" && res.error !== null) chainRefused = true;
-      last = res;
-    }
-    // Past the last resort, a call with no prints settles at the stored price.
-    if ((r === SETTLE_WINDOW || r === SETTLE_CHAIN) && now > lastResort) {
-      const res = await this.manual(
-        "terminateScheduledPair",
-        m,
-        dep.terminator,
-        TERMINATOR.encode("terminateScheduledPair", m.address, []),
-        `${summary} at its stored price, ${priceText(stored)} (the last resort is open)`,
-        dryRun,
-        0n,
-      );
-      if (res.sent || res.status === "simulated") {
-        if (notes.length) res.reason = [res.reason, ...notes].filter((n) => n).join("; ");
-        return res;
-      }
-      last = res;
-    }
-    if (last !== null) {
-      if (notes.length) last.reason = [last.reason, ...notes].filter((n) => n).join("; ");
-      return last;
-    }
-    let reason = notes.filter((n) => n).join("; ") || "no settlement prints are available yet";
-    if (r === SETTLE_AWAIT_VERDICT) reason += `; the vote waits for UMA's verdict until ${rule.verdictDeadline}`;
-    else if (lastResort && now <= lastResort) reason += `; the stored-price fallback opens at ${lastResort}`;
-    return skipped("terminateScheduledPair", m.label, summary, reason);
+    const price = plan.settlementPrice === null ? "" : priceText(plan.settlementPrice);
+    const stored = plan.under === "storedPrice";
+    const updateTs = m.state?.updateTs ?? 0;
+    return {
+      market: m,
+      plan,
+      call: plan.call,
+      summary: stored ? `${summary} at its stored price, ${price} (the last resort is open)` : `${summary} under ${UNDER[plan.under]}, settling at ${price}`,
+      storedPriceTs: stored && updateTs > 0 ? updateTs : null,
+      notes: plan.attempts.filter((a) => !a.ok).map((a) => `under ${UNDER[a.under]}: ${keeperWording(a.reason)}`),
+    };
   }
 
   /**
-   * The settlement price the pair's oracle fixes for `updates`, called exactly as the terminator
-   * calls it (the same function and arguments, the fee as value, from the wallet that would send),
-   * or why it refuses them.
+   * Send (or, with `dryRun`, simulate) exactly the call `planned` holds. A settlement at the market's
+   * stored price is sent only with `acceptStoredPrice`: it fixes the market's price for good at a
+   * price no Pyth update proves. A dry run reports it either way.
    */
-  private async provePrints(
-    oracleAt: Address,
-    feed: Hex,
-    under: SettleUnder,
-    updates: readonly Hex[],
-    fee: bigint,
-    cutoff: number,
-    chainMax: bigint,
-  ): Promise<{ price: bigint } | { why: string }> {
-    const fn = under === "window" ? "fetchFirstPriceAtOrAfter" : "fetchChainedMedian";
-    const data =
-      under === "window"
-        ? ORACLE.encode(fn, feed, updates, BigInt(cutoff - MAX_PRICE_STALENESS), BigInt(cutoff))
-        : ORACLE.encode(fn, feed, updates, BigInt(cutoff), chainMax, BigInt(SETTLEMENT_SAMPLE_SPACING), BigInt(SETTLEMENT_SAMPLE_COUNT));
-    const lane = this.k.executor.lanes.get(this.manualWallet());
-    let ret: Hex;
-    try {
-      ret = await this.k.chain.call(oracleAt, data, { from: lane ? lane.address : null, value: fee });
-    } catch (e) {
-      if (!(e instanceof RpcError)) throw e;
-      const d = e.revertData;
-      // No revert data: the node refused the call itself (say, the wallet cannot cover the fee).
-      return { why: d === null || d === "0x" ? e.rpcMessage : decodeError(d).toString() };
+  async sendScheduledTermination(planned: ScheduledTermination, opts: Pick<ScheduledTerminationOptions, "dryRun" | "acceptStoredPrice"> = {}): Promise<ActionResult> {
+    const dryRun = opts.dryRun ?? false;
+    const m = planned.market;
+    const stored = planned.plan.under === "storedPrice";
+    if (stored && !dryRun && opts.acceptStoredPrice !== true) {
+      const res = skipped("terminateScheduledPair", m.label, planned.summary, `${storedPriceNote(planned, this.k.now())}; not sent without acceptStoredPrice (the CLI's --accept-stored-price)`);
+      res.reason = [res.reason, ...planned.notes].join("; ");
+      return res;
     }
-    try {
-      return { price: ORACLE.decode<bigint>(fn, ret) };
-    } catch {
-      return { why: "the oracle returned no price" };
+    const call = planned.call;
+    const res = await this.manual("terminateScheduledPair", m, call.to, call.data, planned.summary, dryRun, call.value);
+    const notes = stored ? [storedPriceNote(planned, this.k.now()), ...planned.notes] : planned.notes;
+    if (notes.length) res.reason = [res.reason, ...notes].filter((n) => n).join("; ");
+    return res;
+  }
+
+  /**
+   * End a market at its scheduled cutoff: plan the call ({@link planScheduledTermination}) and send it
+   * ({@link sendScheduledTermination}). With `opts.expect`, the plan made now must be that one (the
+   * same rule, settlement price and call) or nothing is sent: what an operator approved is what goes
+   * out, never a settlement that changed in the meantime.
+   */
+  async terminateScheduledPair(market: string, opts: ScheduledTerminationOptions = {}): Promise<ActionResult> {
+    const planned = await this.planScheduledTermination(market, opts);
+    if (planned instanceof ActionResult) return planned;
+    const changed = opts.expect ? settlementChange(opts.expect, planned) : null;
+    if (changed !== null) {
+      return skipped("terminateScheduledPair", planned.market.label, planned.summary, `the settlement changed since the preview (${changed}): nothing was sent; run the command again`);
     }
+    return this.sendScheduledTermination(planned, opts);
   }
 
   private dep(): Deployment {
@@ -728,52 +705,20 @@ export class Operations {
     return d;
   }
 
-  private async firstPrint(feed: Hex, target: number, latest: number | null): Promise<[Print | null, string]> {
-    const id = feed.toLowerCase();
-    const short = id.slice(2, 10);
-    let prints: Print[];
-    try {
-      prints = await this.k.hermes.atOrAfter(target, [feed]);
-    } catch (e) {
-      if (e instanceof HermesError) return [null, e.message];
-      throw e;
-    }
-    const p = prints.find((x) => x.feedId.toLowerCase() === id);
-    if (p === undefined) return [null, `the price endpoint returned no print for ${short} at ${target}`];
-    if (p.publishTime < target || (p.prevPublishTime !== null && p.prevPublishTime >= target)) {
-      return [null, `the price endpoint's print for ${short} is not the first at or after ${target}`];
-    }
-    if (latest !== null && p.publishTime > latest) return [null, `the feed ${short} has no print between ${target} and ${latest}`];
-    return [p, ""];
-  }
-
-  private static oneFeed(p: Print): Hex {
-    return accumulator.isAccumulator(p.blob) ? accumulator.subset(p.blob, [p.feedId]) : p.blob;
-  }
-
-  private async windowPrints(m: Market, target: number, latest: number): Promise<[Hex[], string]> {
-    const out: Hex[] = [];
-    for (const leg of m.legs) {
-      const [p, why] = await this.firstPrint(leg, target, latest);
-      if (p === null) return [[], why];
-      out.push(Operations.oneFeed(p));
-    }
-    return [out, ""];
-  }
-
-  private async chainPrints(m: Market, firstTarget: number, latest: number | null): Promise<[Hex[], string]> {
-    const out: Hex[] = [];
-    let target = firstTarget;
-    for (let i = 0; i < SETTLEMENT_SAMPLE_COUNT; i++) {
-      const sample: Print[] = [];
-      for (const leg of m.legs) {
-        const [p, why] = await this.firstPrint(leg, target, latest);
-        if (p === null) return [[], why];
-        sample.push(p);
-      }
-      for (const p of sample) out.push(Operations.oneFeed(p));
-      target = Math.max(...sample.map((p) => p.publishTime)) + SETTLEMENT_SAMPLE_SPACING;
-    }
-    return [out, ""];
+  /** The keeper's chain and deployment as the SDK's builders take them: no price source, no subgraph, no integrator. */
+  private context(): BazaarContext {
+    const d = this.dep();
+    return {
+      chain: this.k.chain,
+      chainId: this.k.net.chainId,
+      factory: d.factory,
+      lens: d.lens,
+      terminator: d.terminator,
+      oracle: d.oracle,
+      usdc: d.usdc,
+      prices: null,
+      subgraph: null,
+      integrator: ZERO_ADDRESS,
+    };
   }
 }

@@ -1,18 +1,16 @@
 /**
  * The earnings ledger: one JSON line per transaction the keeper sent, and the budgets read from it.
  *
- * The file (`ledger.jsonl` in the state dir) is append-only, one entry per line, in the Python
- * keeper's format (snake_case keys, integers written as JSON integers), so either implementation reads
- * the other's ledger. Lines written by an older or newer version with camelCase keys are read too.
+ * The file (`ledger.jsonl` in the state dir) is append-only, one entry per line, with snake_case
+ * keys and integers written as JSON integers. Lines with camelCase keys are read too.
  *
  * The daily budgets (gas spent and losses taken in the last 24 h) are kept as running totals over a
  * sliding window of the in-memory entries, which are held in time order: each query only drops the
  * entries that aged out since the last one, so a budget check costs O(1) amortized however long the
  * ledger grows. Sends in flight count at once through reservations (see {@link Ledger.reserve}).
  *
- * Each entry also carries what it spent in wei (`extra.cost_wei`, a decimal string: under `extra`
- * because the Python keeper refuses unknown top-level keys), for the ETH spend cap, which no price
- * can move. Lines without it (older ones, the Python keeper's) count 0 wei there.
+ * Each entry also carries what it spent in wei (`extra.cost_wei`, a decimal string), for the ETH
+ * spend cap, which no price can move. A line without it counts 0 wei there.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -122,7 +120,7 @@ export interface SummaryRow {
 
 // ---- the file format ----
 
-/** [field, key on disk (the Python keeper's), key accepted on read as well] */
+/** [field, key on disk, key accepted on read as well] */
 const FIELDS: readonly (readonly [keyof EntryInit, string])[] = [
   ["ts", "ts"],
   ["job", "job"],
@@ -140,7 +138,7 @@ const FIELDS: readonly (readonly [keyof EntryInit, string])[] = [
   ["extra", "extra"],
 ];
 
-/** JSON with bigints written as JSON integers (exact, and what Python reads as int). */
+/** JSON with bigints written as exact JSON integers. */
 function toJson(v: unknown): string {
   switch (typeof v) {
     case "bigint":
@@ -227,7 +225,7 @@ export function entryFromLine(line: string): Entry | null {
   const extra = get("extra", "extra");
   return new Entry({
     ts,
-    // The Python keeper names its jobs by their snake_case config keys; this one by the camelCase keys.
+    // Job names are the camelCase config keys; a snake_case name on disk is read as its camelCase key.
     job: job.includes("_") ? camel(job) : job,
     market,
     wallet,

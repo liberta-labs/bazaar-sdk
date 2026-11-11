@@ -18,7 +18,7 @@ const bz = await Bazaar.connect({
   transport: window.ethereum,     // any EIP-1193 provider (a wallet, a viem client) or an RPC URL
   factory: "0x...",               // the deployment, from the Bazaar docs' deployments page
   chainId: 42161,                 // optional: refuse any other chain
-  prices: { url: "https://your-hermes-proxy", apiKey: undefined }, // signed Pyth prints for calls that need one
+  prices: { token: pythToken },   // signed Pyth Pro updates for calls that need one: short-lived tokens from your backend
   subgraph: "https://...",        // optional: history
   integrator: "0xYourFrontend",   // optional: your referral fee address, set on every order you create
 });
@@ -131,7 +131,10 @@ back, worst case), the exact `approvals` it needs, and plain-language `notes`.
   (`proposeInsurerTermination`, `voteForInsurerTermination`, `executeInsurerTermination`),
   `terminateStalePair`, `terminateScheduledPair` (fetches and checks the archived Pyth prints that prove
   the settlement price, under each settlement rule), `finalizeTermination`, `getTerminalEntitlement`.
-- `bz.listings`: `proposePairDeployment` (bond and seed), settle, expire, `claimSeedRefund`, composites.
+- `bz.listings`: `proposePairDeployment` (bond and seed), settle, expire, `claimSeedRefund`, composites,
+  and `openListings`: every listing proposal not yet resolved (in review, settleable or disputed),
+  found through the subgraph, or the factory's logs from a `fromBlock` when there is none, and each
+  read on chain.
 - `bz.governance`: UMA identifier upgrades (propose, settle, expire, activate) and their timelock.
 - `bz.uma`: assertion status, disputes (`disputeAssertion` with its bond approval), settlement, and a
   preview of a DVM ruling before anyone records it.

@@ -138,7 +138,7 @@ describe("history queries", () => {
     ]);
   });
 
-  // Audit F6: the fill allocated one candle per period without bound and looped forever on interval <= 0.
+  // Without bounds the fill would allocate one candle per period, and loop forever on interval <= 0.
   it("refuses gap fills it cannot bound: unknown intervals, off-grid or unsafe starts, too long a span", () => {
     const c = (t: number, interval = 60): H.Candle => ({ id: `x-${interval}-${t}`, pair: PAIR, interval, periodStart: t, open: 1n, high: 1n, low: 1n, close: 1n, volumeSize: 0n, volumeNotional: 0n, tradeCount: 1 });
     const refused = (f: () => unknown, field: string, msg: RegExp) => {

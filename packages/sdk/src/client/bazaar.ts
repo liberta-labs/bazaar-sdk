@@ -6,7 +6,7 @@
  *     const bz = await Bazaar.connect({
  *       transport: window.ethereum,               // or a viem client, or an RPC URL
  *       factory: "0x...",
- *       prices: "https://hermes.example/v2",      // or { url, apiKey }, or any PriceUpdateSource
+ *       prices: { token: () => pythToken() },     // Pyth Pro: a short-lived token from your backend; or any PriceUpdateSource
  *       subgraph: "https://subgraph.example/...", // optional: history
  *       integrator: "0xYourFrontend",             // optional: your referral fee address
  *     });
@@ -26,11 +26,12 @@
 import type { Address, Hex } from "viem";
 import type { Receipt } from "../chain/client.js";
 import type { Transport } from "../chain/rpc.js";
+import { ProClient, type ProClientOptions, printable } from "../prices/pro.js";
 import * as accountNs from "./account.js";
 import * as allowanceNs from "./allowance.js";
 import * as batchingNs from "./batching.js";
 import { CTX_FUNCTIONS } from "./bindings.generated.js";
-import { type PreparedCall, type Simulation, sendCall, simulate, waitForReceipt } from "./calls.js";
+import { InputError, type PreparedCall, type Simulation, sendCall, simulate, waitForReceipt } from "./calls.js";
 import { type BazaarContext, type ConnectOptions, type PriceUpdateSource, type SubgraphSource, connect } from "./context.js";
 import * as governanceNs from "./governance.js";
 import * as historyNs from "./history.js";
@@ -62,19 +63,53 @@ function bind<NS extends object>(ctx: BazaarContext, ns: NS, names: readonly str
 }
 
 export interface BazaarOptions extends Omit<ConnectOptions, "prices" | "subgraph"> {
-  /** A Hermes-compatible price endpoint (URL, or { url, apiKey, headers }), or any PriceUpdateSource. */
-  prices?: PriceUpdateSource | string | { url: string; apiKey?: string | null; headers?: Record<string, string> } | null;
+  /**
+   * Where signed Pyth Pro updates come from: options for a client of the SDK's own (`{ token }`, the
+   * token a string or a function that returns short-lived ones), a {@link ProClient}, or any
+   * PriceUpdateSource. A browser must not hold the API key: give it tokens its backend mints.
+   */
+  prices?: PriceUpdateSource | ProClient | ProClientOptions | null;
   /** Bazaar's subgraph (URL, or { url, apiKey }), or any SubgraphSource. Needed only for history. */
   subgraph?: SubgraphSource | string | { url: string; apiKey?: string | null } | null;
 }
 
+/** Every option a ProClient takes: the compiler holds this to ProClientOptions' keys. */
+const PRO_CLIENT_OPTIONS = {
+  token: true,
+  streamUrls: true,
+  restUrl: true,
+  symbolsUrl: true,
+  channel: true,
+  headers: true,
+  timeout: true,
+  fetch: true,
+  WebSocket: true,
+  streamAuth: true,
+  isTrustedSigner: true,
+  allowInsecure: true,
+  clock: true,
+  maxUpdateAhead: true,
+} as const satisfies Record<keyof ProClientOptions, true>;
+
+const PRICES_SHAPE =
+  "it takes Pyth Pro client options ({ token, restUrl, streamUrls, symbolsUrl, ... }), a ProClient, or any PriceUpdateSource; the token goes in token, the endpoints in restUrl, streamUrls and symbolsUrl";
+
+/**
+ * The context's price source. A value of another shape is refused rather than read as client options:
+ * a URL, or `{ url, apiKey }`, would otherwise become a client of Pyth's default endpoints without a
+ * token, which fails later and far less clearly.
+ */
 function priceSource(p: BazaarOptions["prices"]): PriceUpdateSource | null {
   if (!p) return null;
-  if (typeof p === "string") return pricesNs.hermesPriceSource(p);
-  if ("url" in p && typeof p.url === "string") {
-    return pricesNs.hermesPriceSource(p.url, { apiKey: p.apiKey ?? undefined, headers: (p as { headers?: Record<string, string> }).headers });
+  if (p instanceof ProClient) return pricesNs.proPriceSource(p);
+  const v: unknown = p;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new InputError("prices", `A ${typeof v === "string" ? "URL" : typeof v} is not a price source: ${PRICES_SHAPE}.`);
   }
-  return p as PriceUpdateSource;
+  if (typeof (v as PriceUpdateSource).latest === "function") return v as PriceUpdateSource;
+  const unknown = Object.keys(v).filter((k) => !Object.hasOwn(PRO_CLIENT_OPTIONS, k));
+  if (unknown.length > 0) throw new InputError("prices", `Unknown option ${unknown.map((k) => printable(k, 40)).join(", ")}: ${PRICES_SHAPE}.`);
+  return pricesNs.proPriceSource(v as ProClientOptions);
 }
 
 function subgraphSource(s: BazaarOptions["subgraph"]): SubgraphSource | null {

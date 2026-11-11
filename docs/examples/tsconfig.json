@@ -1,0 +1,22 @@
+{
+  // Every code sample in the docs lives in a file here and is pulled into its page with
+  // {{#include}}. `npm run docs:check` typechecks them all against the packages' sources, so a sample
+  // that no longer matches the SDK fails the docs build instead of misleading a reader.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "incremental": false,
+    "noUnusedLocals": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "baseUrl": "../..",
+    "paths": {
+      "@liberta-labs/bazaar-sdk": ["packages/sdk/src/index.ts"],
+      "@liberta-labs/bazaar-keeper": ["packages/keeper/src/index.ts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}

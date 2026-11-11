@@ -48,14 +48,35 @@ export const NETWORKS: Readonly<Record<string, NetworkPreset>> = {
   },
 };
 
-/**
- * `prices.endpoint` shortcuts. "bazaar" is the shared endpoint Bazaar intends to run; it has no URL
- * until that service exists.
- */
-export const PRICE_ENDPOINTS: Readonly<Record<string, string | null>> = {
-  pyth: "https://pyth.dourolabs.app/hermes",
-  bazaar: null,
+/** Where Pyth Pro is served: its price stream, its request API, and its symbols registry. */
+export interface ProEndpoints {
+  /** WebSocket stream endpoints. A client connects to every one of them, since any single one may go down. */
+  readonly streamUrls: readonly string[];
+  /** Base URL of the request API (`POST /v1/latest_price`, `POST /v1/price`). */
+  readonly restUrl: string;
+  /** Base URL of the symbols registry (`GET /v1/symbols`), which needs no token. */
+  readonly symbolsUrl: string;
+}
+
+/** Pyth's own Pyth Pro endpoints. */
+export const PYTH_PRO: ProEndpoints = {
+  streamUrls: [
+    "wss://pyth-lazer-0.dourolabs.app/v1/stream",
+    "wss://pyth-lazer-1.dourolabs.app/v1/stream",
+    "wss://pyth-lazer-2.dourolabs.app/v1/stream",
+  ],
+  restUrl: "https://pyth-lazer.dourolabs.app",
+  symbolsUrl: "https://pyth.dourolabs.app",
 };
 
-/** Feed metadata (symbols for market labels) is served without a key here. */
-export const PUBLIC_FEED_METADATA_URL = "https://hermes.pyth.network";
+/** Where a Pyth Pro API key is exchanged for a short-lived token (`POST`, the key as the bearer). */
+export const PYTH_PRO_TOKEN_URL = "https://pyth.dourolabs.app/auth/token";
+
+/**
+ * `prices.endpoint` shortcuts. "bazaar" is the shared endpoint Bazaar intends to run; it has no URLs
+ * until that service exists.
+ */
+export const PRICE_ENDPOINTS: Readonly<Record<string, ProEndpoints | null>> = {
+  pyth: PYTH_PRO,
+  bazaar: null,
+};

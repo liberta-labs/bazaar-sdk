@@ -205,7 +205,7 @@ export interface AccountOptions {
   readonly block?: Pick<Block, "number" | "timestamp"> | null;
   /** Live prices ({@link LivePrices}) to value the position at and to judge the venue with. */
   readonly prices?: LivePriceView | null;
-  /** Without live prices, ask the context's Hermes source for the legs (in parallel with the first read). Default true. */
+  /** Without live prices, ask the context's Pyth Pro source for the legs (in parallel with the first read). Default true. */
   readonly fetchPrices?: boolean;
 }
 
@@ -630,7 +630,7 @@ function stateOf(m: MarketSnapshot | MarketState | null | undefined): MarketStat
 
 /**
  * The account `user` on one market. The position is valued at, in order: `price`, the live price from
- * `prices`, one Hermes request (when the context's source is a {@link hermesPriceSource}), or the
+ * `prices`, one Pyth Pro request (when the context's source is a {@link proPriceSource}), or the
  * pair's stored price (`price.source` says which). Two batched reads: the position, its live order ids
  * and the stored price first; then the lens at that price (solvency, max withdrawable), the order
  * exposure, nonce, terminal entitlement, allowance and the orders themselves, together with the

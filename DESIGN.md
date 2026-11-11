@@ -29,7 +29,7 @@ Signatures (gasless calls, USDC permits) are requested from an EIP-1193 provider
 
 A connection is a `BazaarContext` (`client/context.ts`): one chain, one deployment read from its
 factory, and optional price and subgraph sources behind small interfaces, so any EIP-1193 provider,
-viem client, Hermes proxy or GraphQL endpoint can stand behind them. Each area (markets, account,
+viem client, Pyth Pro client or GraphQL endpoint can stand behind them. Each area (markets, account,
 live, trade, insurance, signing, permits, relay, batching, history, previews, termination, listings,
 governance, uma) is a module of plain functions taking the context first; the `Bazaar` facade
 (`client/bazaar.ts`) binds the context for every such function, from a list `scripts/gen-bindings.mjs`
@@ -66,9 +66,9 @@ person to sign.
   ┌─────────────────────────────┼──────────────────────────────┐
   ▼                             ▼                              ▼
 Reader (sync/reader.ts)    PriceService (prices/)        Lanes (exec/wallets.ts)
-factory → markets, legs,   one Hermes stream, per-pair   one signer + nonce
-per-block state, candidate update payloads, composite    sequence per wallet
-re-reads                   prices, freshness
+factory → markets, legs,   Pyth Pro stream, one update   one signer + nonce
+per-block state, candidate per pair, composite prices,   sequence per wallet
+re-reads                   freshness
   │                             │                              ▲
   ▼                             │                              │
 Store (state/)  ◀── LogTail (sync/tail.ts) ◀── subgraph bootstrap (sync/bootstrap.ts)
@@ -96,6 +96,18 @@ print costs RPC requests only for real candidates. The print path waits while th
 meanwhile are not indexed yet, and the bounty deltas being replayed would land on top of what a
 plan re-read.
 
+A planner judges a call at the price the pair will judge it at. A pair stores an update's price only
+when it was generated in a later second than the price it holds (for a composite, when its older leg
+was), so while a market's stored price is from the print's second or a later one, the planners judge
+at the stored price: a candidate that crosses only at the print waits for the next second's print,
+and one that crosses at the stored price is not missed. Such a call carries no update: the chain's
+stored price never goes back, so the pair could never store the print, and attaching it would only
+cost its fee and a revert once the print aged past the window. A candidate the chain refuses waits
+`engine.simCooldownSeconds` before it is simulated again; nothing else schedules a retry. Just before
+signing, the executor checks the age of the price a call relies on against the chain's time, and does
+not send one older than the pair's 3 s window less `prices.sendMarginSeconds`: nothing refused that
+candidate, so the next print plans it again.
+
 ## The subgraph finds, the chain decides
 
 The subgraph lags the chain and cannot see state that changes without an event: the funding index
@@ -104,7 +116,11 @@ discovery source.
 
 1. **Bootstrap.** Read `_meta`, then page through open positions and live or bounty-holding orders,
    every page pinned to that block, so the snapshot is consistent. With no subgraph, replay the
-   factory's, the terminator's and every market's logs from `startBlock` instead.
+   factory's, the terminator's and every market's logs from `startBlock` instead. Left out (and not
+   given by an official network preset), `startBlock` is the factory's deployment block, found by a
+   binary search on `eth_getCode` at historical blocks: nothing of Bazaar's emits a log before the
+   factory exists, and one request covers every address over a block range, so the scan's cost is set
+   by its first block, not by when each pair was listed.
 2. **Tail.** From the next block, `eth_getLogs` over the factory, the terminator and every market,
    `rpc.logChunk` blocks a request. Events that report full state (a position bucket, an order
    update) overwrite; fills and bounty movements apply as deltas. A head whose hash changed rewinds
@@ -123,19 +139,47 @@ stamps, vault buckets) is read in one batched call when a market's events mark i
 
 ## Prices
 
-- **One stream.** The keeper subscribes once to the union of every watched market's legs plus
-  ETH/USD (for pricing gas), and falls back to polling `latest` when the stream fails. Each newer
-  print, from the stream or a poll, wakes the price-driven planners (see Architecture).
-- **Per-pair payloads.** A Pyth accumulator update carries one signed root and a separate proof per
-  feed, so `prices/accumulator.ts` re-encodes the stream's multi-feed update with only one pair's
-  legs, without re-signing. A call then verifies only its own feeds.
-- **Freshness.** The pair accepts a print at most 3 s from the block's time whose confidence is
-  within 2% (per leg, and on the composed price). A call carries a print only while it is
+Prices come from Pyth Pro: signed updates fetched off chain and verified on chain by Pyth's verifier
+contract, which stores nothing. `prices/lazer.ts` reads and builds the updates, `prices/pro.ts` is the
+client, and `prices/service.ts` keeps the live state.
+
+- **Signed bytes only.** Every price is parsed from the update's signed payload, with the same
+  strictness as the oracle's own parser, never from the JSON an endpoint sends beside it. With a
+  signer check installed (a context installs one that asks the deployment's verifier), an update
+  whose signature does not recover to a trusted signer never becomes a print.
+- **One subscription per pair.** The stream subscribes to each watched market's legs as one set (plus
+  ETH/USD on its own, for pricing gas), so the signed update a call attaches carries exactly that
+  pair's feeds, both legs of a composite in one, and costs one verification fee. The same
+  subscriptions run on every stream endpoint, and each update is taken once, from whichever endpoint
+  brings it first, and nothing counts as taken before its signer check passes. When the stream
+  fails, the service polls `latest` in requests of at most 255 feeds (all one update carries), each
+  market's legs in one.
+- **Generation time, not update time.** A quiet feed's updates carry its last price forward under
+  each new timestamp. A print's age is therefore when its price was generated (the feed update
+  timestamp), which is what the pair judges; a newer update with the same price is not a newer print.
+- **Freshness.** The pair accepts a price generated at most 3 s from the block's time whose confidence
+  is within 2% (per leg, and on the composed price). A call carries an update only while its price is
   `sendMarginSeconds` younger than that, so it is still fresh when the transaction lands. Attaching
-  an older print would revert the call, so a closed session market gets no update and only the jobs
+  an older one would revert the call, so a closed session market gets no update and only the jobs
   that work on the stored price proceed (liquidation, within 10 minutes of the stored price).
-- **The pair reads Pyth's cache first** and verifies an attached update only when the cache is stale,
-  so attaching one costs no verification gas when another transaction has just posted.
+- **A live price needs four properties.** Price, exponent, a confidence above zero and a generation
+  time. The oracle refuses an update without any of them, so a feed entry lacking one yields no print.
+- **No price on chain but the pair's own.** An update a call carries is verified and must be fresh, or
+  the call reverts; the pair then judges the call at it when it was generated in a later second than
+  the price the pair holds, and at the price it holds otherwise. A call without one runs on the
+  pair's stored price while that is at most 3 s old (at any age on a market with trading hours, where
+  the call accepts that). So the SDK's builders attach an update only when the oracle would accept
+  it, and otherwise send none on a market with trading hours and refuse to build on a continuously
+  traded one (`NoFreshPriceError`).
+- **The keeper's client.** The keeper builds one `ProClient` from `prices` (the endpoint's three places,
+  the token, the channel) and streams on the `ws` package (Node has a global WebSocket only from 22),
+  bounded so an endpoint cannot make it buffer more than the client reads: no compression, no
+  redirects, a handshake timeout, and a frame announcing more than three times the SDK's
+  `MAX_STREAM_MESSAGE` ends the connection unread. Once the deployment is read it installs the
+  verifier's signer check unless `prices.checkSigners` is off (and then warns at start): the ETH/USD
+  print that prices gas reaches no contract, so only that check vouches for it. Market labels come
+  from the symbols registry, which needs no token. `terminateScheduledPair` runs the SDK's builder
+  with the client's `atTick`.
 
 ## Simulation probe
 
@@ -206,32 +250,54 @@ ADL, refresh, collect: the pair halts matching), limbo (collect only), settling 
 
 ## terminateScheduledPair
 
-The call must carry archived Pyth prints that prove themselves. The keeper reads
-`settlementRule(pair)` and fetches, per leg, the first print at or after each target from the
-endpoint's historical route, checking that each print's `prevPublishTime` is before its target
-(the "first at or after" condition) and that it is published no later than `latestPublishTs`:
+The call must carry archived Pyth Pro updates from the one-second channel, which issues one update
+per second, stamped on the second. `client/termination.ts` reads `settlementRule(pair)` and fetches
+what the rule needs from the price source's `atTick`:
 
-- `SETTLE_WINDOW`: one print per leg at or after `firstTarget`.
-- `SETTLE_CHAIN`: five samples, each target the previous sample's later leg plus 600 s.
+- `SETTLE_TICK` (UMA's rule): the update stamped at the cutoff, carrying every leg. The pair settles
+  at the price it carries, whenever that price was generated.
+- `SETTLE_CHAIN`: five samples, each the earliest second whose update carries a price generated at or
+  after the sample's target, the next target 600 s past that second (the later leg's). The target's
+  own update proves itself; a later second is proven together with the quiet second before it. That
+  second is found by doubling the step from the target and bisecting, since a price's generation time
+  never goes backwards from one second to the next.
 - A claim-backed vote whose verdict nobody has recorded may settle under either rule, and the call
-  records the verdict itself, so the keeper builds both sets, simulates each and sends the one the
-  contract accepts. That also avoids recording an upheld verdict on its own, which would start its
-  12 h grace before the print is in hand.
-- Past `lastResortTs`, an empty call settles at the stored price.
+  records the verdict itself, so both sets are built, each is simulated, and the one the contract
+  accepts is sent. That also avoids recording an upheld verdict on its own, which would start its
+  12 h grace before the update is in hand.
+- Past `lastResortTs`, an empty call settles at the stored price, for good. By default
+  (`storedPrice: "whenAbsent"`) that call is offered only when every set failed because the archive
+  holds no usable update and the archive is shown to work (it serves ETH/USD's one-second update from a
+  minute before the chain's time): a timeout, a refusal, a wrong archive URL or a refused set may hide
+  a proven price, and settling at the stored price cannot be undone. The plan then says why it is
+  withheld; `"always"` offers it whenever no proven set is accepted, `"never"` never does.
+
+Every set is first verified by calling the pair's oracle as the terminator does, so a set Pyth would
+refuse is never offered as a proven settlement. The fee is the oracle's `getUpdateFee` of the number
+of updates.
+
+The keeper's `run terminate-scheduled` takes the policy as `--stored-price` and sends what its
+preview showed or nothing: just before sending it builds the plan again and stops when the rule, the
+settlement price or the call differs. A settlement at the stored price is sent only with
+`--accept-stored-price`, after the preview has shown that price and how old it is; the library's
+`keeper.run.terminateScheduledPair` asks for `acceptStoredPrice` the same way. The opportunity alert
+names the rule a settlement is under, and calls a stored-price fallback what it is.
 
 ## Testing
 
 - **Unit tests** (`packages/*/test`, vitest): the formula ports against hand-worked cases, ABI encoding
-  and log and error decoding, accumulator parsing and re-encoding, the store's event handling and
+  and log and error decoding, Pyth Pro update parsing, encoding and signing, the price client against a
+  fake request API and a fake WebSocket, the store's event handling and
   snapshots, the config rules, the spend policy, keystores (cross-checked against eth-account in both
   directions), each job's planning, the engine's print and tick paths, the CLI, and every frontend
   module against a fake EIP-1193 transport (typed-data hashes against the documented type strings,
   packing, validation, fee and margin math against hand-worked Solidity cases, a message for every
   custom error).
-- **End to end** (`packages/keeper/test/e2e`, `npm run test:e2e`): replays a recorded deployment of
-  Bazaar's current contracts on a fresh Anvil (no compilation; `fixtures/README.md` says how the record
-  is made), lists an ETH/USD market, builds a book, a stop-loss and a leveraged position, then runs the
-  real keeper with every job enabled against the mock Hermes server, moving the price and the clock to
+- **End to end** (`packages/keeper/test/e2e`, `npm run test:e2e`): replays a deployment of Bazaar's
+  current contracts on a fresh Anvil (no compilation: `fixtures/build.mjs` computes it from a Bazaar
+  build's artifacts), lists an ETH/USD market, builds a book, a stop-loss and a leveraged position,
+  then runs the real keeper with every job enabled against the mock Pyth Pro server (its updates
+  signed with the public test key the deployment's mock verifier trusts), moving the price and the clock to
   give each job its work, and checks each outcome on chain (it also reports the keeper's latency from
   print to send). A second file drives the frontend SDK through the same scenario: permits, every
   order type, gasless relaying, previews compared with what the chain did, insurance exits, listings,

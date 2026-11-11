@@ -4,26 +4,30 @@
  * deployment's pairs (guard.ts `requirePair`: one cached factory read per pair), checks its inputs
  * against what it can read (the account's orders and position, the book, the live price), then
  * returns a {@link PreparedCall} with
- * an empty signature, `from` the trader, the Pyth update attached where the function takes one
- * (`value` its fee, `priceTime` its publish time) and `pullsUsdc` what the call takes from the wallet.
+ * an empty signature, `from` the trader, the Pyth Pro update attached where the function takes one
+ * and the oracle would accept it (feeds.ts `priceUpdateFor`: `value` its fee, `priceTime` the second
+ * its price was generated in; `noFreshPrice` saying why there is none) and `pullsUsdc` what the call
+ * takes from the wallet.
  *
  * Build calls that carry a price update as late as possible, right before the wallet is asked to
- * send (calls.ts `buildAndSend`): the pair refuses a print more than 3 s from the block's time, so a
- * call older than that should be rebuilt. The gasless forms of the same actions are in relay.ts.
+ * send (calls.ts `buildAndSend`): the pair refuses a price generated more than 3 s from the block's
+ * time, so a call older than that should be rebuilt. The gasless forms of the same actions are in
+ * relay.ts.
  *
  * This module also reads the live price out of a signed update (`parsePriceUpdate`,
  * `pairPriceFromUpdate`, `livePairPrice`), composed as BazaarOracle composes it, so an order or a
  * quote is judged against the price the pair will see.
  */
 
-import { type Address, type Hex, decodeAbiParameters, getAddress, size } from "viem";
+import { type Address, type Hex, getAddress } from "viem";
 import { lens as lensCodec, pair as pairCodec } from "../chain/codec.js";
 import { MAX_WALK_STEPS, MIN_COLLATERAL_DEPOSIT, MIN_ORDER_AMOUNT, BAZAAR_SCALE, BP_SCALE, LIMIT, MAX_TRIGGER_EXECS_PER_CALL, STOP_LIMIT, ZERO_ADDRESS } from "../constants.js";
 import { type PairPrice, pairPrice, triggerReached } from "../formulas/index.js";
-import { type PriceMessage, isAccumulator, parse as parseAccumulator } from "../prices/accumulator.js";
+import { type LazerPayload, MICROS_PER_SECOND, feedIdHex, legEntries, readUpdate } from "../prices/lazer.js";
+import { isLivePrint } from "../prices/pro.js";
 import { InputError, type PreparedCall } from "./calls.js";
 import { type BazaarContext, requirePrices } from "./context.js";
-import { pairFeeds, priceUpdateFor } from "./feeds.js";
+import { type FreshUpdate, NoFreshPriceError, pairFeeds, priceUpdateFor } from "./feeds.js";
 import { requirePair } from "./guard.js";
 import {
   type AccountOrderState,
@@ -59,53 +63,48 @@ export class PriceUpdateError extends Error {
   override readonly name = "PriceUpdateError";
 }
 
-const PRICE_STRUCT = [
-  { name: "price", type: "int64" },
-  { name: "conf", type: "uint64" },
-  { name: "expo", type: "int32" },
-  { name: "publishTime", type: "uint256" },
-] as const;
-// MockPyth.createPriceFeedUpdateData: abi.encode(PriceFeed(id, price, emaPrice), prevPublishTime).
-const MOCK_FEED = [
-  {
-    type: "tuple",
-    components: [
-      { name: "id", type: "bytes32" },
-      { name: "price", type: "tuple", components: PRICE_STRUCT },
-      { name: "emaPrice", type: "tuple", components: PRICE_STRUCT },
-    ],
-  },
-  { type: "uint64" },
-] as const;
-const MOCK_FEED_BYTES = 320;
+/** One feed's live price as a signed update carries it. */
+export interface UpdatePrice {
+  readonly feedId: Hex;
+  readonly price: bigint;
+  readonly conf: bigint;
+  readonly expo: number;
+  /** The second the price was generated in: what the pair's freshness window judges. */
+  readonly publishTime: number;
+  /** When the price was generated, in microseconds (the feed update timestamp). */
+  readonly generatedUs: bigint;
+}
+
+/** Each update's payload, read from its bytes; throws PriceUpdateError on one that is not a Pyth Pro update. */
+function readUpdates(update: readonly Hex[]): LazerPayload[] {
+  return update.map((blob) => {
+    try {
+      return readUpdate(blob);
+    } catch (e) {
+      throw new PriceUpdateError(e instanceof Error ? e.message : String(e));
+    }
+  });
+}
 
 /**
- * The price messages a `priceUpdate: bytes[]` carries: Pyth accumulator updates ("PNAU", what Hermes
- * serves) and MockPyth's update data (local deployments). Throws PriceUpdateError on anything else.
+ * The live prices a `priceUpdate: bytes[]` carries, read from each update's signed payload: one
+ * entry per feed that holds a price a live call could use (prices/pro.ts `isLivePrint`), update by
+ * update. The signatures are not checked here; the chain checks them. Throws PriceUpdateError on an
+ * update that is not a Pyth Pro update.
  */
-export function parsePriceUpdate(update: readonly Hex[]): PriceMessage[] {
-  const out: PriceMessage[] = [];
-  for (const blob of update) {
-    if (isAccumulator(blob)) {
-      try {
-        for (const u of parseAccumulator(blob).updates) if (u.message) out.push(u.message);
-      } catch (e) {
-        throw new PriceUpdateError(`malformed Pyth update: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    } else if (size(blob) === MOCK_FEED_BYTES) {
-      const [feed, prev] = decodeAbiParameters(MOCK_FEED, blob);
+export function parsePriceUpdate(update: readonly Hex[]): UpdatePrice[] {
+  const out: UpdatePrice[] = [];
+  for (const u of readUpdates(update)) {
+    for (const f of u.feeds) {
+      if (f.id === 0 || !isLivePrint(f)) continue;
       out.push({
-        feedId: feed.id.toLowerCase() as Hex,
-        price: feed.price.price,
-        conf: feed.price.conf,
-        expo: feed.price.expo,
-        publishTime: Number(feed.price.publishTime),
-        prevPublishTime: Number(prev),
-        emaPrice: feed.emaPrice.price,
-        emaConf: feed.emaPrice.conf,
+        feedId: feedIdHex(f.id),
+        price: f.price,
+        conf: f.confidence,
+        expo: f.exponent,
+        publishTime: Number(f.feedUpdateTimestamp / MICROS_PER_SECOND),
+        generatedUs: f.feedUpdateTimestamp,
       });
-    } else {
-      throw new PriceUpdateError("unrecognized Pyth update format");
     }
   }
   return out;
@@ -113,21 +112,19 @@ export function parsePriceUpdate(update: readonly Hex[]): PriceMessage[] {
 
 /**
  * The pair price an update proves, composed from the pair's legs exactly as BazaarOracle composes it
- * (formulas `pairPrice`): spot, the confidence bracket, the oldest leg's publish time, and whether it
- * clears the 2% confidence cap. Null when the update does not carry every leg.
+ * (formulas `pairPrice`): spot, the confidence bracket, the second the older leg's price was
+ * generated in, and whether it clears the 2% confidence cap. Each leg is read from whichever update
+ * carries its most recently generated price, as the oracle reads it. Null when the oracle would
+ * refuse the update whatever the block time: a leg no update carries, or one whose entry lacks a
+ * property a live price needs, holds no price, or has no confidence.
  */
 export async function pairPriceFromUpdate(ctx: BazaarContext, pair: Address, update: readonly Hex[]): Promise<PairPrice | null> {
   const feeds = await pairFeeds(ctx, pair);
-  const newest = new Map<string, PriceMessage>();
-  for (const m of parsePriceUpdate(update)) {
-    const k = m.feedId.toLowerCase();
-    const prev = newest.get(k);
-    if (!prev || m.publishTime > prev.publishTime) newest.set(k, m);
-  }
-  const legs = feeds.legs.map((id) => newest.get(id.toLowerCase()));
-  if (legs.some((l) => !l)) return null;
+  readUpdates(update); // an update that cannot be read is a PriceUpdateError
+  const legs = legEntries(update, feeds.legs).map((e) => e?.feed);
+  if (legs.some((l) => !l || !isLivePrint(l))) return null;
   return pairPrice(
-    legs.map((l) => ({ price: l!.price, conf: l!.conf, expo: l!.expo, publishTime: l!.publishTime })),
+    legs.map((l) => ({ price: l!.price, conf: l!.confidence, expo: l!.exponent, publishTime: Number(l!.feedUpdateTimestamp / MICROS_PER_SECOND) })),
     feeds.invertQuote,
   );
 }
@@ -159,7 +156,8 @@ async function checkPrice(ctx: BazaarContext, pair: Address, update?: readonly H
       return (await livePairPrice(ctx, pair)).price.spot;
     }
   } catch {
-    // An update the SDK cannot read still works on-chain; fall back to the stored mark.
+    // No live price could be read (the source failed, or holds none for a leg): the order is
+    // checked against the stored mark instead, and the pair judges it on whatever price it reads.
   }
   const s = await storedPairPrice(ctx, pair);
   return s.spotPrice > 0n ? s.spotPrice : null;
@@ -280,9 +278,12 @@ export const terminalPayoutNote = (payout: bigint, principalRatio: bigint) =>
  * Withdraw collateral (BAZAAR precision; the wallet receives it floored to micro-USDC). A trader with
  * a position or resting orders is priced fresh: the pair keeps the position's margin, its resting
  * orders' reservation and a minimum behind, and refuses the stale fallback for a position holder. A
- * flat account reads no price. The price update is attached whenever a price source is connected
- * (the pair refunds its fee when it does not read it); without one, the call carries none and is
- * refused here for an account that needs one. Frozen for a position holder while an ADL window is
+ * flat account reads no price. The update is attached when a price source is connected and holds one
+ * the oracle would accept (feeds.ts `priceUpdateFor`; the pair refunds the fee of an update it does
+ * not read). Otherwise the call carries none, which a flat account does not need; for an account that
+ * does, it is refused here when no price source is connected or the market is continuously traded
+ * (NoFreshPriceError), and on a market that keeps trading hours it is left to the pair, which judges
+ * it on its stored price. Frozen for a position holder while an ADL window is
  * open, and for everyone while the settlement window is. On a terminated pair the wallet receives
  * `amount × principalRatio` ({@link terminalWithdrawal}), which the summary shows; a withdrawal that
  * would pay nothing is refused.
@@ -311,27 +312,40 @@ export async function withdrawCollateral(
     value: fresh.fee,
     from: getAddress(from),
     summary: `Withdraw ${usdc(amount)} USDC of collateral${terminal ? ` (${terminalPayoutNote(terminal.payout, terminal.principalRatio)})` : ""}`,
-    ...(fresh.publishTime !== null ? { priceTime: fresh.publishTime } : {}),
+    ...priceFields(fresh),
     pullsUsdc: 0n,
   };
 }
 
+/** No update, and why. */
+const noUpdate = (reason: string | null): FreshUpdate => ({ update: [], fee: 0n, publishTime: null, attached: false, reason });
+
 /**
- * A price update for a call that reads a price only sometimes: none when `withPrice` is false;
- * attached when a price source is connected (the pair refunds the fee of an update it does not
- * read); otherwise none, and a ConnectError when `withPrice` is true or `needed()` says the call
- * will read one.
+ * A price update for a call that reads a price only sometimes: none when `withPrice` is false; when a
+ * price source is connected, the update feeds.ts `priceUpdateFor` gives (the pair refunds the fee of
+ * an update it does not read), or none where it has no fresh price and the call reads none
+ * (`withPrice` not true and `needed()` false); otherwise none, and a ConnectError when `withPrice` is
+ * true or `needed()` says the call will read one.
  */
-export async function optionalUpdate(
-  ctx: BazaarContext,
-  pair: Address,
-  withPrice: boolean | undefined,
-  needed: () => Promise<boolean>,
-): Promise<{ update: Hex[]; fee: bigint; publishTime: number | null }> {
-  if (withPrice === false) return { update: [], fee: 0n, publishTime: null };
-  if (ctx.prices) return priceUpdateFor(ctx, pair);
+export async function optionalUpdate(ctx: BazaarContext, pair: Address, withPrice: boolean | undefined, needed: () => Promise<boolean>): Promise<FreshUpdate> {
+  if (withPrice === false) return noUpdate(null);
+  if (ctx.prices) {
+    try {
+      return await priceUpdateFor(ctx, pair);
+    } catch (e) {
+      // A continuously traded market without a fresh price fails only a call that reads one.
+      if (!(e instanceof NoFreshPriceError) || withPrice === true || (await needed())) throw e;
+      return noUpdate(e.reason);
+    }
+  }
   if (withPrice === true || (await needed())) requirePrices(ctx); // throws: no price source
-  return { update: [], fee: 0n, publishTime: null };
+  return noUpdate(null);
+}
+
+/** A call's price fields: when its update's price was generated, or why it carries none for want of a fresh one. */
+export function priceFields(fresh: FreshUpdate): { priceTime?: number; noFreshPrice?: string } {
+  if (fresh.publishTime !== null) return { priceTime: fresh.publishTime };
+  return fresh.reason !== null ? { noFreshPrice: fresh.reason } : {};
 }
 
 // ---- orders ----
@@ -406,7 +420,7 @@ export async function createOrder(ctx: BazaarContext, pair: Address, from: Addre
     value: fresh.fee,
     from: getAddress(from),
     summary: describeOrder(spec),
-    priceTime: fresh.publishTime,
+    ...priceFields(fresh),
     pullsUsdc: specBounty(spec),
   };
 }
@@ -591,7 +605,7 @@ export async function amendOrders(ctx: BazaarContext, pair: Address, from: Addre
     value: fresh.fee,
     from: getAddress(from),
     summary: n === 1 ? `Amend order #${amends[0]!.orderId} to ${px(amends[0]!.size)} at ${px(amends[0]!.limitPrice)}` : `Amend ${n} orders`,
-    priceTime: fresh.publishTime,
+    ...priceFields(fresh),
     pullsUsdc: 0n,
   };
 }
@@ -713,7 +727,7 @@ export async function executeTriggeredOrders(ctx: BazaarContext, pair: Address, 
     value: fresh.fee,
     from: me,
     summary: orderIds.length === 1 ? `Execute your order #${orderIds[0]}` : `Execute ${orderIds.length} of your orders`,
-    priceTime: fresh.publishTime,
+    ...priceFields(fresh),
     pullsUsdc: 0n,
   };
 }

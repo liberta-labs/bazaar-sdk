@@ -1,0 +1,25 @@
+{{!--
+  The page's Markdown path relative to the book root (keeper/setup.md), which page-actions.js
+  resolves to the copy the docs workflow publishes beside the HTML. index.html reports index.md, so
+  the workflow publishes the first chapter under that name too. Only chapter pages carry a chapter
+  title; the print page and 404.html have no Markdown source and get no tag, which keeps the page
+  actions off them.
+--}}
+{{#if chapter_title}}
+<meta name="bazaar-page-source" content="{{path}}">
+{{/if}}
+
+{{!--
+  Page-view counting, as docs.bazaar.finance does it, is off until this site has its own GoatCounter
+  code (counting into Bazaar's own dashboard would mix the two sites' pages). To turn it on, create a
+  site at goatcounter.com and replace this comment with:
+
+  <script>
+      window.goatcounter = {
+          path: function () {
+              return location.pathname.replace(/\.html$/, '').replace(/\/index$/, '/');
+          }
+      };
+  </script>
+  <script data-goatcounter="https://<your-code>.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+--}}

@@ -3,7 +3,7 @@
 import { type Market, type ProbeResult, UNLOAD_FLOOR_DECAY, inventorySize, pair } from "@liberta-labs/bazaar-sdk";
 import type { Address } from "viem";
 import type { UnloadJob as UnloadJobConfig } from "../../config/index.js";
-import { type Action, lockKey } from "../../exec/executor.js";
+import { type Action, type ActionResult, lockKey } from "../../exec/executor.js";
 import { fmtG } from "../../exec/policy.js";
 import { Job, monotonic, units } from "./base.js";
 
@@ -31,7 +31,7 @@ export class UnloadJob extends Job<UnloadJobConfig> {
     if ((this.nextCheck.get(m.address) ?? 0) > monotonic()) return [];
     const lock = lockKey("unload", m.address);
     if (this.k.executor.inflight.has(lock)) return [];
-    const pc = this.priced(m); // against the stored price the walk sells nothing and pays nothing
+    const pc = this.priced(m); // against a stale stored price the walk sells nothing and pays nothing
     if (pc === null) return [];
     const mono = monotonic();
     let next = mono + this.cfg.recheckSeconds;
@@ -44,15 +44,21 @@ export class UnloadJob extends Job<UnloadJobConfig> {
       }
     }
     this.nextCheck.set(m.address, next);
-    const updates = pc.updates; // before the first await: the print the walk is priced at
+    const updates = pc.updates; // before the first await: the update of the print the walk is priced at, or none for the stored price
     const fee = await this.k.reader.updateFee(updates);
     return [
       this.action(m, m.address, PAIR.encode("unloadVault", this.cfg.maxSteps, updates), `unload inventory (${fmtG(units(held))} units held)`, {
         value: fee,
+        priceTime: pc.priceTime,
         locks: [lock],
         rewardPair: m.address,
         requires: soldSomething,
       }),
     ];
+  }
+
+  /** A price that aged before the send refused nothing: simulate again at the next tick, with a newer one. */
+  override note(action: Action, result: ActionResult): void {
+    if (result.priceAged && action.market) this.wake(action.market.address);
   }
 }

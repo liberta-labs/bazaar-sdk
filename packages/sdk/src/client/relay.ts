@@ -60,7 +60,7 @@ import {
   takesPriceUpdate,
   typedDataFor,
 } from "./signing.js";
-import { checkCancelIds, matchHintsFor, optionalUpdate, prepareAmends, prepareOrder, terminalPayoutNote, terminalWithdrawal } from "./trade.js";
+import { checkCancelIds, matchHintsFor, optionalUpdate, prepareAmends, prepareOrder, priceFields, terminalPayoutNote, terminalWithdrawal } from "./trade.js";
 import { floorToUsdc, formatUnits18, toUsdcUnitsCeil } from "./units.js";
 
 /** A signed gasless request: every signed field, the signer, the signature and the permit. */
@@ -363,7 +363,9 @@ export async function encodeRelayed(ctx: BazaarContext, req: RelayedRequest, opt
   const pair = await requirePair(ctx, req.pair);
   const fee = chargedFee(req.relayerFee);
   const alwaysPriced = req.action === "createOrder" || req.action === "amendOrders";
-  const freshP = takesPriceUpdate(req.action) ? optionalUpdate(ctx, pair, undefined, async () => alwaysPriced) : Promise.resolve({ update: [] as Hex[], fee: 0n, publishTime: null as number | null });
+  const freshP = takesPriceUpdate(req.action)
+    ? optionalUpdate(ctx, pair, undefined, async () => alwaysPriced)
+    : Promise.resolve({ update: [] as Hex[], fee: 0n, publishTime: null, attached: false, reason: null });
   const hintsP: Promise<MatchHints | undefined> =
     req.action === "createOrder" ? (opts.hints ? Promise.resolve(opts.hints) : matchHintsFor(ctx, pair, req.spec, 0)) : Promise.resolve(undefined);
   const terminalP = req.action === "withdrawCollateral" ? terminalWithdrawal(ctx, pair, req.signer, req.amount) : Promise.resolve(null);
@@ -382,7 +384,7 @@ export async function encodeRelayed(ctx: BazaarContext, req: RelayedRequest, opt
     value: fresh.fee,
     from: opts.relayer ? getAddress(opts.relayer) : null,
     summary: `Relay for ${getAddress(req.signer)}: ${describeRelayed(req)}${paid} (fee ${formatUnits18(req.relayerFee, 6)} USDC)`,
-    ...(fresh.publishTime !== null ? { priceTime: fresh.publishTime } : {}),
+    ...priceFields(fresh),
     pullsUsdc: pull,
   };
 }

@@ -1,19 +1,21 @@
 /**
  * End-to-end: replay a Bazaar deployment on Anvil, build the ETH/USD market, and run the real keeper
- * against it (the port of the Python keeper's tests/e2e/run_e2e.py).
+ * against it.
  *
- * The keeper runs in this process with every automatic job enabled, prices from the mock Hermes
- * server, no subgraph (it indexes from logs) and Anvil's eighth account as its wallet. Each step
- * moves the price or the clock to give one job its work and checks the result on chain. The steps
- * share one chain and one keeper, so they run in order and each builds on the last.
+ * The keeper runs in this process with every automatic job enabled, prices streamed from the mock
+ * Pyth Pro server (its updates signed with the test key the local verifier trusts, and checked
+ * against that verifier by the keeper), no subgraph (it indexes from logs) and Anvil's eighth account
+ * as its wallet. Each step moves the price or the clock to give one job its work and checks the
+ * result on chain. The steps share one chain and one keeper, so they run in order and each builds on
+ * the last.
  *
  * It also measures how fast the keeper reacts to a price move: from the moment the mock's price
  * changes, to the keeper receiving the print, to its "sent" event for the trigger and liquidation
- * transactions. The mock streams one print a second, so up to a second of the first leg is the
- * mock's cadence, not the keeper. Each move waits first until Pyth's on-chain cache is stale: while
- * it is fresh (3 s after any priced call) the pair prices from it and ignores the update a call
- * carries, so a move made then reaches the chain only once the cache ages out, for any sender. The
- * keeper sees that as a zero-reward simulation and retries after `engine.simCooldownSeconds`.
+ * transactions. The mock streams on fixed_rate@200ms, so up to an interval of the first leg is the
+ * mock's cadence, not the keeper. Each move waits first until the chain's clock has passed the
+ * second of the pair's stored price: a call carrying a print from that second is judged at the
+ * stored price (the pair keeps the first price of a second), so the keeper plans the move only on
+ * the next second's print, for any sender.
  *
  *     anvil --port 8546 --block-time 1 --base-fee 10000000 --code-size-limit 100000
  *     npx vitest run -c vitest.e2e.config.ts packages/keeper/test/e2e/keeper.e2e.test.ts
@@ -25,14 +27,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { LIMIT, MAX_PRICE_STALENESS } from "@liberta-labs/bazaar-sdk";
-import { Keeper, MockHermes, findOpportunities, parseConfig, setupLogging, startMockHermes } from "../../src/index.js";
+import { LIMIT } from "@liberta-labs/bazaar-sdk";
+import { Keeper, MockPro, type MockProServer, findOpportunities, parseConfig, setupLogging, startMockPro } from "../../src/index.js";
 import type { Entry } from "../../src/exec/ledger.js";
-import type { MockHermesServer } from "../../src/devtools/mock-hermes.js";
-import { Anvil, E18, FEED, LENS, MOCKS, PAIR, Scenario, clientVersion, deploy, keys, waitUntil } from "./chain.js";
+import { Anvil, E18, FEED, LENS, PAIR, Scenario, clientVersion, deploy, keys, waitUntil } from "./chain.js";
 
 const RPC = process.env.BAZAAR_E2E_RPC ?? "http://127.0.0.1:8546";
-const BROADCAST = fileURLToPath(new URL("./fixtures/run-latest.json", import.meta.url));
+const BROADCAST = fileURLToPath(new URL("./fixtures/deployment.json", import.meta.url));
 const ARBSYS_ARTIFACT = fileURLToPath(new URL("./fixtures/MockArbSys.json", import.meta.url));
 
 const version = await clientVersion(RPC);
@@ -81,8 +82,8 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
   const anvil = new Anvil(RPC);
   let snap: Hex | null = null;
   let sc: Scenario;
-  let mock: MockHermes;
-  let srv: MockHermesServer | null = null;
+  let mock: MockPro;
+  let srv: MockProServer | null = null;
   let keeper: Keeper | null = null;
   let task: Promise<void> | null = null;
   let stateDir = "";
@@ -91,17 +92,17 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
   const latencies: Latency[] = [];
 
   /**
-   * Wait until Pyth's on-chain cache for FEED is stale at the latest block. While it is fresh (at most
-   * MAX_PRICE_STALENESS seconds old) the pair prices every call from it and ignores the update the
-   * call carries, so a move made then cannot take effect until the cache ages out, whoever sends.
-   * Waiting first makes the latency below the keeper's own, not the protocol's 3 s gate.
+   * Wait until the latest block is past the second of the pair's stored price. A call carrying a
+   * print from that second (or an earlier one) is judged at the stored price, so a move made before
+   * then takes effect only with a later second's print, whoever sends. Waiting first makes the latency
+   * below the keeper's own, not that rule's.
    */
-  async function cacheStale(): Promise<void> {
-    const p = MOCKS.decode<{ publishTime: bigint }>("getPriceUnsafe", await anvil.call(sc.pyth, MOCKS.encode("getPriceUnsafe", FEED)));
-    await waitUntil(async () => (await anvil.latest())[1] - Number(p.publishTime) > MAX_PRICE_STALENESS, {
+  async function storedPriceBehind(): Promise<void> {
+    const p = PAIR.decode<{ updateTs: bigint }>("lastPairPrice", await anvil.call(sc.pair, PAIR.encode("lastPairPrice")));
+    await waitUntil(async () => (await anvil.latest())[1] > Number(p.updateTs), {
       timeout: 30,
       every: 0.1,
-      what: "the Pyth cache to go stale",
+      what: "the chain to pass the stored price's second",
     });
   }
 
@@ -116,6 +117,7 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
     });
     const t0 = performance.now();
     mock.setPrice(FEED, usdPrice);
+    sc.price = usdPrice; // the scenario's own calls carry the price the market now trades at
     return () => {
       off();
       const s = sent.find((x) => x.job === job && x.at >= t0);
@@ -141,8 +143,9 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
     console.log("-- building the market");
     await sc.setup((line) => console.log(line));
 
-    mock = new MockHermes(RPC, sc.pyth, { [FEED]: 2000.0 }, { [FEED]: "Crypto.ETH/USD" });
-    srv = await startMockHermes(mock, { port: 0 });
+    mock = new MockPro({ rpc: RPC, prices: { [FEED]: 2000.0 }, symbols: { [FEED]: "Crypto.ETH/USD" } });
+    await mock.sync();
+    srv = await startMockPro(mock, { port: 0 });
     stateDir = mkdtempSync(join(tmpdir(), "bazaar-keeper-e2e-"));
     const cfg = parseConfig({
       network: "anvil",
@@ -224,7 +227,7 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
   it("trigger execution: the keeper fired the stop-loss", async () => {
     console.log("-- trigger execution");
     const stop = sc.orders["stop-loss"]!;
-    await cacheStale();
+    await storedPriceBehind();
     const done = timeMove("triggers", 1940, "trigger");
     const o = await wait(async () => {
       const r = await sc.order(stop);
@@ -242,7 +245,7 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
   it("liquidation: the keeper seized the underwater position", async () => {
     console.log("-- liquidation");
     liq = await sc.liquidationPrice();
-    await cacheStale();
+    await storedPriceBehind();
     const done = timeMove("liquidation", liq, "liquidation");
     const gone = await wait(async () => (await sc.bucket(6)).size === 0n, 90, "the victim's liquidation");
     const liqs = await recorded(keeper!, "liquidation");
@@ -317,7 +320,9 @@ describe.skipIf(!anvilUp)(`keeper end to end on ${version}`, () => {
 
   it("opportunities: terminateStalePair offered", async () => {
     console.log("-- termination");
-    mock.paused.add(FEED);
+    // The feed goes quiet: its updates carry the last price forward, so nothing can refresh the pair.
+    await mock.sync();
+    mock.pause(FEED);
     await anvil.warp(22 * 86_400);
     const opps = await findOpportunities(keeper!);
     check(

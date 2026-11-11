@@ -12,6 +12,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "docs:check": "tsc -p docs/examples/tsconfig.json",
+    "docs:build": "npm run docs:check && mdbook build docs",
+    "docs:serve": "mdbook serve docs --open",
     "typecheck:check": "tsc -p tsconfig.check.json && tsc -p tsconfig.check-sdk.json",
     "sync-abis": "node scripts/sync-abis.mjs",
     "build-probe": "node scripts/build-probe.mjs",
@@ -23,6 +26,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
+    "@types/ws": "^8.18.2",
     "typescript": "^5.9.3",
     "vitest": "^2.1.9"
   }

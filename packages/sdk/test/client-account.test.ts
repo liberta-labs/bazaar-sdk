@@ -4,6 +4,7 @@ import { accountHealth, accountSnapshot, portfolio } from "../src/client/account
 import { type LivePriceView, listMarkets, marketSnapshot } from "../src/client/markets.js";
 import { TAKE_PROFIT } from "../src/constants.js";
 import { E18, FACTORY, FakeTransport, LENS, type MarketFixture, USDC, addr, contextFor, h32, withMarket } from "./client-reads-fakes.js";
+import { print as proPrint } from "./pro-fakes.js";
 
 const A = addr("0a");
 const B = addr("0b");
@@ -146,7 +147,7 @@ describe("accountSnapshot", () => {
     expect(given.price).toMatchObject({ spot: 2_000n * E18, low: 2_000n * E18, high: 2_000n * E18, source: "given" });
   });
 
-  it("without live prices, asks the context's Hermes source for the legs (beside the first read)", async () => {
+  it("without live prices, asks the context's Pyth Pro source for the legs (beside the first read)", async () => {
     const { t, ctx } = setup();
     withAccount(t, A, { bucket: { isLong: true, size: E18, entryValue: 2_000n * E18, collateral: 300n * E18 } });
     const now = Math.floor(Date.now() / 1000);
@@ -156,13 +157,13 @@ describe("accountSnapshot", () => {
       },
       async prints(ids: readonly `0x${string}`[]) {
         expect(ids).toEqual([h32("f1")]);
-        return [{ feedId: h32("f1"), price: 210_000_000_000n, conf: 100_000_000n, expo: -8, publishTime: now, prevPublishTime: null, blob: "0x" as const, received: 0 }];
+        return [proPrint(h32("f1"), now, { price: 210_000_000_000n, conf: 100_000_000n })];
       },
     };
     const ctx2 = { ...ctx, prices };
     await listMarkets(ctx2, { metadata: null });
     const s = await accountSnapshot(ctx2, A, ALICE);
-    expect(s.price).toEqual({ spot: 2_100n * E18, low: 2_099n * E18, high: 2_101n * E18, publishTime: now, source: "hermes" });
+    expect(s.price).toEqual({ spot: 2_100n * E18, low: 2_099n * E18, high: 2_101n * E18, publishTime: now, source: "pro" });
     expect(s.health).toMatchObject({ unrealizedPnl: 100n * E18 });
     expect((await accountSnapshot(ctx2, A, ALICE, { fetchPrices: false })).price?.source).toBe("stored");
   });

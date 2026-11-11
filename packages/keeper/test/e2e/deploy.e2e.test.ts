@@ -12,19 +12,20 @@
  * the suite is skipped. The run snapshots the chain before the replay and reverts to it afterwards,
  * so the next e2e file finds the deployer's nonce at 0 again and can replay on the same Anvil.
  *
- * The keeper run (keeper.e2e.test.ts, the port of the Python keeper's tests/e2e/run_e2e.py) and the
+ * The keeper run (keeper.e2e.test.ts) and the
  * frontend SDK run (frontend.e2e.test.ts) build on the same deploy + Scenario setup.
  */
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { type Address, type Hex, getAddress } from "viem";
+import { privateKeyToAddress } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type ContractCodec, STOP_LOSS, TRIGGER_PRICE_MASK } from "@liberta-labs/bazaar-sdk";
-import { ARBSYS, Anvil, E18, FACTORY, FEED, LENS, MOCKS, PAIR, Scenario, clientVersion, deploy } from "./chain.js";
+import { type ContractCodec, STOP_LOSS, TRIGGER_PRICE_MASK, lazer } from "@liberta-labs/bazaar-sdk";
+import { ARBSYS, Anvil, E18, FACTORY, FEED, LENS, MOCKS, ORACLE, PAIR, Scenario, clientVersion, deploy } from "./chain.js";
 
 const RPC = process.env.BAZAAR_E2E_RPC ?? "http://127.0.0.1:8546";
-const BROADCAST = fileURLToPath(new URL("./fixtures/run-latest.json", import.meta.url));
+const BROADCAST = fileURLToPath(new URL("./fixtures/deployment.json", import.meta.url));
 const ARBSYS_ARTIFACT = fileURLToPath(new URL("./fixtures/MockArbSys.json", import.meta.url));
 
 const version = await clientVersion(RPC);
@@ -89,7 +90,7 @@ describe.skipIf(!anvilUp)(`replayed deployment and market scenario on ${version}
   });
 
   it("replays every recorded contract and etches ArbSys", async () => {
-    for (const n of ["BazaarFactory", "BazaarPair", "BazaarPairLens", "BazaarPairTerminator", "BazaarOracle", "MockPyth", "MockUSDC", "MockOptimisticOracleV3", "MatchingEngineLib"]) {
+    for (const n of ["BazaarFactory", "BazaarPair", "BazaarPairLens", "BazaarPairTerminator", "BazaarOracle", "MockPythLazer", "MockUSDC", "MockOptimisticOracleV3", "MatchingEngineLib"]) {
       expect(names[n], n).toBeDefined();
       expect((await anvil.chain.code(names[n]!)).length, n).toBeGreaterThan(2);
     }
@@ -115,6 +116,14 @@ describe.skipIf(!anvilUp)(`replayed deployment and market scenario on ${version}
       usdc: names.MockUSDC,
       oo: names.MockOptimisticOracleV3,
     });
+  });
+
+  it("verifies prices with the mock verifier: no fee, and only the public test signer trusted", async () => {
+    expect(await read<Address>(names.BazaarOracle!, ORACLE, "pythLazer")).toBe(names.MockPythLazer);
+    expect(await read<bigint>(names.BazaarOracle!, ORACLE, "getUpdateFee", 3n)).toBe(0n);
+    expect(await read<bigint>(names.MockPythLazer!, MOCKS, "verification_fee")).toBe(0n);
+    expect(await read<boolean>(names.MockPythLazer!, MOCKS, "isValidSigner", privateKeyToAddress(lazer.localSignerKey()))).toBe(true);
+    expect(await read<boolean>(names.MockPythLazer!, MOCKS, "isValidSigner", sc.w[0])).toBe(false);
   });
 
   it("lists exactly the ETH/USD market", async () => {

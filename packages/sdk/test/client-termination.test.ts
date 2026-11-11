@@ -4,10 +4,15 @@ import { ContractCodec, factory as factoryCodec, lens as lensCodec, oracle as or
 import { InputError } from "../src/client/calls.js";
 import { ConnectError, type PriceUpdateSource } from "../src/client/context.js";
 import {
-  type PrintFetcher,
-  type SettlementPrint,
+  SETTLEMENT_RULE_TEXT,
+  SettlementPrintError,
+  type StoredPricePolicy,
+  TERMINATION_CATEGORY_INFO,
+  type TickFetcher,
+  TerminationCategory,
   chainLastResort,
   chainPrints,
+  chainSample,
   executeInsurerTermination,
   finalizeTermination,
   getInsurerVote,
@@ -15,23 +20,24 @@ import {
   getTerminalEntitlement,
   insurerProposal,
   insurerProposalId,
+  generatedAtOrAfter,
   openProposals,
-  printFetcher,
   proposalIdsFromReceipt,
   proposeInsurerTermination,
   proposeTermination,
   reasonProblem,
   settleTerminationProposal,
-  settlementPrintProblem,
+  settlementPrint,
   settlementRule,
   terminateScheduledPair,
   terminateStalePair,
   terminationProposal,
   terminationStatus,
   terminatorConstants,
+  tickFetcher,
+  tickPrints,
   unjudgedLevyBp,
   voteForInsurerTermination,
-  windowPrints,
 } from "../src/client/termination.js";
 import {
   BondQuoteError,
@@ -48,6 +54,10 @@ import {
   timeText,
   usdcText,
 } from "../src/client/uma.js";
+import { SETTLE_AWAIT_VERDICT, SETTLE_CHAIN, SETTLE_NOTHING, SETTLE_TICK } from "../src/constants.js";
+import { readUpdate } from "../src/prices/lazer.js";
+import { ProError, type ProUpdate } from "../src/prices/pro.js";
+import { FakePro, tick, unsigned } from "./pro-fakes.js";
 import { ADDR, FakeChain, Revert, b32, errorData, makeCtx, stringError } from "./termination-fakes.js";
 
 const NOW = 1_900_000_000;
@@ -65,20 +75,26 @@ const registry = new ContractCodec([
   { type: "function", name: "isIdentifierSupported", stateMutability: "view", inputs: [{ name: "i", type: "bytes32" }], outputs: [{ name: "", type: "bool" }] },
 ] as unknown as Abi);
 
-const blob = (feed: Hex, t: number) => ("0x" + feed.slice(-4) + t.toString(16).padStart(12, "0")) as Hex;
+const A_ID = 0xaaa1;
+const Q_ID = 0xf0f0;
+const ETH_ID = 2;
 
-/** A hand-built archive: the first print at or after each target, prev = the print before it. */
-function archive(series: Record<string, number[]>) {
-  const asked: [Hex, number][] = [];
-  const fetch: PrintFetcher = async (feed, target) => {
-    asked.push([feed, target]);
-    const ts = series[feed]!;
-    const i = ts.findIndex((t) => t >= target);
-    if (i < 0) return null;
-    return { feedId: feed, update: blob(feed, ts[i]!), publishTime: ts[i]!, prevPublishTime: i > 0 ? ts[i - 1]! : ts[i]! - 1_000 };
+/**
+ * Pyth's one-second archive over a FakePro: every request goes through a real ProClient, so what the
+ * settlement helpers read is parsed from update bytes. `asked` records each (feeds, second) request.
+ */
+function archive(pro: FakePro) {
+  const asked: [number[], number][] = [];
+  const client = pro.client();
+  const fetch: TickFetcher = (feeds, second) => {
+    asked.push([feeds.map((f) => Number(BigInt(f))), second]);
+    return client.atTick(feeds, second);
   };
-  return { fetch, asked };
+  return { fetch, asked, pro, blob: (second: number, ids: number[] = [A_ID]) => pro.tickAt(second, ids) };
 }
+
+/** The seconds asked for, in order. */
+const seconds = (asked: [number[], number][]) => asked.map(([, t]) => t);
 
 interface Scene {
   fake: FakeChain;
@@ -120,9 +136,8 @@ function scene(): Scene {
     locked: 0n,
     assertions: new Map<string, Record<string, unknown>>(),
     preview: new Revert(stringError("Assertion not resolved")) as unknown,
-    probe: { found: false, spotPrice: 0n, lowPrice: 0n, highPrice: 0n, publishTime: 0n },
     accept: (_updates: readonly Hex[], _value: bigint): true | Hex => true,
-    // The oracle's verification of a print set (fetchFirstPriceAtOrAfter / fetchChainedMedian): a price, or revert data.
+    // The oracle's verification of a set of updates (fetchPriceAtTick / fetchChainedMedian): a price, or revert data.
     prove: (_fn: string, _args: readonly unknown[], _value: bigint): bigint | Hex => 2_000n * E18,
     whitelisted: (_id: Hex) => true,
   };
@@ -160,11 +175,9 @@ function scene(): Scene {
     .on(ADDR.factory, factoryCodec(), "oo", ADDR.oo)
     .on(ADDR.factory, factoryCodec(), "assertionOo", ADDR.oo)
     .on(ADDR.oracle, oracleCodec(), "composites", ([id]) => (id === st.baseFeedId && st.composite ? st.composite : {}))
-    .on(ADDR.oracle, oracleCodec(), "getUpdateFee", ([u]) => 7n * BigInt(u.length))
-    .on(ADDR.oracle, oracleCodec(), "getSampleSetFee", ([, u]) => 3n * BigInt(u.length))
-    .on(ADDR.oracle, oracleCodec(), "tryReadStalePrice", () => st.probe)
-    .on(ADDR.oracle, oracleCodec(), "fetchFirstPriceAtOrAfter", (a, tx) => {
-      const r = st.prove("fetchFirstPriceAtOrAfter", a, tx.value);
+    .on(ADDR.oracle, oracleCodec(), "getUpdateFee", ([n]) => 7n * BigInt(n))
+    .on(ADDR.oracle, oracleCodec(), "fetchPriceAtTick", (a, tx) => {
+      const r = st.prove("fetchPriceAtTick", a, tx.value);
       if (typeof r !== "bigint") throw new Revert(r);
       return r;
     })
@@ -202,108 +215,268 @@ async function inputError(p: Promise<unknown>, field?: string): Promise<InputErr
 }
 
 // ---------------------------------------------------------------------------------------------
-// Settlement-print selection
+// Settlement updates
 // ---------------------------------------------------------------------------------------------
 
-describe("settlementPrintProblem", () => {
-  const pr = (publishTime: number, prevPublishTime: number | null): SettlementPrint => ({ feedId: FEED_A, update: "0x01", publishTime, prevPublishTime });
-  const target = 1_000;
-
-  it("accepts the first print at or after the target, inside the bound", () => {
-    expect(settlementPrintProblem(pr(1_000, 999), target, 1_003)).toBeNull(); // published exactly at the target
-    expect(settlementPrintProblem(pr(1_002, 990), target, 1_003)).toBeNull();
-    expect(settlementPrintProblem(pr(1_003, 999), target, 1_003)).toBeNull(); // exactly at the bound
-    expect(settlementPrintProblem(pr(5_000, 999), target, null)).toBeNull(); // unbounded chain
-  });
-
-  it("refuses a print published before its target", () => {
-    expect(settlementPrintProblem(pr(999, 990), target, 1_003)).toMatch(/before its target/);
-  });
-
-  it("refuses a print whose predecessor is at or after the target (not the first)", () => {
-    expect(settlementPrintProblem(pr(1_002, 1_000), target, 1_003)).toMatch(/not the first/); // prev == target
-    expect(settlementPrintProblem(pr(1_002, 1_001), target, 1_003)).toMatch(/not the first/);
-    expect(settlementPrintProblem(pr(1_002, 999), target, 1_003)).toBeNull(); // prev one second before
-  });
-
-  it("leaves an unreported prevPublishTime to Pyth", () => {
-    expect(settlementPrintProblem(pr(1_002, null), target, 1_003)).toBeNull();
-  });
-
-  it("refuses a print published after latestPublishTs", () => {
-    expect(settlementPrintProblem(pr(1_004, 999), target, 1_003)).toMatch(/after the latest publish time/);
-  });
-});
-
-describe("windowPrints and chainPrints", () => {
+describe("settlement updates", () => {
   const C = 2_000_000; // cutoff
+  const update = (blob: Hex): ProUpdate => {
+    const u = readUpdate(blob);
+    return { blob, signer: null, timestampUs: u.timestampUs, channel: u.channel, feeds: new Map(u.feeds.map((f) => [b32(f.id), f])), prints: [] };
+  };
 
-  it("UMA's rule takes each leg's first print at or after cutoff - 3", async () => {
-    const a = archive({ [FEED_A]: [C - 10, C - 2, C - 1, C + 5], [FEED_Q]: [C - 4, C - 3, C + 1] });
-    const prints = await windowPrints(a.fetch, [FEED_A, FEED_Q], C - 3, C);
-    expect(prints.map((p) => p.publishTime)).toEqual([C - 2, C - 3]);
-    expect(prints.map((p) => p.update)).toEqual([blob(FEED_A, C - 2), blob(FEED_Q, C - 3)]);
-    expect(a.asked).toEqual([
-      [FEED_A, C - 3],
-      [FEED_Q, C - 3],
+  it("reads one feed out of a one-second update, and refuses what the oracle refuses", () => {
+    const u = update(tick(C, [{ id: A_ID, price: 5n, generated: C - 40 }, { id: Q_ID, price: 0n, generated: 0 }]));
+    expect(settlementPrint(u, FEED_A.toUpperCase().replace("0X", "0x") as Hex, C)).toEqual({ feedId: FEED_A, update: u.blob, tick: C, included: 15, priced: true, price: 5n, generatedUs: BigInt(C - 40) * 1_000_000n, publishTime: C - 40 });
+    expect(settlementPrint(u, FEED_Q, C)).toMatchObject({ priced: false, price: 0n, generatedUs: 0n, publishTime: 0 });
+    // what it refuses says the archive's answer cannot be relied on, not that no price exists
+    const missing = (() => {
+      try {
+        settlementPrint(u, b32(9), C);
+      } catch (e) {
+        return e as SettlementPrintError;
+      }
+      return null;
+    })();
+    expect(missing?.kind).toBe("unreachable");
+    // not the one-second update stamped on that second
+    expect(() => settlementPrint(u, FEED_A, C + 1)).toThrow("The update offered for second 2000001 is not Pyth's one-second update stamped on it.");
+    expect(() => settlementPrint(update(unsigned({ at: C, channel: "fixed_rate@200ms", feeds: [{ id: A_ID }] })), FEED_A, C)).toThrow(SettlementPrintError);
+    // a feed it does not carry, and one without its exponent
+    expect(() => settlementPrint(u, b32(9), C)).toThrow("does not carry feed 0x00000000…");
+    expect(() => settlementPrint(update(tick(C, [{ id: A_ID, omit: ["exponent"] }])), FEED_A, C)).toThrow("without its price or its exponent");
+    // a confidence is not needed, nor (for the cutoff's price) a generation time
+    expect(settlementPrint(update(tick(C, [{ id: A_ID, omit: ["confidence", "feedUpdateTimestamp"] }])), FEED_A, C)).toMatchObject({ priced: true, generatedUs: 0n, included: 3 });
+  });
+
+  it("places a price before or after a target as the oracle does", () => {
+    const at = (spec: Parameters<typeof tick>[1][number]) => settlementPrint(update(tick(C + 5, [spec])), FEED_A, C + 5);
+    expect(generatedAtOrAfter(at({ id: A_ID, generated: C }), C)).toBe(true);
+    expect(generatedAtOrAfter(at({ id: A_ID, generated: C + 5 }), C)).toBe(true);
+    expect(generatedAtOrAfter(at({ id: A_ID, generated: C - 1, generatedExtraUs: 999_999n }), C)).toBe(false); // carried forward from before
+    // the readings the oracle refuses as incomplete: none says when the feed last priced
+    expect(() => generatedAtOrAfter(at({ id: A_ID, price: 0n, generated: 0 }), C)).toThrow("carries no price for feed 0x00000000…");
+    expect(() => generatedAtOrAfter(at({ id: A_ID, price: 0n, generated: C - 9 }), C)).toThrow("carries no price for feed 0x00000000…");
+    expect(() => generatedAtOrAfter(at({ id: A_ID, generated: 0 }), C)).toThrow("carries a price for feed 0x00000000… without saying when it was generated");
+    expect(() => generatedAtOrAfter(at({ id: A_ID, price: 0n, generated: C + 1 }), C)).toThrow("carries no price for feed 0x00000000…");
+    expect(() => generatedAtOrAfter(at({ id: A_ID, omit: ["feedUpdateTimestamp"] }), C)).toThrow("without its feed update timestamp");
+  });
+
+  it("treats a price below zero as no price to settle at", async () => {
+    const pro = new FakePro();
+    pro.now = C + 5_000;
+    pro.generate(A_ID, C - 10, -5n);
+    const e = (await tickPrints(archive(pro).fetch, [FEED_A], C).catch((x) => x)) as SettlementPrintError;
+    expect(e).toBeInstanceOf(SettlementPrintError);
+    expect([e.kind, e.message]).toEqual(["absent", `Pyth's one-second update stamped at the cutoff (${C}) carries a price below zero for feed 0x00000000…, which the oracle refuses: it cannot settle the market.`]);
+    // a chain sample's price too, though the quiet second before it may carry any price
+    const chain = new FakePro();
+    chain.now = C + 5_000;
+    chain.generate(A_ID, C - 10, -5n).generate(A_ID, C + 3, -7n);
+    const e2 = (await chainSample(archive(chain).fetch, FEED_A, C, { latest: null, newest: C + 5_000 }).catch((x) => x)) as SettlementPrintError;
+    expect([e2.kind, e2.message]).toEqual(["absent", `Pyth's one-second update for second ${C + 3} gives feed 0x00000000… a price at or below zero for the target ${C}, which the oracle refuses: no chain can be proven.`]);
+  });
+
+  it("UMA's rule takes the update stamped at the cutoff, whenever its price was generated", async () => {
+    const pro = new FakePro();
+    pro.now = C + 100;
+    pro.generate(A_ID, C - 3_600, 77n); // quiet for an hour before the cutoff: the price is carried forward
+    const a = archive(pro);
+    const proof = await tickPrints(a.fetch, [FEED_A], C);
+    expect(proof.updates).toEqual([a.blob(C)]);
+    expect(proof.prints).toEqual([expect.objectContaining({ feedId: FEED_A, tick: C, priced: true, publishTime: C - 3_600 })]);
+    expect(a.asked).toEqual([[[A_ID], C]]);
+  });
+
+  it("UMA's rule settles a composite with one update holding both legs, or one per leg when they cannot be asked for together", async () => {
+    const pro = new FakePro();
+    pro.now = C + 100;
+    pro.generate(A_ID, C - 10, 5n).printing(Q_ID, C - 500, 9n);
+    const a = archive(pro);
+    const proof = await tickPrints(a.fetch, [FEED_A, FEED_Q], C);
+    expect(proof.updates).toEqual([a.blob(C, [A_ID, Q_ID])]);
+    expect(proof.prints.map((p) => [p.feedId, p.publishTime, p.update === proof.updates[0]])).toEqual([
+      [FEED_A, C - 10, true],
+      [FEED_Q, C, true],
     ]);
+    expect(a.asked).toEqual([[[A_ID, Q_ID], C]]);
+    // the archive will not answer for the two together
+    const alone: TickFetcher = async (feeds, second) => (feeds.length > 1 ? null : a.fetch(feeds, second));
+    const split = await tickPrints(alone, [FEED_A, FEED_Q], C);
+    expect(split.updates).toEqual([a.blob(C, [A_ID]), a.blob(C, [Q_ID])]);
+    const failing: TickFetcher = async (feeds, second) => {
+      if (feeds.length > 1) throw new Error("400 bad request");
+      return a.fetch(feeds, second);
+    };
+    expect((await tickPrints(failing, [FEED_A, FEED_Q], C)).updates).toHaveLength(2);
   });
 
-  it("UMA's rule fails when the window is empty (first print after the cutoff)", async () => {
-    const a = archive({ [FEED_A]: [C - 10, C + 5] });
-    await expect(windowPrints(a.fetch, [FEED_A], C - 3, C)).rejects.toThrow(/after the latest publish time/);
+  it("UMA's rule has nothing to settle with when the archive lacks the cutoff's update, or it carries no price", async () => {
+    const pro = new FakePro();
+    pro.now = C + 100;
+    pro.generate(A_ID, C + 50, 5n); // its first price ever comes after the cutoff
+    const a = archive(pro);
+    await expect(tickPrints(a.fetch, [FEED_A], C)).rejects.toThrow("Pyth's one-second update stamped at the cutoff (2000000) carries no price for feed 0x00000000…: it cannot settle the market.");
+    pro.missing.add(C);
+    const e = (await tickPrints(a.fetch, [FEED_A], C).catch((x) => x)) as SettlementPrintError;
+    expect(e).toBeInstanceOf(SettlementPrintError);
+    expect([e.message, e.feedId, e.target]).toEqual(["Pyth's archive has no one-second update for feed 0x00000000… at second 2000000 yet.", FEED_A, C]);
+    const down: TickFetcher = async () => {
+      throw new Error("price endpoint unreachable: fetch failed");
+    };
+    await expect(tickPrints(down, [FEED_A], C)).rejects.toThrow("Pyth's archive could not serve feed 0x00000000… at second 2000000: price endpoint unreachable: fetch failed");
   });
 
-  it("chains five samples, each target the previous print + 600 s", async () => {
-    const a = archive({ [FEED_A]: [C - 1, C + 2, C + 300, C + 601, C + 700, C + 1_205, C + 1_810, C + 2_420, C + 3_100, C + 9_000] });
-    const { prints, targets } = await chainPrints(a.fetch, [FEED_A], C, null);
-    expect(targets).toEqual([C, C + 602, C + 1_300, C + 2_410, C + 3_020]);
-    expect(prints.map((p) => p.publishTime)).toEqual([C + 2, C + 700, C + 1_810, C + 2_420, C + 3_100]);
+  it("a chain sample is the target's own update when it carries a price generated at or after the target", async () => {
+    const pro = new FakePro();
+    pro.now = C + 10_000;
+    pro.printing(A_ID, C - 100, 5n);
+    const a = archive(pro);
+    const sample = await chainSample(a.fetch, FEED_A, C, { latest: null, newest: pro.now });
+    expect(sample.map((p) => [p.tick, p.publishTime, p.update])).toEqual([[C, C, a.blob(C)]]);
+    expect(a.asked).toEqual([[[A_ID], C]]);
   });
 
-  it("measures a composite's next target from the later leg (a session close to the reopen)", async () => {
+  it("a chain sample after a quiet stretch is the first second with a new price, and the quiet second before it", async () => {
+    const pro = new FakePro();
+    pro.now = C + 10_000;
+    pro.generate(A_ID, C - 5, 5n).printing(A_ID, C + 37, 6n);
+    const a = archive(pro);
+    const sample = await chainSample(a.fetch, FEED_A, C, { latest: null, newest: pro.now });
+    expect(sample.map((p) => [p.tick, p.publishTime])).toEqual([
+      [C + 36, C - 5], // still carrying the price from before the target
+      [C + 37, C + 37],
+    ]);
+    expect(sample.map((p) => p.update)).toEqual([a.blob(C + 36), a.blob(C + 37)]);
+    // the step doubles from the target until a new price shows, then the gap is bisected
+    expect(seconds(a.asked).map((t) => t - C)).toEqual([0, 1, 3, 7, 15, 31, 63, 47, 39, 35, 37, 36]);
+    // a feed with no price at all at the target proves nothing: its updates do not say when it last priced
+    const fresh = new FakePro();
+    fresh.now = C + 10_000;
+    fresh.printing(A_ID, C + 3, 6n);
+    const b = archive(fresh);
+    await expect(chainSample(b.fetch, FEED_A, C, { latest: null, newest: fresh.now })).rejects.toThrow("carries no price for feed");
+    // new price on the very next second
+    const next = new FakePro();
+    next.now = C + 10_000;
+    next.generate(A_ID, C - 5, 5n).printing(A_ID, C + 1, 6n);
+    const n = archive(next);
+    expect((await chainSample(n.fetch, FEED_A, C, { latest: null, newest: next.now })).map((p) => p.tick)).toEqual([C, C + 1]);
+    expect(seconds(n.asked).map((t) => t - C)).toEqual([0, 1]);
+  });
+
+  it("finds a reopen days later in a few dozen requests", async () => {
+    const R = C + 235_800; // Friday's close to Monday's open
+    const pro = new FakePro();
+    pro.now = R + 10_000;
+    pro.generate(A_ID, C, 5n).printing(A_ID, R, 6n);
+    const a = archive(pro);
+    const sample = await chainSample(a.fetch, FEED_A, C + 600, { latest: null, newest: pro.now });
+    expect(sample.map((p) => [p.tick, p.publishTime])).toEqual([
+      [R - 1, C],
+      [R, R],
+    ]);
+    expect(a.asked.length).toBeLessThan(45);
+  });
+
+  it("respects the bound on a sample's second, and the present", async () => {
+    const pro = new FakePro();
+    pro.now = C + 10_000;
+    pro.generate(A_ID, C - 5, 5n).printing(A_ID, C + 60, 6n);
+    const a = archive(pro);
+    // capped before the feed's next price: no chain exists under the bound, and nothing past it is asked for
+    await expect(chainSample(a.fetch, FEED_A, C, { latest: C + 50, newest: pro.now })).rejects.toThrow(
+      "Feed 0x00000000… produced no price from 2000000 up to the latest second a sample may be stamped with (2000050): no chain exists under that bound.",
+    );
+    expect(Math.max(...seconds(a.asked))).toBe(C + 50);
+    expect((await chainSample(a.fetch, FEED_A, C, { latest: C + 60, newest: pro.now })).map((p) => p.tick)).toEqual([C + 59, C + 60]); // exactly at the bound
+    await expect(chainSample(a.fetch, FEED_A, C + 100, { latest: C + 60, newest: pro.now })).rejects.toThrow("lies after the latest second a sample may be stamped with (2000060)");
+    // the feed has not produced its next price yet: the sample does not exist
+    const early = archive(pro);
+    await expect(chainSample(early.fetch, FEED_A, C, { latest: null, newest: C + 20 })).rejects.toThrow("Feed 0x00000000… has produced no price since 2000000 yet (looked up to 2000020): its sample does not exist.");
+    expect(Math.max(...seconds(early.asked))).toBe(C + 20);
+    await expect(chainSample(early.fetch, FEED_A, C + 21, { latest: null, newest: C + 20 })).rejects.toThrow("The sample's target 2000021 has not been reached yet: its update does not exist.");
+    // a second the archive does not hold
+    pro.missing.add(C + 7);
+    await expect(chainSample(archive(pro).fetch, FEED_A, C, { latest: null, newest: pro.now })).rejects.toThrow("Pyth's archive has no one-second update for feed 0x00000000… at second 2000007 yet.");
+  });
+
+  it("chains five samples, each target 600 s past the second of the sample before", async () => {
+    const pro = new FakePro();
+    pro.now = C + 10_000;
+    // prices at C+2, then every 700 s
+    for (const t of [C - 1, C + 2, C + 700, C + 1_400, C + 2_100, C + 2_800, C + 9_000]) pro.generate(A_ID, t, BigInt(t));
+    const a = archive(pro);
+    const chain = await chainPrints(a.fetch, [FEED_A], C, { latest: null, newest: pro.now });
+    expect(chain.targets).toEqual([C, C + 602, C + 1_300, C + 2_000, C + 2_700]);
+    expect(chain.ticks).toEqual([C + 2, C + 700, C + 1_400, C + 2_100, C + 2_800]);
+    // every sample came after a quiet second: two updates each, the quiet one first
+    expect(chain.prints.map((p) => p.tick)).toEqual([C + 1, C + 2, C + 699, C + 700, C + 1_399, C + 1_400, C + 2_099, C + 2_100, C + 2_799, C + 2_800]);
+    expect(chain.updates).toEqual(chain.prints.map((p) => a.blob(p.tick)));
+    // a feed printing every second proves each sample with its target's own update
+    const live = new FakePro();
+    live.now = C + 10_000;
+    live.printing(A_ID, C - 100, 5n);
+    const l = await chainPrints(archive(live).fetch, [FEED_A], C, { latest: null, newest: live.now });
+    expect(l.ticks).toEqual([C, C + 600, C + 1_200, C + 1_800, C + 2_400]);
+    expect(l.updates).toHaveLength(5);
+    // fewer samples, another spacing
+    const two = await chainPrints(archive(live).fetch, [FEED_A], C, { latest: null, newest: live.now }, 2, 60);
+    expect(two.targets).toEqual([C, C + 60]);
+  });
+
+  it("measures a composite's next target from the later leg, base leg first (a session close to the reopen)", async () => {
     // Friday 16:00 close at C, Monday 09:30 reopen at R; the FX leg prints every second.
     const R = C + 235_800;
-    const equity: PrintFetcher = async (feed, target) => {
-      const t = target <= C ? C : target <= R ? R : R + Math.ceil((target - R) / 60) * 60;
-      const prev = t === C ? C - 5 : t === R ? C : t - 60;
-      return { feedId: feed, update: blob(feed, t), publishTime: t, prevPublishTime: prev };
-    };
-    const fx: PrintFetcher = async (feed, target) => ({ feedId: feed, update: blob(feed, target), publishTime: target, prevPublishTime: target - 1 });
-    const fetch: PrintFetcher = (feed, target) => (feed === FEED_A ? equity(feed, target) : fx(feed, target));
-    const { prints, targets } = await chainPrints(fetch, [FEED_A, FEED_Q], C, null);
-    expect(targets).toEqual([C, C + 600, R + 600, R + 1_200, R + 1_800]);
-    expect(prints.filter((p) => p.feedId === FEED_A).map((p) => p.publishTime)).toEqual([C, R, R + 600, R + 1_200, R + 1_800]);
-    // updates ordered sample by sample, legs in order
-    expect(prints.map((p) => p.feedId)).toEqual([FEED_A, FEED_Q, FEED_A, FEED_Q, FEED_A, FEED_Q, FEED_A, FEED_Q, FEED_A, FEED_Q]);
+    const pro = new FakePro();
+    pro.now = R + 10_000;
+    pro.printing(A_ID, C - 1_000, 5n, C).printing(A_ID, R, 6n).printing(Q_ID, C - 1_000, 9n);
+    const a = archive(pro);
+    const chain = await chainPrints(a.fetch, [FEED_A, FEED_Q], C, { latest: null, newest: pro.now });
+    expect(chain.targets).toEqual([C, C + 600, R + 600, R + 1_200, R + 1_800]);
+    expect(chain.ticks).toEqual([C, R, R + 600, R + 1_200, R + 1_800]);
+    // sample by sample: the base leg's one or two updates, then the quote leg's
+    expect(chain.prints.map((p) => [p.feedId === FEED_A ? "A" : "Q", p.tick])).toEqual([
+      ["A", C],
+      ["Q", C],
+      ["A", R - 1], // the equity's quiet second before the reopen
+      ["A", R],
+      ["Q", C + 600], // the FX leg's own earliest second for the same target
+      ["A", R + 600],
+      ["Q", R + 600],
+      ["A", R + 1_200],
+      ["Q", R + 1_200],
+      ["A", R + 1_800],
+      ["Q", R + 1_800],
+    ]);
+    // each leg is proven with an update of its own
+    expect(chain.updates[0]).toBe(a.blob(C, [A_ID]));
+    expect(chain.updates[1]).toBe(a.blob(C, [Q_ID]));
+    expect(a.asked.every(([feeds]) => feeds.length === 1)).toBe(true);
   });
 
   it("refuses a chain whose sample lands past the UMA cap", async () => {
-    const a = archive({ [FEED_A]: [C + 2, C + 700, C + 1_810, C + 2_420, C + 3_100] });
-    await expect(chainPrints(a.fetch, [FEED_A], C, C + 1_000)).rejects.toThrow(/after the latest publish time allowed \(2001000\)/);
+    const pro = new FakePro();
+    pro.now = C + 10_000;
+    pro.printing(A_ID, C - 100, 5n);
+    const a = archive(pro);
+    await expect(chainPrints(a.fetch, [FEED_A], C, { latest: C + 1_000, newest: pro.now })).rejects.toThrow("The sample's target 2001200 lies after the latest second a sample may be stamped with (2001000): no chain exists under that bound.");
+    expect((await chainPrints(a.fetch, [FEED_A], C, { latest: C + 2_400, newest: pro.now })).ticks.at(-1)).toBe(C + 2_400);
   });
 
-  it("refuses a print the archive returns that is not the first at or after its target", async () => {
-    const liar: PrintFetcher = async (feed) => ({ feedId: feed, update: "0x01", publishTime: C - 1, prevPublishTime: C - 2 });
-    await expect(windowPrints(liar, [FEED_A], C - 3, C)).rejects.toThrow(/not the first/);
-  });
-
-  it("printFetcher asks the price source one feed at a time", async () => {
-    const asked: [number, readonly Hex[]][] = [];
+  it("tickFetcher is the price source's atTick", async () => {
+    const asked: [readonly Hex[], number][] = [];
     const src: PriceUpdateSource = {
       latest: async () => ({ update: [], publishTime: 0 }),
-      atOrAfter: async (t, feeds) => {
-        asked.push([t, feeds]);
-        return [{ update: ["0xbeef"], publishTime: t + 1, prevPublishTime: t - 1 }];
+      atTick: async (feeds, second) => {
+        asked.push([feeds, second]);
+        return null;
       },
     };
-    const p = await printFetcher(src)(FEED_A, 500);
-    expect(p).toEqual({ feedId: FEED_A, update: "0xbeef", publishTime: 501, prevPublishTime: 499 });
-    expect(asked).toEqual([[500, [FEED_A]]]);
-    const many: PriceUpdateSource = { latest: src.latest, atOrAfter: async () => [{ update: ["0x01", "0x02"], publishTime: 1, prevPublishTime: 0 }] };
-    await expect(printFetcher(many)(FEED_A, 1)).rejects.toThrow(/exactly one update per leg/);
-    expect(() => printFetcher(null)).toThrow(ConnectError);
-    expect(() => printFetcher({ latest: src.latest })).toThrow(ConnectError);
+    expect(await tickFetcher(src)([FEED_A], 500)).toBeNull();
+    expect(asked).toEqual([[[FEED_A], 500]]);
+    expect(() => tickFetcher(null)).toThrow(ConnectError);
+    expect(() => tickFetcher({ latest: src.latest })).toThrow("connect with a Pyth Pro price source");
   });
 
   it("chainLastResort is 21 days after the cutoff, or 12 h after a nearer UMA cap", () => {
@@ -319,120 +492,159 @@ describe("windowPrints and chainPrints", () => {
 
 describe("terminateScheduledPair", () => {
   let s: Scene;
+  let pro: FakePro;
   const C = NOW - 5_000;
   const U64_MAX = (1n << 64n) - 1n;
   beforeEach(() => {
     s = scene();
     s.st.scheduled = BigInt(C);
+    pro = new FakePro();
+    pro.now = NOW;
+    pro.printing(ETH_ID, NOW - 30 * D, 3_000n); // ETH/USD, which the archive must serve when it works
   });
-  const windowRule = (lastResort = C + 12 * H) => ({ rule: 1, firstTarget: BigInt(C - 3), latestPublishTs: BigInt(C), lastResortTs: BigInt(lastResort), verdictDeadline: 0n });
+  const tickRule = (lastResort = C + 12 * H) => ({ rule: 1, firstTarget: BigInt(C), latestPublishTs: BigInt(C), lastResortTs: BigInt(lastResort), verdictDeadline: 0n });
   const chainRule = (latest = U64_MAX, lastResort = C + 21 * D) => ({ rule: 2, firstTarget: BigInt(C), latestPublishTs: latest, lastResortTs: BigInt(lastResort), verdictDeadline: 0n });
-  const chainSeries = [C - 1, C + 2, C + 700, C + 1_400, C + 2_100, C + 2_800, C + 9_000];
+  /** The base feed prints every second around the cutoff and after it. */
+  const printing = () => pro.printing(A_ID, C - 1_000, 5n);
+  const chainTicks = [C, C + 600, C + 1_200, C + 1_800, C + 2_400];
+  const plan = (a = archive(pro), more: { storedPrice?: StoredPricePolicy } = {}) => terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchTick: a.fetch, ...more });
 
-  it("UMA's rule: one proven print per leg, with getUpdateFee as value", async () => {
-    s.st.rule = windowRule();
-    const a = archive({ [FEED_A]: [C - 10, C - 2, C - 1, C + 5] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.under).toBe("window");
-    expect(plan.call).not.toBeNull();
-    const [pair, updates] = decodeCall(T(), "terminateScheduledPair", plan.call!.data);
+  it("UMA's rule: the cutoff's update, with getUpdateFee as value", async () => {
+    s.st.rule = tickRule();
+    pro.generate(A_ID, C - 7_200, 5n); // quiet for two hours before the cutoff: its last price settles it
+    const a = archive(pro);
+    const p = await plan(a);
+    expect(p.under).toBe("tick");
+    expect(p.call).not.toBeNull();
+    const [pair, updates] = decodeCall(T(), "terminateScheduledPair", p.call!.data);
     expect(pair).toBe(ADDR.pair);
-    expect(updates).toEqual([blob(FEED_A, C - 2)]);
-    expect(plan.call!.value).toBe(7n);
-    expect(plan.call!.costs).toEqual([expect.objectContaining({ kind: "fee", amount: 7n, unit: "ETH" })]);
-    expect(plan.call!.summary).toMatch(/Pyth fee/);
+    expect(updates).toEqual([a.blob(C)]);
+    expect(p.updates).toEqual([a.blob(C)]);
+    expect(p.prints).toEqual([expect.objectContaining({ feedId: FEED_A, tick: C, publishTime: C - 7_200 })]);
+    expect(p.call!.value).toBe(7n);
+    expect(p.call!.costs).toEqual([expect.objectContaining({ kind: "fee", amount: 7n, unit: "ETH" })]);
+    expect(p.call!.summary).toMatch(/Pyth fee/);
+    expect(s.fake.called("getUpdateFee").map((c) => c.args)).toEqual([[1n]]); // the fee is per update
     // simulated as the sender, with the fee
     const sim = s.fake.called("terminateScheduledPair");
     expect(sim).toHaveLength(1);
     expect(sim[0]!.from).toBe(ADDR.alice);
     expect(sim[0]!.value).toBe(7n);
+    expect(a.asked).toEqual([[[A_ID], C]]);
   });
 
-  it("composite pairs carry one update per leg", async () => {
-    s.st.rule = windowRule();
+  it("a composite pair settles with one update holding both legs", async () => {
+    s.st.rule = tickRule();
     s.st.composite = { baseId: FEED_A, quoteId: FEED_Q, invertQuote: false };
     s.st.baseFeedId = COMPOSITE;
-    const a = archive({ [FEED_A]: [C - 20, C - 1], [FEED_Q]: [C - 4, C - 3, C] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    const [, updates] = decodeCall(T(), "terminateScheduledPair", plan.call!.data);
-    expect(updates).toEqual([blob(FEED_A, C - 1), blob(FEED_Q, C - 3)]);
-    expect(plan.call!.value).toBe(14n);
+    pro.generate(A_ID, C - 20, 5n).printing(Q_ID, C - 100, 9n);
+    const a = archive(pro);
+    const p = await plan(a);
+    const [, updates] = decodeCall(T(), "terminateScheduledPair", p.call!.data);
+    expect(updates).toEqual([a.blob(C, [A_ID, Q_ID])]);
+    expect(p.call!.value).toBe(7n);
+    expect(p.prints.map((x) => x.feedId)).toEqual([FEED_A, FEED_Q]);
+    expect(s.fake.called("fetchPriceAtTick")[0]!.args).toEqual([COMPOSITE, updates, BigInt(C)]);
   });
 
-  it("an empty window waits for the stored-price fallback, then takes it", async () => {
-    s.st.rule = windowRule();
-    const a = archive({ [FEED_A]: [C - 10, C + 5] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.call).toBeNull();
-    expect(plan.reason).toMatch(/after the latest publish time/);
-    expect(plan.retryAt).toBe(C + 12 * H + 1);
+  it("without the cutoff's update it waits for the stored-price fallback, then takes it", async () => {
+    s.st.rule = tickRule();
+    pro.missing.add(C);
+    const a = archive(pro);
+    const p = await plan(a);
+    expect(p.call).toBeNull();
+    expect(p.reason).toMatch(/Under UMA's rule \(the one-second update stamped at the cutoff\): Pyth's archive has no one-second update for feed 0x00000000… at second \d+ yet\./);
+    expect(p.retryAt).toBe(C + 12 * H + 1);
+    expect([p.attempts.map((x) => x.kind), p.storedPriceWithheld]).toEqual([["absent"], null]); // not open yet: nothing withheld
+    // the same when the update is there but carries no price for the feed
+    pro.missing.clear();
+    const empty = await plan();
+    expect(empty.call).toBeNull();
+    expect(empty.reason).toMatch(/carries no price for feed/);
 
-    s.st.rule = windowRule(NOW - 1);
-    const late = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
+    s.st.rule = tickRule(NOW - 1);
+    const late = await plan();
     expect(late.under).toBe("storedPrice");
+    expect(late.attempts.map((x) => [x.under, x.kind])).toEqual([
+      ["tick", "absent"],
+      ["storedPrice", null],
+    ]);
+    expect(late.storedPriceWithheld).toBeNull();
     expect(decodeCall(T(), "terminateScheduledPair", late.call!.data)[1]).toEqual([]);
+    expect(late.updates).toEqual([]);
     expect(late.call!.value).toBe(0n);
     expect(late.call!.costs).toEqual([]);
+    expect(s.fake.called("getUpdateFee")).toEqual([]); // no update, no fee read
   });
 
-  it("past the last resort a proven print is still preferred", async () => {
-    s.st.rule = windowRule(NOW - 1);
-    const a = archive({ [FEED_A]: [C - 10, C - 1] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.under).toBe("window");
-    expect(plan.call!.notes.join(" ")).toMatch(/if Pyth refused these prints when the call runs, the market would settle at its stored price \(100\)/);
+  it("past the last resort a proven update is still preferred", async () => {
+    s.st.rule = tickRule(NOW - 1);
+    printing();
+    const p = await plan();
+    expect(p.under).toBe("tick");
+    expect(p.call!.notes.join(" ")).toMatch(/if Pyth refused these updates when the call runs, the market would settle at its stored price \(100\)/);
   });
 
-  // Audit F4: past the grace the terminator catches a failed fetch and settles at the stored price,
-  // so the simulation alone accepts prints Pyth refuses.
-  it("verifies the window print through the oracle as the terminator calls it, and shows its price", async () => {
-    s.st.rule = windowRule();
+  // Past the grace the terminator catches a failed fetch and settles at the stored price,
+  // so the simulation alone accepts updates Pyth refuses.
+  it("verifies the cutoff's update through the oracle as the terminator calls it, and shows its price", async () => {
+    s.st.rule = tickRule();
     s.st.prove = () => 2_000_500_000_000_000_000_000n;
-    const a = archive({ [FEED_A]: [C - 10, C - 2, C - 1, C + 5] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    const proof = s.fake.called("fetchFirstPriceAtOrAfter");
+    printing();
+    const a = archive(pro);
+    const p = await plan(a);
+    const proof = s.fake.called("fetchPriceAtTick");
     expect(proof).toHaveLength(1);
-    expect(proof[0]!.args).toEqual([FEED_A, [blob(FEED_A, C - 2)], BigInt(C - 3), BigInt(C)]);
+    expect(proof[0]!.args).toEqual([FEED_A, [a.blob(C)], BigInt(C)]);
     expect([proof[0]!.to, proof[0]!.from, proof[0]!.value]).toEqual([ADDR.oracle, ADDR.alice, 7n]);
-    expect(plan.under).toBe("window");
-    expect(plan.settlementPrice).toBe(2_000_500_000_000_000_000_000n);
-    expect(plan.attempts).toEqual([expect.objectContaining({ under: "window", ok: true, price: 2_000_500_000_000_000_000_000n })]);
-    expect(plan.call!.summary).toMatch(/at 2000\.5 under UMA's rule/);
-    expect(plan.call!.notes[0]).toMatch(/^Settles at 2000\.5: .*which the oracle verified/);
+    expect(p.under).toBe("tick");
+    expect(p.settlementPrice).toBe(2_000_500_000_000_000_000_000n);
+    expect(p.attempts).toEqual([expect.objectContaining({ under: "tick", ok: true, price: 2_000_500_000_000_000_000_000n })]);
+    expect(p.call!.summary).toMatch(/at 2000\.5 under UMA's rule/);
+    expect(p.call!.notes[0]).toBe(`Settles at 2000.5: the price in Pyth's one-second update stamped at the cutoff (${C}), which the oracle verified (fetchPriceAtTick, as the terminator calls it).`);
   });
 
-  it("past the grace, prints the oracle refuses are not offered as proof: the stored-price call is, with its price", async () => {
-    s.st.rule = windowRule(NOW - 1);
-    s.st.prove = () => stringError("PriceFeedNotFoundWithinRange");
-    const a = archive({ [FEED_A]: [C - 10, C - 1] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.under).toBe("storedPrice");
-    expect(plan.settlementPrice).toBe(100n * E18);
-    expect(decodeCall(T(), "terminateScheduledPair", plan.call!.data)[1]).toEqual([]);
-    expect(plan.call!.value).toBe(0n);
-    expect(plan.call!.summary).toMatch(/at 100 under the stored price/);
-    expect(plan.call!.notes[0]).toMatch(/settles at its last stored price, 100\./);
-    expect(plan.attempts.map((x) => [x.under, x.ok, x.price])).toEqual([
-      ["window", false, null],
+  it("past the grace, updates the oracle refuses are not offered as proof, nor by default the stored-price call", async () => {
+    s.st.rule = tickRule(NOW - 1);
+    s.st.prove = () => stringError("invalid signer");
+    printing();
+    const held = await plan();
+    expect([held.call, held.under]).toEqual([null, null]);
+    expect(held.attempts.map((x) => [x.under, x.ok, x.kind])).toEqual([["tick", false, "refused"]]);
+    expect(held.storedPriceWithheld).toBe('a proven settlement may still exist (tick: refused): try again later, or pass storedPrice: "always" to settle at the stored price anyway');
+    expect(held.reason).toMatch(/The stored-price fallback is open but not offered: a proven settlement may still exist/);
+    expect(s.fake.called("terminateScheduledPair")).toEqual([]);
+    // a caller who has decided gets it, with its price
+    const p = await plan(archive(pro), { storedPrice: "always" });
+    expect(p.under).toBe("storedPrice");
+    expect(p.settlementPrice).toBe(100n * E18);
+    expect(decodeCall(T(), "terminateScheduledPair", p.call!.data)[1]).toEqual([]);
+    expect(p.call!.value).toBe(0n);
+    expect(p.call!.summary).toMatch(/at 100 under the stored price/);
+    expect(p.call!.notes[0]).toMatch(/settles at its last stored price, 100\./);
+    expect(p.attempts.map((x) => [x.under, x.ok, x.price])).toEqual([
+      ["tick", false, null],
       ["storedPrice", true, 100n * E18],
     ]);
-    expect(plan.attempts[0]!.reason).toMatch(/would not verify these prints \(PriceFeedNotFoundWithinRange\).*would settle at the market's stored price \(100\) instead/);
-    // The print set was never simulated as a settlement: only the empty call was.
+    // Pyth's verifier reverts with a reason string: it is explained, not just quoted
+    expect(p.attempts[0]!.reason).toMatch(/would not verify these updates \(The price update was signed by a key Pyth no longer accepts\..*\)\..*would settle at the market's stored price \(100\) instead/);
+    // The refused set was never simulated as a settlement: only the empty call was.
     expect(s.fake.called("terminateScheduledPair").map((c) => c.args[1])).toEqual([[]]);
     // A pair that never stored a price settles at 1.
     s.st.lastPrice = { spotPrice: 0n, updateTs: 0n };
-    expect((await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch })).settlementPrice).toBe(1n);
+    expect((await plan(archive(pro), { storedPrice: "always" })).settlementPrice).toBe(1n);
   });
 
-  it("within the grace, prints the oracle refuses give no call", async () => {
-    s.st.rule = windowRule();
-    s.st.prove = () => stringError("PriceFeedNotFoundWithinRange");
-    const a = archive({ [FEED_A]: [C - 10, C - 1] });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.call).toBeNull();
-    expect(plan.settlementPrice).toBeNull();
-    expect(plan.reason).toMatch(/would not verify these prints \(PriceFeedNotFoundWithinRange\)\. The terminator would refuse them too\./);
-    expect(plan.retryAt).toBe(C + 12 * H + 1);
+  it("within the grace, updates the oracle refuses give no call", async () => {
+    s.st.rule = tickRule();
+    s.st.prove = () => errorData(oracleCodec(), "BazaarOracle__WrongTick", BigInt(C) * 1_000_000n, 3);
+    printing();
+    const p = await plan();
+    expect(p.call).toBeNull();
+    expect(p.settlementPrice).toBeNull();
+    expect(p.reason).toMatch(/would not verify these updates \(A settlement price update is not Pyth's one-second update for the required second\.\)\. The terminator would refuse them too\./);
+    expect(p.attempts[0]!.error?.name).toBe("BazaarOracle__WrongTick");
+    expect(p.retryAt).toBe(C + 12 * H + 1);
     expect(s.fake.called("terminateScheduledPair")).toEqual([]);
   });
 
@@ -440,49 +652,67 @@ describe("terminateScheduledPair", () => {
     s.st.rule = chainRule(BigInt(C + 9_999), C + 9_999 + 12 * H);
     s.st.cap = BigInt(C + 9_999);
     s.st.prove = () => 1_234n * E18;
-    const a = archive({ [FEED_A]: chainSeries });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
+    pro.generate(A_ID, C - 9, 5n).printing(A_ID, C + 2, 6n); // quiet across the cutoff: the first sample takes two updates
+    const a = archive(pro);
+    const p = await plan(a);
     const proof = s.fake.called("fetchChainedMedian");
-    expect(proof[0]!.args).toEqual([FEED_A, [C + 2, C + 700, C + 1_400, C + 2_100, C + 2_800].map((t) => blob(FEED_A, t)), BigInt(C), BigInt(C + 9_999), 600n, 5n]);
-    expect(proof[0]!.value).toBe(15n);
-    expect([plan.under, plan.settlementPrice]).toEqual(["chain", 1_234n * E18]);
+    const want = [C + 1, C + 2, C + 602, C + 1_202, C + 1_802, C + 2_402].map((t) => a.blob(t));
+    expect(proof[0]!.args).toEqual([FEED_A, want, BigInt(C), BigInt(C + 9_999), 600n, 5n]);
+    expect(proof[0]!.value).toBe(42n); // six updates, each verified on its own
+    expect(s.fake.called("getUpdateFee").at(-1)!.args).toEqual([6n]);
+    expect([p.under, p.settlementPrice, p.call!.value]).toEqual(["chain", 1_234n * E18, 42n]);
+    expect(p.updates).toEqual(want);
+    expect(p.call!.notes[0]).toMatch(/^Settles at 1234: the median of five Pyth prices chained from the cutoff/);
 
     // No UMA cap: the terminator bounds the chain at uint64 max.
     s.st.cap = 0n;
     s.st.rule = chainRule();
-    await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: archive({ [FEED_A]: chainSeries }).fetch });
+    await plan();
     expect(s.fake.called("fetchChainedMedian").at(-1)!.args[3]).toBe(U64_MAX);
 
-    // Past the last resort a refused chain is the stored price's.
+    // Past the last resort a refused chain gives the stored price once the caller decides it should.
     s.st.rule = chainRule(U64_MAX, NOW - 1);
-    s.st.prove = () => stringError("SampleCountMismatch");
-    const late = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: archive({ [FEED_A]: chainSeries }).fetch });
+    s.st.prove = () => errorData(oracleCodec(), "BazaarOracle__SampleNotProven", FEED_A, BigInt(C), BigInt(C + 1));
+    const held = await plan();
+    expect([held.under, held.attempts.map((x) => x.kind)]).toEqual([null, ["refused"]]);
+    const late = await plan(archive(pro), { storedPrice: "always" });
     expect([late.under, late.settlementPrice]).toEqual(["storedPrice", 100n * E18]);
+    expect(late.attempts[0]!.error?.name).toBe("BazaarOracle__SampleNotProven");
   });
 
-  it("the chain rule: five chained samples with getSampleSetFee as value", async () => {
+  it("the chain rule: five chained samples, never the cutoff's update alone", async () => {
     s.st.rule = chainRule();
     s.st.scheduleId = b32(0xb4e);
     s.st.insurer.set(b32(0xb4e), { pair: ADDR.pair, proposer: ADDR.bob, proposalTs: BigInt(C - D), cutoffTs: BigInt(C), claimBacked: false, resolved: true, scheduled: true });
-    const a = archive({ [FEED_A]: chainSeries });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.under).toBe("chain");
-    const [, updates] = decodeCall(T(), "terminateScheduledPair", plan.call!.data);
-    expect(updates).toEqual([C + 2, C + 700, C + 1_400, C + 2_100, C + 2_800].map((t) => blob(FEED_A, t)));
-    expect(plan.call!.value).toBe(15n);
-    const fee = s.fake.called("getSampleSetFee");
-    expect(fee[0]!.args[0]).toBe(FEED_A);
-    // a bare vote never needs the window print
-    expect(a.asked.every(([, t]) => t !== C - 3)).toBe(true);
+    printing();
+    const a = archive(pro);
+    const p = await plan(a);
+    expect(p.under).toBe("chain");
+    const [, updates] = decodeCall(T(), "terminateScheduledPair", p.call!.data);
+    expect(updates).toEqual(chainTicks.map((t) => a.blob(t)));
+    expect(p.call!.value).toBe(35n);
+    expect(p.prints.map((x) => x.tick)).toEqual(chainTicks);
+    expect(s.fake.called("fetchPriceAtTick")).toEqual([]);
   });
 
-  it("a chain capped by a UMA cutoff that has no complete set waits for its last resort", async () => {
+  it("a chain whose samples do not exist yet, or cannot fit under a UMA cutoff, waits", async () => {
+    // the fifth sample's target is still ahead of the chain's time
+    s.st.rule = chainRule();
+    pro.printing(A_ID, C - 1_000, 5n);
+    s.fake.now = C + 2_000;
+    pro.now = C + 2_000;
+    const early = await plan();
+    expect(early.call).toBeNull();
+    expect(early.reason).toMatch(/The sample's target \d+ has not been reached yet/);
+    expect(early.retryAt).toBe(C + 21 * D + 1);
+    s.fake.now = NOW;
+    pro.now = NOW;
+    // capped at a UMA cutoff 1,000 s after the vote's: only two samples fit
     s.st.rule = chainRule(BigInt(C + 1_000), C + 1_000 + 12 * H);
-    const a = archive({ [FEED_A]: chainSeries });
-    const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-    expect(plan.call).toBeNull();
-    expect(plan.reason).toMatch(/latest publish time allowed/);
-    expect(plan.retryAt).toBe(C + 1_000 + 12 * H + 1);
+    const capped = await plan();
+    expect(capped.call).toBeNull();
+    expect(capped.reason).toMatch(/lies after the latest second a sample may be stamped with/);
+    expect(capped.retryAt).toBe(C + 1_000 + 12 * H + 1);
   });
 
   describe("a claim-backed vote with no recorded verdict", () => {
@@ -493,71 +723,121 @@ describe("terminateScheduledPair", () => {
       s.st.insurer.set(CLAIM, { pair: ADDR.pair, proposer: ADDR.bob, proposalTs: BigInt(C - D), cutoffTs: BigInt(C), claimBacked: true, verdict: 0, resolved: true, scheduled: true });
       s.st.rule = { rule: 3, firstTarget: 0n, latestPublishTs: 0n, lastResortTs: 0n, verdictDeadline: BigInt(C - D + 14 * D) };
       s.st.assertions.set(CLAIM, { asserter: ADDR.bob, assertionTime: BigInt(C - D), expirationTime: BigInt(C - D + 12 * H), currency: ADDR.usdc, bond: 1_000_000_000n, disputer: ADDR.alice });
+      printing();
     });
-    const both = () => archive({ [FEED_A]: [C - 2, ...chainSeries] });
 
     it("settles under UMA's rule when the DVM upheld the claim", async () => {
       s.st.preview = true;
-      const a = both();
-      const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-      expect(plan.under).toBe("window");
-      expect(decodeCall(T(), "terminateScheduledPair", plan.call!.data)[1]).toEqual([blob(FEED_A, C - 2)]);
-      expect(plan.call!.notes.join(" ")).toMatch(/records UMA's verdict/);
-      expect(a.asked).toEqual([[FEED_A, C - 3]]); // the chain is never fetched
+      const a = archive(pro);
+      const p = await plan(a);
+      expect(p.under).toBe("tick");
+      expect(decodeCall(T(), "terminateScheduledPair", p.call!.data)[1]).toEqual([a.blob(C)]);
+      expect(p.call!.notes.join(" ")).toMatch(/records UMA's verdict/);
+      expect(a.asked).toEqual([[[A_ID], C]]); // the chain is never fetched
     });
 
     it("settles under the chain rule, capped, when the DVM rejected it", async () => {
       s.st.preview = false;
-      s.st.cap = BigInt(C + 1_500); // the third sample would be past it
-      const a = both();
-      const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-      expect(plan.call).toBeNull();
-      expect(plan.reason).toMatch(/latest publish time allowed \(1899996500\)/);
+      s.st.cap = BigInt(C + 1_500); // the fourth sample would be past it
+      const p = await plan();
+      expect(p.call).toBeNull();
+      expect(p.reason).toMatch(new RegExp(`lies after the latest second a sample may be stamped with \\(${C + 1_500}\\)`));
       s.st.cap = 0n;
-      const ok = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: both().fetch });
+      const ok = await plan();
       expect(ok.under).toBe("chain");
     });
 
     it("builds both sets and returns the one the contract accepts when the verdict cannot be previewed", async () => {
       s.st.preview = new Revert(stringError("Assertion not resolved"));
       s.st.accept = (updates: readonly Hex[]) => (updates.length === 5 ? true : errorData(T(), "BazaarPairTerminator__InsurerVerdictPending", 1n));
-      const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: both().fetch });
-      expect(plan.under).toBe("chain");
-      expect(plan.attempts.map((x) => [x.under, x.ok])).toEqual([
-        ["window", false],
+      const p = await plan();
+      expect(p.under).toBe("chain");
+      expect(p.attempts.map((x) => [x.under, x.ok])).toEqual([
+        ["tick", false],
         ["chain", true],
       ]);
-      expect(plan.attempts[0]!.error?.name).toBe("BazaarPairTerminator__InsurerVerdictPending");
+      expect(p.attempts[0]!.error?.name).toBe("BazaarPairTerminator__InsurerVerdictPending");
     });
 
     it("reports the verdict deadline when the contract takes neither", async () => {
       s.st.accept = () => errorData(T(), "BazaarPairTerminator__InsurerVerdictPending", BigInt(C + 13 * D));
-      const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: both().fetch });
-      expect(plan.call).toBeNull();
-      expect(plan.attempts).toHaveLength(2);
-      expect(plan.retryAt).toBe(C - D + 14 * D);
-      expect(plan.reason).toMatch(/waits for UMA's verdict/);
+      const p = await plan();
+      expect(p.call).toBeNull();
+      expect(p.attempts).toHaveLength(2);
+      expect(p.retryAt).toBe(C - D + 14 * D);
+      expect(p.reason).toMatch(/waits for UMA's verdict/);
     });
 
     it("waits for an undisputed claim's liveness without fetching anything", async () => {
       s.st.assertions.set(CLAIM, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 600), currency: ADDR.usdc, bond: 1n });
-      const a = both();
-      const plan = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: a.fetch });
-      expect(plan.call).toBeNull();
-      expect(plan.retryAt).toBe(NOW + 600);
+      const a = archive(pro);
+      const p = await plan(a);
+      expect(p.call).toBeNull();
+      expect(p.retryAt).toBe(NOW + 600);
       expect(a.asked).toEqual([]);
     });
   });
 
   it("refuses up front before the cutoff, with no cutoff, and once fixed", async () => {
-    s.st.rule = windowRule();
+    s.st.rule = tickRule();
     s.st.scheduled = BigInt(NOW + 10);
-    expect((await inputError(terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: archive({}).fetch }), "pair")).message).toMatch(/first block after it/);
+    expect((await inputError(plan(), "pair")).message).toMatch(/first block after it/);
     s.st.scheduled = 0n;
-    await inputError(terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: archive({}).fetch }), "pair");
+    await inputError(plan(), "pair");
     s.st.scheduled = BigInt(C);
     s.st.fixedTs = BigInt(NOW - 1);
-    await inputError(terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchPrint: archive({}).fetch }), "pair");
+    await inputError(plan(), "pair");
+  });
+
+  it("past the last resort, an archive that cannot be asked never leads to the stored price", async () => {
+    s.st.rule = tickRule(NOW - 1);
+    const down: TickFetcher = async () => {
+      throw new ProError("price endpoint returned HTTP 503 from https://archive.example/v2/abcdefghijklmnopqrstuvwxyz0123456789: try later");
+    };
+    const p = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchTick: down });
+    expect(p.call).toBeNull();
+    expect(p.attempts.map((x) => [x.under, x.kind])).toEqual([["tick", "unreachable"]]);
+    expect(p.attempts[0]!.reason).toBe(`Pyth's archive could not serve feed 0x00000000… at second ${C}: price endpoint returned HTTP 503 from https://archive.example/v2/***: try later`);
+    expect(p.storedPriceWithheld).toMatch(/^a proven settlement may still exist \(tick: unreachable\)/);
+    expect(s.fake.called("terminateScheduledPair")).toEqual([]);
+    const always = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchTick: down, storedPrice: "always" });
+    expect([always.under, always.settlementPrice]).toEqual(["storedPrice", 100n * E18]);
+  });
+
+  it("believes the archive has no update only when it serves a control update", async () => {
+    s.st.rule = tickRule(NOW - 1);
+    // a 404 for every second, as from a wrong archive URL: its "none" says nothing
+    const p = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, fetchTick: async () => null });
+    expect(p.call).toBeNull();
+    expect(p.attempts.map((x) => [x.under, x.kind])).toEqual([["tick", "unreachable"]]);
+    expect(p.attempts[0]!.reason).toMatch(/\(Not believed: the archive did not serve ETH\/USD's one-second update from a minute ago either\.\)$/);
+    expect(p.storedPriceWithheld).toMatch(/^Pyth's archive did not serve ETH\/USD's one-second update from a minute ago/);
+    // an archive that serves ETH/USD but not the cutoff: believed, and the stored price is offered
+    pro.missing.add(C);
+    const a = archive(pro);
+    const q = await plan(a);
+    expect([q.under, q.attempts.map((x) => x.kind)]).toEqual(["storedPrice", ["absent", null]]);
+    expect(a.asked.at(-1)).toEqual([[2], NOW - 60]); // the control: ETH/USD a minute before the chain's time
+    // never: not even then
+    const never = await plan(archive(pro), { storedPrice: "never" });
+    expect([never.call, never.storedPriceWithheld]).toEqual([null, 'storedPrice is "never"']);
+  });
+
+  it("builds the stored-price call without a price source when asked to", async () => {
+    s.st.rule = tickRule(NOW - 1);
+    await expect(terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice })).rejects.toThrow(ConnectError);
+    const p = await terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice, storedPrice: "always" });
+    expect([p.under, p.settlementPrice]).toEqual(["storedPrice", 100n * E18]);
+    expect(p.attempts.map((x) => [x.under, x.kind])).toEqual([
+      ["tick", "unreachable"],
+      ["storedPrice", null],
+    ]);
+    expect(p.attempts[0]!.reason).toMatch(/connect with a Pyth Pro price source/);
+  });
+
+  it("needs a price source that serves past updates", async () => {
+    s.st.rule = tickRule();
+    await expect(terminateScheduledPair(s.ctx, { pair: ADDR.pair, from: ADDR.alice })).rejects.toThrow(ConnectError);
   });
 });
 
@@ -601,7 +881,7 @@ describe("proposeTermination", () => {
     expect(c.notes.join(" ")).not.toMatch(/Warning/); // exactly the bond: nothing to warn about
   });
 
-  // Audit F10: the bond is quoted at build time and pulled at execution.
+  // The bond is quoted at build time and pulled at execution.
   it("refuses a bond quote below the terminator's floor, and warns when the allowance exceeds the quote", async () => {
     s.st.bond = 0n;
     await expect(proposeTermination(s.ctx, args())).rejects.toThrow(BondQuoteError);
@@ -833,7 +1113,7 @@ describe("terminationStatus", () => {
     const st = await terminationStatus(s.ctx, ADDR.pair, { ids: [claim, vote] });
     expect(st.phase).toBe("limbo");
     expect(st.haltsAt).toBe(NOW - 2);
-    expect(st.settlementRule.key).toBe("window");
+    expect(st.settlementRule.key).toBe("tick");
     expect(st.settlementRule.meaning).toMatch(/UMA's rule/);
     expect(st.acceptedTerminationAssertionId).toBe(claim);
     expect(st.insurerScheduled).toBe(false);
@@ -873,7 +1153,7 @@ describe("terminationStatus", () => {
     expect(asked).toEqual([{ pair: ADDR.pair.toLowerCase() }]);
   });
 
-  // Audit F14: the subgraph's ids were not validated, bounded or paged (only the first 100 were read).
+  // The subgraph's ids are validated, bounded and paged, not only the first 100 read.
   it("pages the subgraph's ids and refuses ids it cannot use", async () => {
     const s = scene();
     const votes = Array.from({ length: 101 }, (_, i) => b32(0x1000 + i));
@@ -922,16 +1202,18 @@ describe("terminationStatus", () => {
 });
 
 describe("terminateStalePair and finalizeTermination", () => {
-  it("terminateStalePair opens 21 days after the newest print", async () => {
+  it("terminateStalePair opens 21 days after the pair last stored a price", async () => {
     const s = scene();
     s.st.lastPrice = { spotPrice: 5n, updateTs: BigInt(NOW - 20 * D) };
-    expect((await inputError(terminateStalePair(s.ctx, { pair: ADDR.pair }), "pair")).message).toMatch(/opens at/);
-    s.st.lastPrice = { spotPrice: 5n, updateTs: BigInt(NOW - 22 * D) };
-    s.st.probe = { found: true, spotPrice: 1n, lowPrice: 1n, highPrice: 1n, publishTime: BigInt(NOW - D) };
-    await inputError(terminateStalePair(s.ctx, { pair: ADDR.pair }), "pair");
-    s.st.probe = { found: false };
+    expect((await inputError(terminateStalePair(s.ctx, { pair: ADDR.pair }), "pair")).message).toMatch(/stored a price within the last .* opens at/);
+    s.st.lastPrice = { spotPrice: 5n, updateTs: BigInt(NOW - 21 * D) };
+    await inputError(terminateStalePair(s.ctx, { pair: ADDR.pair }), "pair"); // exactly 21 days: not yet
+    s.st.lastPrice = { spotPrice: 5n, updateTs: BigInt(NOW - 21 * D - 1) };
     const c = await terminateStalePair(s.ctx, { pair: ADDR.pair });
     expect(decodeCall(T(), "terminateStalePair", c.data)).toEqual([ADDR.pair]);
+    expect(c.summary).toMatch(/stored no price for more than 21 days/);
+    // the pair's own stored price is the evidence: the oracle is not asked anything
+    expect(s.fake.calls.filter((x) => x.to === ADDR.oracle)).toEqual([]);
     // a never-priced pair is aged from its creation
     s.st.lastPrice = { spotPrice: 0n, updateTs: 0n };
     s.st.created = BigInt(NOW - 3 * D);
@@ -971,7 +1253,7 @@ describe("reads", () => {
       CATEGORY_ORACLE_DECOMMISSION: 1,
       CATEGORY_ASSET_CESSATION: 2,
       CATEGORY_STRUCTURAL_CHANGE: 3,
-      CATEGORY_PYTH_CONTRACT_MIGRATION: 4,
+      CATEGORY_PYTH_VERIFIER_MIGRATION: 4,
       OUTCOME_NONE: 0,
       OUTCOME_TRUE: 1,
       OUTCOME_FALSE: 2,
@@ -980,7 +1262,7 @@ describe("reads", () => {
       VERDICT_TRUE: 1,
       VERDICT_FALSE: 2,
       SETTLE_NOTHING: 0,
-      SETTLE_WINDOW: 1,
+      SETTLE_TICK: 1,
       SETTLE_CHAIN: 2,
       SETTLE_AWAIT_VERDICT: 3,
       TERMINATION_PROPOSAL_BOND: 1_000_000_000n,
@@ -991,18 +1273,25 @@ describe("reads", () => {
     };
     for (const [k, v] of Object.entries(consts)) s.fake.on(ADDR.terminator, tc, k, v);
     const c = await terminatorConstants(s.ctx);
-    expect(c.categories).toEqual({ oracleDecommission: 1, assetCessation: 2, structuralChange: 3, pythContractMigration: 4 });
-    expect(c.settleRules).toEqual({ nothing: 0, window: 1, chain: 2, awaitVerdict: 3 });
+    expect(c.categories).toEqual({ oracleDecommission: 1, assetCessation: 2, structuralChange: 3, pythVerifierMigration: 4 });
+    expect(c.settleRules).toEqual({ nothing: 0, tick: 1, chain: 2, awaitVerdict: 3 });
+    // the SDK's own copies agree with what the chain reports
+    expect(c.settleRules).toEqual({ nothing: SETTLE_NOTHING, tick: SETTLE_TICK, chain: SETTLE_CHAIN, awaitVerdict: SETTLE_AWAIT_VERDICT });
+    expect(TerminationCategory.PythVerifierMigration).toBe(c.categories.pythVerifierMigration);
+    expect(TERMINATION_CATEGORY_INFO[4].description).toMatch(/Pyth Pro verifier contract/);
+    expect(SETTLEMENT_RULE_TEXT.tick).toMatch(/one-second update stamped at its cutoff/);
     expect([c.terminationProposalLiveness, c.maxReasonLength, c.settlementSampleCount, c.settlementSampleSpacing]).toEqual([43_200, 1_000, 5, 600]);
     expect(c.requiredTerminationBondUsdc).toBe(1_000_000_000n);
 
     s.st.rule = { rule: 2, firstTarget: 100n, latestPublishTs: (1n << 64n) - 1n, lastResortTs: (1n << 256n) - 1n, verdictDeadline: 0n };
     expect(await settlementRule(s.ctx, ADDR.pair)).toEqual(expect.objectContaining({ key: "chain", firstTarget: 100, latestPublishTs: null, lastResortTs: null }));
+    s.st.rule = { rule: 1, firstTarget: 100n, latestPublishTs: 100n, lastResortTs: 100n + BigInt(12 * H), verdictDeadline: 0n };
+    expect(await settlementRule(s.ctx, ADDR.pair)).toEqual(expect.objectContaining({ key: "tick", firstTarget: 100, latestPublishTs: 100, lastResortTs: 100 + 12 * H }));
 
     const id = b32(0xc1);
     s.st.claims.set(id, { pair: ADDR.pair, proposer: ADDR.bob, lastTradingTs: 5n, reason: "gone", proposalTs: 10n, resolved: false, category: 4 });
     expect(await terminationProposal(s.ctx, id)).toEqual(
-      expect.objectContaining({ proposer: ADDR.bob, categoryName: "Pyth contract migration", livenessEndsAt: 10 + 12 * H, reason: "gone" }),
+      expect.objectContaining({ proposer: ADDR.bob, categoryName: "Pyth verifier migration", livenessEndsAt: 10 + 12 * H, reason: "gone" }),
     );
     expect(await terminationProposal(s.ctx, b32(2))).toBeNull();
 
@@ -1093,7 +1382,7 @@ describe("UMA assertions", () => {
     await inputError(disputeAssertion(s.ctx, { assertionId: id, from: ADDR.alice }), "assertionId");
   });
 
-  // Audit F9: an `oo` override was trusted as the call's target and the bond's spender.
+  // An `oo` override becomes the call's target and the bond's spender only when it is Bazaar's oracle.
   it("accepts an oo override only when it is factory.oo() or the assertion's recorded oracle", async () => {
     const s = scene();
     const EVIL = getAddress("0x000000000000000000000000000000000000e5e1");
@@ -1118,7 +1407,7 @@ describe("UMA assertions", () => {
     expect((await assertionStatus(s.ctx, id, { oo: OTHER.toLowerCase() as Address })).phase).toBe("settleable"); // factory.oo()
   });
 
-  // Audit F10: a bond quote is pulled at execution, so a node answering 0 must not yield a "0 USDC" dispute.
+  // A bond quote is pulled at execution, so a node answering 0 must not yield a "0 USDC" dispute.
   it("disputeAssertion refuses a bond below every Bazaar claim's floor and warns of a larger allowance", async () => {
     const s = scene();
     const id = b32(0xd2);
@@ -1133,7 +1422,7 @@ describe("UMA assertions", () => {
     expect(c.notes.join(" ")).toMatch(/already lets UMA's Optimistic Oracle .* take up to an unlimited amount, more than the 1,000 USDC quoted/);
   });
 
-  // Audit F14: the dispute bond's unit came from a hard-coded "USDC".
+  // The dispute bond's unit comes from its currency, never a hard-coded "USDC".
   it("disputeAssertion names a non-USDC bond in its own token", async () => {
     const s = scene();
     const id = b32(0xd3);
@@ -1152,7 +1441,7 @@ describe("UMA assertions", () => {
     await expect(disputeAssertion(s.ctx, { assertionId: id, from: ADDR.alice })).rejects.toThrow(BondQuoteError);
   });
 
-  // Audit F13 and F14: costs were shown rounded down, and a uint256 time threw.
+  // Costs are never shown rounded down, and a uint256 time prints instead of throwing.
   it("prints amounts exactly and contract-time sentinels without throwing", () => {
     expect(usdcText(1_000_009_999n)).toBe("1,000.009999 USDC");
     expect(usdcText(4_000_999_999n)).toBe("4,000.999999 USDC");

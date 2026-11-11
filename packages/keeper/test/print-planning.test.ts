@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Market, type Print, PriceService } from "@liberta-labs/bazaar-sdk";
+import { type Market, type Print, PriceService, feedIdHex } from "@liberta-labs/bazaar-sdk";
 import { type Address, type Hex, getAddress } from "viem";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config/index.js";
@@ -16,16 +16,20 @@ import type { Action } from "../src/exec/executor.js";
 import { Effects } from "../src/state/store.js";
 import type { LogTail } from "../src/sync/tail.js";
 
-const F1 = `0x${"01".repeat(32)}` as Hex;
-const F2 = `0x${"02".repeat(32)}` as Hex;
+const F1 = feedIdHex(101);
+const F2 = feedIdHex(102);
 
+/** A print whose price was generated at the start of second `publish`. */
 const pr = (feed: Hex, publish: number): Print => ({
   feedId: feed,
   price: 200_000_000_000n,
   conf: 1_000n,
   expo: -8,
   publishTime: publish,
-  prevPublishTime: publish - 1,
+  generatedUs: BigInt(publish) * 1_000_000n,
+  timestampUs: BigInt(publish) * 1_000_000n,
+  channel: 3,
+  signer: null,
   blob: "0x",
   received: 0,
 });

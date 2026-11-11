@@ -12,3 +12,6 @@ coverage/
 bazaar-keeper.yaml
 /state/
 /keys/
+
+# The built docs site
+docs/book/

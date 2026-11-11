@@ -1,13 +1,14 @@
 /**
  * Anvil helpers for the end-to-end run: replay a Bazaar deployment, then build a market to keep.
  *
- * The deployment is replayed from a Foundry broadcast record (broadcast/DeployBazaar.s.sol/31337/
- * run-latest.json in a built Bazaar checkout; a stripped copy lives in ./fixtures), so no contract is
+ * The deployment is replayed from ./fixtures/deployment.json, the transactions Bazaar's Anvil
+ * deployment sends, computed from a built Bazaar checkout by ./fixtures/build.mjs, so no contract is
  * compiled here. Replaying the same transactions from the same account on a fresh Anvil reproduces
  * the same addresses.
  *
  * Every account here is one of Anvil's ten unlocked dev accounts (the public test mnemonic), so
- * transactions go through `eth_sendTransaction` and Anvil signs them.
+ * transactions go through `eth_sendTransaction` and Anvil signs them. Prices are Pyth Pro updates
+ * signed with the public test key, which the deployment's mock verifier trusts.
  */
 
 import fs from "node:fs";
@@ -28,27 +29,29 @@ import {
   ZERO_ADDRESS,
   decodeError,
   factory,
+  lazer,
   lens,
+  oracle,
   pair,
   sleep,
 } from "@liberta-labs/bazaar-sdk";
 
 export const MNEMONIC = "test test test test test test test test test test test junk";
-export const FEED: Hex = ETH_USD_FEED; // ETH/USD
+/** ETH/USD: Pyth Pro feed 2, in the bytes32 the contracts hold it in. */
+export const FEED: Hex = ETH_USD_FEED;
 export const E18 = BAZAAR_SCALE;
 export const PAIR = pair();
 export const LENS = lens();
 export const FACTORY = factory();
+export const ORACLE = oracle();
 /** ArbSys's precompile address, where the pair reads its block number. */
 export const ARBSYS: Address = "0x0000000000000000000000000000000000000064";
 
-/** The mocks the anvil deployment uses in place of Pyth and USDC (HelperConfig.getOrCreateAnvilConfig). */
+/** The mocks the anvil deployment uses in place of Pyth's verifier and USDC (HelperConfig.getOrCreateAnvilConfig). */
 export const MOCKS = new ContractCodec(
   parseAbi([
-    "function createPriceFeedUpdateData(bytes32 id, int64 price, uint64 conf, int32 expo, int64 emaPrice, uint64 emaConf, uint64 publishTime, uint64 prevPublishTime) pure returns (bytes)",
-    "function getUpdateFee(bytes[] updateData) view returns (uint256)",
-    "function updatePriceFeeds(bytes[] updateData) payable",
-    "function getPriceUnsafe(bytes32 id) view returns ((int64 price, uint64 conf, int32 expo, uint256 publishTime))",
+    "function isValidSigner(address signer) view returns (bool)",
+    "function verification_fee() view returns (uint256)",
     "function mint(address to, uint256 amount)",
     "function approve(address spender, uint256 amount) returns (bool)",
     "function balanceOf(address who) view returns (uint256)",
@@ -217,7 +220,7 @@ export class Anvil {
   }
 }
 
-/** A Foundry broadcast record, as far as the replay reads it. */
+/** A deployment record (./fixtures/deployment.json), as far as the replay reads it. */
 interface BroadcastRecord {
   transactions: {
     contractName?: string | null;
@@ -313,7 +316,9 @@ export class Scenario {
   readonly w: Address[];
   readonly factory: Address;
   readonly lens: Address;
-  readonly pyth: Address;
+  readonly oracle: Address;
+  /** Pyth's verifier on the local chain: the mock that trusts the public test signer. */
+  readonly verifier: Address;
   readonly usdc: Address;
   /** Set by setup(). */
   pair: Address = ZERO_ADDRESS;
@@ -332,23 +337,30 @@ export class Scenario {
     this.w = this.k.map((k) => privateKeyToAccount(k).address);
     this.factory = need(names, "BazaarFactory");
     this.lens = need(names, "BazaarPairLens");
-    this.pyth = need(names, "MockPyth");
+    this.oracle = need(names, "BazaarOracle");
+    this.verifier = need(names, "MockPythLazer");
     this.usdc = need(names, "MockUSDC");
   }
 
   // ---- prices ----
-  /** A signed MockPyth update for FEED at `price` USD, published at `ts` (confidence 1 bp). */
+  /**
+   * A Pyth Pro update for FEED at `price` USD, generated in second `ts`, signed with the test key:
+   * the four properties a live price needs, the confidence 0.1% of the price.
+   */
   async update(price: number, ts: number): Promise<Hex> {
     const p = BigInt(Math.round(price * 1e8));
-    const data = MOCKS.encode("createPriceFeedUpdateData", FEED, p, p / 10_000n, -8, p, p / 10_000n, BigInt(ts), BigInt(ts - 1));
-    return MOCKS.decode<Hex>("createPriceFeedUpdateData", await this.a.call(this.pyth, data));
+    const generated = BigInt(ts) * 1_000_000n;
+    return lazer.buildUpdate(
+      { timestampUs: generated, channel: "fixed_rate@200ms", feeds: [{ id: 2, price: p, exponent: -8, confidence: p / 1_000n, feedUpdateTimestamp: generated }] },
+      lazer.localSignerKey(),
+    );
   }
 
-  /** An update stamped one second after the latest block, and the fee MockPyth charges for it. */
+  /** An update stamped one second after the latest block, and the fee the oracle charges for it. */
   async pu(price?: number): Promise<[Hex[], bigint]> {
     const [, ts] = await this.a.latest();
     const ups = [await this.update(price ?? this.price, ts + 1)];
-    const fee = MOCKS.decode<bigint>("getUpdateFee", await this.a.call(this.pyth, MOCKS.encode("getUpdateFee", ups)));
+    const fee = ORACLE.decode<bigint>("getUpdateFee", await this.a.call(this.oracle, ORACLE.encode("getUpdateFee", BigInt(ups.length))));
     return [ups, fee];
   }
 
@@ -438,8 +450,6 @@ export class Scenario {
       // the keeper (account 7) needs no USDC: it holds only what it collects
       await a.send(w[0], this.usdc, MOCKS.encode("mint", who, 2_000_000n * 10n ** 6n));
     }
-    let [ups, fee] = await this.pu();
-    await a.send(w[0], this.pyth, MOCKS.encode("updatePriceFeeds", ups), { value: fee });
     await a.send(w[0], this.usdc, MOCKS.encode("approve", this.factory, 5000n * 10n ** 6n));
     const r = await a.send(w[0], this.factory, FACTORY.encode("proposePairDeployment", FEED, true, 5000n * E18, "ETH/USD"), {
       label: "propose listing",
@@ -456,7 +466,7 @@ export class Scenario {
     for (const [i, amount] of [[1, 40_000n], [2, 40_000n], [3, 10_000n], [4, 10_000n]] as const) {
       await a.send(w[i]!, this.pair, PAIR.encode("depositCollateral", amount * E18, 0n, 0n, 0n, "0x", "0x"));
     }
-    [ups, fee] = await this.pu();
+    const [ups, fee] = await this.pu();
     await a.send(w[5]!, this.pair, PAIR.encode("depositToInsurance", 20_000n * E18, ups, 0n, 0n, 0n, "0x", "0x"), {
       value: fee,
       label: "insurance deposit",

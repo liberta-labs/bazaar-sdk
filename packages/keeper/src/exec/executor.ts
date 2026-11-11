@@ -16,6 +16,7 @@
 import {
   type Chain,
   type DecodedError,
+  MAX_PRICE_STALENESS,
   type Market,
   type ProbeResult,
   type Receipt,
@@ -53,7 +54,7 @@ const WEI_PER_ETH = 1e18;
 const BAZAAR_ONE = 1e18; // BAZAAR_SCALE as a double, for USD amounts
 
 /**
- * One key in the executor's in-flight set, from the parts Python keyed its tuples with:
+ * One key in the executor's in-flight set, joined from its parts:
  * `lockKey("liq", market.address, account)`.
  */
 export function lockKey(...parts: readonly (string | number | bigint)[]): string {
@@ -88,6 +89,13 @@ export interface ActionInit {
    * wallet itself instead.
    */
   probe?: boolean;
+  /**
+   * The second the price the call relies on was generated in (the update it carries) or stored in
+   * (the pair's own price, when it carries none), for a call that reverts once that price is more
+   * than 3 s from the block's time; null or left out for a call that does not. Checked again just
+   * before the call is signed.
+   */
+  priceTime?: number | null;
 }
 
 export class Action {
@@ -107,6 +115,7 @@ export class Action {
   decide: ((q: Quote) => Decision) | null;
   minGas: bigint;
   probe: boolean;
+  priceTime: number | null;
 
   constructor(a: ActionInit) {
     this.job = a.job;
@@ -125,6 +134,7 @@ export class Action {
     this.decide = a.decide ?? null;
     this.minGas = a.minGas ?? 0n;
     this.probe = a.probe ?? true;
+    this.priceTime = a.priceTime ?? null;
   }
 }
 
@@ -155,6 +165,11 @@ export class ActionResult {
   error: DecodedError | null = null;
   wouldSend = false;
   returned: Hex = "0x";
+  /**
+   * Not sent because the price the call relies on had aged too far by the time it would have been
+   * signed: nothing about the candidate was refused, so it is planned again with a newer price.
+   */
+  priceAged = false;
 
   constructor(r: ActionResultInit) {
     this.status = r.status;
@@ -263,6 +278,12 @@ export class Executor {
   recheckDelaysMs: readonly number[] = [250, 500, 1000];
   /** How long a sent transaction's receipt is waited for (s). */
   receiptTimeoutS = 90;
+  /**
+   * The chain's time in unix seconds, fractions included, from the newest head known: what an
+   * action's `priceTime` is judged against just before it is signed. The engine sets it to its own
+   * chain clock; this machine's clock until then.
+   */
+  clock: () => number = () => Date.now() / 1000;
   /** in-flight keys kept past their run (see hold), with the timer that frees each */
   private readonly held = new Map<string, ReturnType<typeof setTimeout>>();
   private haltReason = "";
@@ -554,7 +575,7 @@ export class Executor {
     reservation: Reservation,
   ): Promise<ActionResult> {
     const g = this.cfg.gas;
-    // The same double arithmetic as the Python keeper, so both send the same limits and fees.
+    // The multipliers are config floats, so both limits are scaled in double precision and truncated.
     const gasLimit = BigInt(Math.trunc(Number(gas) * g.gasLimitMultiplier)) + 10_000n;
     const scaledFee = BigInt(Math.trunc(Number(baseFee) * g.feeMultiplier));
     let maxFee = scaledFee > baseFee + 1n ? scaledFee : baseFee + 1n;
@@ -567,6 +588,15 @@ export class Executor {
       const wait = lane.lock.acquire();
       if (wait) await wait;
       try {
+        // The last moment before the call is signed: planning, the simulation and the wallet's queue
+        // all took time, and a price outside the pair's window on inclusion reverts the call.
+        const aged = this.priceAge(a);
+        if (aged !== null) {
+          res.status = "skipped";
+          res.priceAged = true;
+          res.reason = aged;
+          return res;
+        }
         if (lane.nonce === null) lane.nonce = await this.chain.nonce(lane.address, "pending");
         const tx: TxRequest = {
           type: "eip1559",
@@ -692,6 +722,22 @@ export class Executor {
     this.record(a, lane, res, ok ? gasWei + a.value : gasWei, reservation);
     this.emit("action", res);
     return res;
+  }
+
+  /**
+   * Why `a` must not be signed now, or null: the price it relies on is older, at the chain's time
+   * now, than the pair's 3 s window less `prices.sendMarginSeconds`, the margin left for the call to
+   * be included.
+   */
+  private priceAge(a: Action): string | null {
+    if (a.priceTime === null) return null;
+    const limit = MAX_PRICE_STALENESS - this.cfg.prices.sendMarginSeconds;
+    const age = this.clock() - a.priceTime;
+    if (age <= limit) return null;
+    return (
+      `not sent: the price it relies on is from second ${a.priceTime}, ${age.toFixed(1)} s before the chain's time now, past the ` +
+      `${fmtG(limit)} s a call may carry (the pair's 3 s window less prices.sendMarginSeconds); planned again with a newer price`
+    );
   }
 
   /**

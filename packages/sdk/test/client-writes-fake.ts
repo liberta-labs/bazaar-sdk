@@ -4,13 +4,15 @@
  * eth_signTypedData_v4 with local keys, and records every request.
  */
 
-import { type Abi, type Address, type Hex, decodeFunctionData, encodeAbiParameters, encodeFunctionResult, getAddress, toHex } from "viem";
+import { type Abi, type Address, type Hex, decodeFunctionData, encodeFunctionResult, getAddress, toHex } from "viem";
 import { type PrivateKeyAccount, privateKeyToAccount } from "viem/accounts";
 import { bazaarFactoryAbi, bazaarOracleAbi, bazaarPairAbi, bazaarPairLensAbi, bazaarPairTerminatorAbi } from "../src/abi/index.js";
 import { Chain } from "../src/chain/client.js";
 import { RpcError, type Transport } from "../src/chain/rpc.js";
 import { ERC20_ABI } from "../src/client/allowance.js";
 import type { BazaarContext, PriceUpdateSource } from "../src/client/context.js";
+import { feedIdHex, proFeedId } from "../src/prices/lazer.js";
+import { unsigned } from "./pro-fakes.js";
 
 export const PAIR = getAddress("0x00000000000000000000000000000000000000a1");
 export const LENS = getAddress("0x00000000000000000000000000000000000000b2");
@@ -19,7 +21,8 @@ export const TERMINATOR = getAddress("0x00000000000000000000000000000000000000d4
 export const USDC = getAddress("0x00000000000000000000000000000000000000e5");
 export const FACTORY = getAddress("0x00000000000000000000000000000000000000f6");
 export const INTEGRATOR = getAddress("0x00000000000000000000000000000000000001e7");
-export const FEED = ("0x" + "ab".repeat(32)) as Hex;
+/** The pair's feed: Pyth Pro feed 171, as the bytes32 the contracts hold. */
+export const FEED = feedIdHex(0xab);
 
 export const ALICE_KEY: Hex = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 export const BOB_KEY: Hex = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
@@ -155,22 +158,15 @@ export class FakeChain implements Transport {
   }
 }
 
-// MockPyth update data: abi.encode(PriceFeed(id, price, emaPrice), prevPublishTime)
-const PRICE_STRUCT = [
-  { name: "price", type: "int64" },
-  { name: "conf", type: "uint64" },
-  { name: "expo", type: "int32" },
-  { name: "publishTime", type: "uint256" },
-] as const;
-export function mockUpdate(feedId: Hex, price: bigint, publishTime: number, conf = 0n, expo = -8): Hex {
-  const p = { price, conf, expo, publishTime: BigInt(publishTime) };
-  return encodeAbiParameters(
-    [{ type: "tuple", components: [{ name: "id", type: "bytes32" }, { name: "price", type: "tuple", components: PRICE_STRUCT }, { name: "emaPrice", type: "tuple", components: PRICE_STRUCT }] }, { type: "uint64" }],
-    [{ id: feedId, price: p, emaPrice: p }, BigInt(publishTime - 1)],
-  );
+/**
+ * A Pyth Pro update carrying `feedId` at `price`, generated in second `publishTime` and stamped on
+ * it, with a placeholder signature (nothing here verifies one).
+ */
+export function mockUpdate(feedId: Hex, price: bigint, publishTime: number, conf = 1n, expo = -8): Hex {
+  return unsigned({ at: publishTime, channel: "real_time", feeds: [{ id: proFeedId(feedId), price, conf, expo }] });
 }
 
-/** A price source serving MockPyth updates at `prices[feed]` (8-decimal integers). */
+/** A price source serving Pyth Pro updates at `prices[feed]` (8-decimal integers), one update per feed. */
 export class FakePrices implements PriceUpdateSource {
   readonly prices = new Map<string, bigint>();
   publishTime: number;
@@ -196,7 +192,7 @@ export class FakePrices implements PriceUpdateSource {
 }
 
 /**
- * A context over the fake, with the pair priced off one plain feed and a 7-wei-per-update Pyth fee.
+ * A context over the fake, with the pair priced off one raw feed and a 7-wei-per-update Pyth fee.
  * The factory knows PAIR (and only PAIR) as one of its pairs, and the pair is live (not terminated,
  * no terminal entitlement) until a test says otherwise.
  */
@@ -208,7 +204,7 @@ export function fakeContext(opts: { prices?: PriceUpdateSource | null } = {}) {
   fake.lens("getTerminalEntitlement", { collateral: 0n, registeredClaim: 0n, principalRatio: 0n, profitRatio: 0n, payout: 0n });
   fake.pair("baseFeedId", FEED);
   fake.oracle("composites", { baseId: "0x" + "00".repeat(32), quoteId: "0x" + "00".repeat(32), invertQuote: false });
-  fake.oracle("getUpdateFee", ([u]: readonly [readonly Hex[]]) => BigInt(u.length) * 7n);
+  fake.oracle("getUpdateFee", ([n]: readonly [bigint]) => n * 7n);
   const ctx: BazaarContext = {
     chain: new Chain(fake),
     chainId: fake.chainId,

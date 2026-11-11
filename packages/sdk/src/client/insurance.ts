@@ -30,7 +30,7 @@ import { InputError, type PreparedCall } from "./calls.js";
 import type { BazaarContext } from "./context.js";
 import { requirePair } from "./guard.js";
 import { DIRECT_META, chainTime, encodePairWrite } from "./signing.js";
-import { livePairPrice, optionalUpdate } from "./trade.js";
+import { livePairPrice, optionalUpdate, priceFields } from "./trade.js";
 import { floorToUsdc, formatUnits18 } from "./units.js";
 
 // ---- InsuranceVaultLib constants ----
@@ -145,7 +145,7 @@ export async function depositToInsurance(
     value: fresh.fee,
     from: getAddress(from),
     summary: `Deposit ${usdc(floored)} USDC into the insurance fund`,
-    ...(fresh.publishTime !== null ? { priceTime: fresh.publishTime } : {}),
+    ...priceFields(fresh),
     pullsUsdc: floored,
   };
 }
@@ -212,7 +212,7 @@ export async function executeInsuranceWithdrawal(ctx: BazaarContext, pair: Addre
     value: fresh.fee,
     from: getAddress(from),
     summary,
-    ...(fresh.publishTime !== null ? { priceTime: fresh.publishTime } : {}),
+    ...priceFields(fresh),
     pullsUsdc: 0n,
   };
 }

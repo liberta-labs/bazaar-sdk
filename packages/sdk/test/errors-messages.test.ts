@@ -1,10 +1,11 @@
 import { type AbiParameter, type Hex, concatHex, encodeAbiParameters, getAddress } from "viem";
 import { describe, expect, it } from "vitest";
 import { allErrors } from "../src/chain/codec.js";
-import { DecodedError, KEEPER_HINTS, decodeError } from "../src/chain/errors.js";
+import { DecodedError, KEEPER_HINTS, VERIFIER_REASON_HINTS, decodeError } from "../src/chain/errors.js";
 import { RpcError } from "../src/chain/rpc.js";
 import { CallError, InputError } from "../src/client/calls.js";
 import {
+  REASON_MESSAGES,
   USER_MESSAGES,
   errorMessage,
   formatAmount,
@@ -103,6 +104,46 @@ describe("user messages", () => {
   it("falls back to the name for an unknown error", () => {
     expect(userMessage("Nope__Unknown")).toBe("Nope__Unknown");
   });
+
+  it("explains what the oracle refuses about a Pyth Pro update", () => {
+    const feed = ("0x" + "00".repeat(31) + "01") as Hex;
+    const stale = decodeError(revertData("BazaarOracle__StalePrice", [feed, 1_700_000_000n]));
+    // the decoder does not know the chain's time, so the generation time is given as it is, not relative to this machine's clock
+    expect(stale.message).toMatch(/^The price in this transaction was generated at 2023-11-14 22:13:20 UTC, more than 3 seconds from the block's time when it ran\./);
+    expect(stale.hint).toBe(KEEPER_HINTS["BazaarOracle__StalePrice"]);
+    expect(decodeError(revertData("BazaarOracle__FeeMismatch", [1n, 2n * 10n ** 14n])).message).toContain("must equal Pyth's fee (0.0002 ETH)");
+    expect(decodeError(revertData("BazaarOracle__SampleTooLate", [feed, 1_700_000_600n, 1_700_000_000n])).message).toMatch(/is for 2023-11-14 22:23 UTC .*after the latest time this settlement accepts \(2023-11-14 22:13 UTC/);
+    expect(decodeError(revertData("BazaarOracle__SampleNotProven", [feed, 1_700_000_000n, 1_700_000_005n])).message).toMatch(/do not prove the price for 2023-11-14 22:13 UTC/);
+    for (const name of ["BazaarOracle__FeedNotInUpdate", "BazaarOracle__IncompleteFeed", "BazaarOracle__WrongTick", "BazaarOracle__InvalidFeedId", "LazerPayloadLib__Malformed", "Factory__InvalidFeedId"]) {
+      const d = decodeError(revertData(name));
+      expect(d.message, name).toBe(USER_MESSAGES[name]);
+      expect(d.hint, name).toBe(KEEPER_HINTS[name]);
+      expect(d.hint, name).not.toBe("");
+    }
+    // errors the contracts do not declare have neither a message nor a hint
+    for (const gone of ["Factory__FeedNotOnPyth", "BazaarOracle__SampleFeeMismatch"]) {
+      expect(USER_MESSAGES[gone], gone).toBeUndefined();
+      expect(KEEPER_HINTS[gone], gone).toBeUndefined();
+    }
+    expect(KEEPER_HINTS["BazaarPair__NoPriceUpdatesProvided"]).toMatch(/the pair's own stored price is more than 3 seconds old/);
+  });
+
+  it("explains the reason strings Pyth's verifier reverts with", () => {
+    const reason = (msg: string): Hex => concatHex(["0x08c379a0", encodeAbiParameters([{ type: "string" }], [msg])]);
+    expect(Object.keys(REASON_MESSAGES).sort()).toEqual(Object.keys(VERIFIER_REASON_HINTS).sort());
+    expect(Object.keys(REASON_MESSAGES)).toEqual(["invalid signer", "invalid signature", "Insufficient fee provided", "input too short", "invalid evm magic"]);
+    for (const [msg, text] of Object.entries(REASON_MESSAGES)) {
+      const d = decodeError(reason(msg));
+      expect([d.name, d.args.message]).toEqual(["Error", msg]);
+      expect(d.message).toBe(text);
+      expect(d.hint).toBe(VERIFIER_REASON_HINTS[msg]);
+      expect(errorMessage(new RpcError(3, "execution reverted", reason(msg)))).toBe(text);
+    }
+    expect(decodeError(reason("invalid signer")).message).toBe("The price update was signed by a key Pyth no longer accepts. Rebuild the transaction with a current price update.");
+    // any other reason string is shown as it is
+    const other = decodeError(reason("ERC20: transfer amount exceeds balance"));
+    expect([other.message, other.hint]).toEqual(["ERC20: transfer amount exceeds balance", "ERC20: transfer amount exceeds balance"]);
+  });
 });
 
 describe("formatting", () => {
@@ -184,5 +225,17 @@ describe("errorMessage", () => {
     expect(errorMessage({ code: 4001 })).toMatch(/rejected/);
     expect(errorMessage(new Error("weird"))).toBe("Something went wrong. Please try again.");
     expect(d).toBeInstanceOf(DecodedError);
+  });
+});
+
+describe("message tables", () => {
+  it("are read by their own keys only, so a reason such as constructor stays text", () => {
+    const errorString = (s: string) => `0x08c379a0${encodeAbiParameters([{ type: "string" }], [s]).slice(2)}` as Hex;
+    for (const reason of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      const d = decodeError(errorString(reason));
+      expect(d.hint, reason).toBe(reason);
+      expect(d.message, reason).toBe(reason);
+      expect(userMessage(reason), reason).toBe(reason);
+    }
   });
 });

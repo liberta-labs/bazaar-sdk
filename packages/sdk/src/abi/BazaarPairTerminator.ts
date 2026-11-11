@@ -39,7 +39,7 @@ export const bazaarPairTerminatorAbi = [
   },
   {
     "type": "function",
-    "name": "CATEGORY_PYTH_CONTRACT_MIGRATION",
+    "name": "CATEGORY_PYTH_VERIFIER_MIGRATION",
     "inputs": [],
     "outputs": [
       {
@@ -195,7 +195,7 @@ export const bazaarPairTerminatorAbi = [
   },
   {
     "type": "function",
-    "name": "SETTLE_WINDOW",
+    "name": "SETTLE_TICK",
     "inputs": [],
     "outputs": [
       {

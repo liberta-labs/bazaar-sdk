@@ -79,7 +79,7 @@ describe("subgraph client", () => {
   });
 
   it("stops paging when the cursor does not move forward", async () => {
-    // the same full page, forever: the old loop asked for it again and again
+    // the same full page, forever: without a progress check the loop would ask for it again and again
     const same = fakeFetch(() => json({ data: { positions: Array.from({ length: SUBGRAPH_PAGE }, () => ({ id: "0x01" })) } }));
     await expect(new SubgraphClient("https://sg.example/q", null, { fetch: same.fetch }).pages("positions", "", "", 1, true)).rejects.toThrow(/id order/);
     expect(same.sent.length).toBe(1);

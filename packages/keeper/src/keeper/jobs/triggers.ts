@@ -49,7 +49,7 @@ export class TriggersJob extends Job<TriggersJobConfig> {
       (candidates ??= []).push(oid);
     }
     if (candidates === null) return [];
-    const updates = pc.updates; // before the first await: the print `price` came from
+    const updates = pc.updates; // before the first await: the update of the print `price` is from, or none for the stored price
     const reader = this.k.reader;
     const live = await reader.orders(m.address, candidates);
     let ready: Ready[] = [];
@@ -86,13 +86,14 @@ export class TriggersJob extends Job<TriggersJobConfig> {
         m.address,
         PAIR.encode("executeTriggeredOrders", execs, updates),
         `execute ${execs.length} trigger order(s), up to $${units(bounty).toFixed(2)} of bounty`,
-        { value: fee, locks: ready.map(({ oid }) => lockKey("trig", m.address, oid)), rewardPair: m.address },
+        { value: fee, priceTime: pc.priceTime, locks: ready.map(({ oid }) => lockKey("trig", m.address, oid)), rewardPair: m.address },
       ),
     ];
   }
 
   override note(action: Action, result: ActionResult): void {
-    if (result.sent) this.clearEarly(action.locks);
-    else this.coolRefused(action, result, "executeTriggeredOrders"); // see Job.coolRefused
+    // Refused or unprofitable: wait before simulating the same orders again. A price that aged
+    // before the send refused nothing: the next print plans them again.
+    if (!result.sent && !result.priceAged) for (const key of action.locks) this.cool(key);
   }
 }

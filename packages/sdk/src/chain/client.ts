@@ -172,8 +172,9 @@ export class Chain {
     };
   }
 
-  async code(address: Address): Promise<Hex> {
-    return hex(await this.request("eth_getCode", [address, "latest"]));
+  /** The code at `address`, at the head or at an earlier block (which needs a node that keeps historical state). */
+  async code(address: Address, at: BlockTag = "latest"): Promise<Hex> {
+    return hex(await this.request("eth_getCode", [address, tag(at)]));
   }
 
   async balance(address: Address): Promise<bigint> {

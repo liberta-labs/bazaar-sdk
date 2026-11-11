@@ -15,6 +15,7 @@ export * from "./chain/rpc.js";
 export * from "./chain/codec.js";
 export * from "./chain/errors.js";
 export * from "./chain/client.js";
+export * from "./chain/deployment.js";
 export * from "./probe/index.js";
 export * from "./prices/index.js";
 export * from "./sync/index.js";
@@ -22,12 +23,13 @@ export * from "./subgraph/index.js";
 
 // ---- Frontend: the shared core, flat ----
 export * from "./client/context.js";
+export * from "./client/signers.js";
 export * from "./client/calls.js";
 export * from "./client/feeds.js";
 export * from "./client/units.js";
-export { errorMessage, installUserMessages, userMessage, walletErrorMessage, USER_MESSAGES } from "./errors/messages.js";
+export { errorMessage, installUserMessages, userMessage, walletErrorMessage, REASON_MESSAGES, USER_MESSAGES } from "./errors/messages.js";
 
-export { hermesPriceSource, livePrices, LivePrices } from "./client/prices.js";
+export { proPriceSource, livePrices, LivePrices } from "./client/prices.js";
 export { Bazaar, type BazaarOptions } from "./client/bazaar.js";
 export { requirePair } from "./client/guard.js";
 

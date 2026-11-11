@@ -1,13 +1,13 @@
 /**
  * Logging: readable lines for people, JSON lines for machines.
  *
- * `getLogger(name)` hands out a named logger (the Python keeper's names, e.g. "bazaar_sdk.exec");
- * `setup(level, format)` configures them all at once. Until `setup` runs, warnings and errors go to
- * stderr as bare messages and everything else is dropped, as Python's logging does without handlers.
+ * `getLogger(name)` hands out a named logger (e.g. "bazaar_sdk.exec"); `setup(level, format)`
+ * configures them all at once. Until `setup` runs, warnings and errors go to stderr as bare messages
+ * and everything else is dropped.
  *
- * Messages are plain strings (template literals), or Python-style `%s` / `%d` / `%r` / `%f` templates
+ * Messages are plain strings (template literals), or printf-style `%s` / `%d` / `%r` / `%f` templates
  * filled from the arguments: an Error argument fills `%s` with its message. An Error passed after the
- * arguments the template consumes is the record's exception (Python's `exc_info=e`): its stack is
+ * arguments the template consumes is the record's exception: its stack is
  * printed under the line, or put in the JSON line's `exc` field.
  *
  * Never pass a URL that may carry a key (use `redactUrl`) or any secret.
@@ -27,7 +27,7 @@ export interface Logger {
   info(msg: string, ...args: unknown[]): void;
   warning(msg: string, ...args: unknown[]): void;
   error(msg: string, ...args: unknown[]): void;
-  /** At error level, with a trailing Error argument as the exception (Python's log.exception). */
+  /** At error level, with a trailing Error argument as the exception. */
   exception(msg: string, ...args: unknown[]): void;
   isEnabledFor(level: LogLevel): boolean;
 }

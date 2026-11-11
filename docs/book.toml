@@ -1,0 +1,20 @@
+[book]
+title = "Bazaar SDK"
+description = "TypeScript tools for the Bazaar protocol: the keeper, and everything a frontend or bot needs"
+language = "en"
+src = "src"
+
+[build]
+# Every page is listed in SUMMARY.md and exists: never create an empty page for a typo.
+create-missing = false
+
+[output.html]
+# "ayu" is mdBook's internal id for the theme the picker labels Liberty.
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+additional-css = ["bazaar-theme.css", "page-actions.css"]
+additional-js = ["bazaar-theme.js", "page-actions.js"]
+no-section-label = true
+fold = { enable = true, level = 1 }
+git-repository-url = "https://github.com/liberta-labs/bazaar-sdk"
+edit-url-template = "https://github.com/liberta-labs/bazaar-sdk/edit/main/docs/{path}"

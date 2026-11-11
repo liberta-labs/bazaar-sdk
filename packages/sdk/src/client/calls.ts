@@ -19,17 +19,24 @@ export interface PreparedCall {
   readonly action: string;
   readonly to: Address;
   readonly data: Hex;
-  /** ETH to send: the Pyth update fee when a price update is attached, else 0. */
+  /** ETH to send: Pyth's verification fee when a price update is attached, else 0. */
   readonly value: bigint;
   /** The account the call acts for, when known (the sender of a direct call). */
   readonly from: Address | null;
   /** One line for a confirmation screen. */
   readonly summary: string;
   /**
-   * When the call carries a Pyth update: the update's publish time (seconds). The pair refuses a print
-   * more than 3 s from the block's time, so a call older than that should be rebuilt before sending.
+   * When the call carries a Pyth Pro update: the second its price was generated in. The pair refuses
+   * a price generated more than 3 s from the block's time, so a call older than that should be rebuilt
+   * before sending.
    */
   readonly priceTime?: number;
+  /**
+   * Set when the call takes a Pyth Pro update but carries none because no update the oracle would
+   * accept was available: why. The pair then judges the call on its stored price, which some calls
+   * refuse once it is older than 3 s.
+   */
+  readonly noFreshPrice?: string;
   /** USDC the call pulls from the wallet (BAZAAR precision), so the UI can check balance and allowance. */
   readonly pullsUsdc?: bigint;
 }

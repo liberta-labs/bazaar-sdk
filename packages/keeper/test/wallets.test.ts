@@ -16,7 +16,7 @@ import {
   writeKeystore,
 } from "../src/exec/wallets.js";
 
-// Anvil's first test account, and keystores of it written by eth-account (the Python keeper).
+// Anvil's first test account, and keystores of it written by eth-account.
 const KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const PY_SCRYPT = {
@@ -114,7 +114,7 @@ describe("local signing", () => {
 });
 
 describe("keystores", () => {
-  it("reads the Python keeper's scrypt keystore", async () => {
+  it("reads an eth-account scrypt keystore", async () => {
     expect(bytesToHex(await decryptKeystore(PY_SCRYPT, "correct horse"))).toBe(KEY);
     await expect(decryptKeystore(PY_SCRYPT, "wrong")).rejects.toThrow("wrong keystore password");
   });
@@ -139,7 +139,7 @@ describe("keystores", () => {
     );
   });
 
-  it("writes the Python keeper's format, owner-only, and never over an existing file", async () => {
+  it("writes a v3 keystore, owner-only, and never over an existing file", async () => {
     const path = join(dir, "keys", "default.json");
     expect(await writeKeystore(KEY, "pw", path)).toBe(ADDRESS);
     const text = readFileSync(path, "utf8");
@@ -266,7 +266,7 @@ describe("RemoteSigner", () => {
     expect(new RemoteSigner(URL_WITH_KEY, ADDRESS).displayUrl).toBe("https://signer.example/v1/***/rpc");
   });
 
-  it("refuses a signed transaction that is not the one asked for, or not signed by the wallet (K12)", async () => {
+  it("refuses a signed transaction that is not the one asked for, or not signed by the wallet", async () => {
     const answering = (raw: string) =>
       (async () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: raw }))) as unknown as typeof fetch;
     const me = new LocalSigner(KEY);
@@ -296,7 +296,7 @@ describe("RemoteSigner", () => {
     expect(await new RemoteSigner(URL_WITH_KEY, ADDRESS, { fetch: answering(PY_RAW) }).sign(TX)).toBe(PY_RAW);
   });
 
-  it("never echoes a bad address (K10)", () => {
+  it("never echoes a bad address", () => {
     let err: unknown;
     try {
       new RemoteSigner(URL_WITH_KEY, KEY);

@@ -4,7 +4,7 @@ export const bazaarOracleAbi = [
     "type": "constructor",
     "inputs": [
       {
-        "name": "_pyth",
+        "name": "_pythLazer",
         "type": "address",
         "internalType": "address"
       }
@@ -138,7 +138,7 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "function",
-    "name": "fetchFirstPriceAtOrAfter",
+    "name": "fetchPriceAtTick",
     "inputs": [
       {
         "name": "baseFeedId",
@@ -151,12 +151,7 @@ export const bazaarOracleAbi = [
         "internalType": "bytes[]"
       },
       {
-        "name": "minPublishTime",
-        "type": "uint64",
-        "internalType": "uint64"
-      },
-      {
-        "name": "maxPublishTime",
+        "name": "tick",
         "type": "uint64",
         "internalType": "uint64"
       }
@@ -201,36 +196,12 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "function",
-    "name": "getSampleSetFee",
-    "inputs": [
-      {
-        "name": "baseFeedId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "priceUpdate",
-        "type": "bytes[]",
-        "internalType": "bytes[]"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "fee",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "getUpdateFee",
     "inputs": [
       {
-        "name": "priceUpdate",
-        "type": "bytes[]",
-        "internalType": "bytes[]"
+        "name": "updates",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [
@@ -244,13 +215,32 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "function",
-    "name": "pyth",
+    "name": "isRawFeedId",
+    "inputs": [
+      {
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "pythLazer",
     "inputs": [],
     "outputs": [
       {
         "name": "",
         "type": "address",
-        "internalType": "contract IPyth"
+        "internalType": "contract IPythLazer"
       }
     ],
     "stateMutability": "view"
@@ -286,90 +276,7 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "function",
-    "name": "tryReadFreshPrice",
-    "inputs": [
-      {
-        "name": "baseFeedId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      },
-      {
-        "name": "maxStaleness",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "found",
-        "type": "bool",
-        "internalType": "bool"
-      },
-      {
-        "name": "spotPrice",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "lowPrice",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "highPrice",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "publishTime",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "tryReadStalePrice",
-    "inputs": [
-      {
-        "name": "baseFeedId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "found",
-        "type": "bool",
-        "internalType": "bool"
-      },
-      {
-        "name": "spotPrice",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "lowPrice",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "highPrice",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "publishTime",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "updateAndFetchPrice",
+    "name": "verifyAndFetchPrice",
     "inputs": [
       {
         "name": "baseFeedId",
@@ -460,6 +367,44 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "error",
+    "name": "BazaarOracle__FeeMismatch",
+    "inputs": [
+      {
+        "name": "supplied",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "required",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BazaarOracle__FeedNotInUpdate",
+    "inputs": [
+      {
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BazaarOracle__IncompleteFeed",
+    "inputs": [
+      {
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "BazaarOracle__InvalidCompositeLegs",
     "inputs": [
       {
@@ -469,6 +414,17 @@ export const bazaarOracleAbi = [
       },
       {
         "name": "quoteId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BazaarOracle__InvalidFeedId",
+    "inputs": [
+      {
+        "name": "feedId",
         "type": "bytes32",
         "internalType": "bytes32"
       }
@@ -513,15 +469,57 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "error",
-    "name": "BazaarOracle__SampleFeeMismatch",
+    "name": "BazaarOracle__SampleNotProven",
     "inputs": [
       {
-        "name": "supplied",
-        "type": "uint256",
-        "internalType": "uint256"
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
       },
       {
-        "name": "required",
+        "name": "target",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "tick",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BazaarOracle__SampleTooLate",
+    "inputs": [
+      {
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "tick",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "maxPublishTime",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BazaarOracle__StalePrice",
+    "inputs": [
+      {
+        "name": "feedId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "generatedTs",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -529,7 +527,28 @@ export const bazaarOracleAbi = [
   },
   {
     "type": "error",
+    "name": "BazaarOracle__WrongTick",
+    "inputs": [
+      {
+        "name": "timestampUs",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "channel",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "BazaarOracle__ZeroAddress",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "LazerPayloadLib__Malformed",
     "inputs": []
   }
 ] as const;

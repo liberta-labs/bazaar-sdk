@@ -25,19 +25,22 @@ import { join } from "node:path";
 import {
   Chain,
   type Deployment,
-  HermesClient,
   type Market,
-  PUBLIC_FEED_METADATA_URL,
   PriceService,
+  ProClient,
+  ProError,
+  type ProEndpoints,
   Reader,
   type Status,
   SubgraphClient,
   SubgraphError,
   ZERO_ADDRESS,
   fetchSymbols,
+  findDeploymentBlock,
   inventorySize,
   marketLabel,
   marketStatus,
+  verifierSignerCheck,
 } from "@liberta-labs/bazaar-sdk";
 import { type Address, type Hex, getAddress, isAddress } from "viem";
 import {
@@ -45,9 +48,10 @@ import {
   type JobName,
   type KeeperConfig,
   type ResolvedNetwork,
+  UNCHECKED_SIGNERS_WARNING,
   enabledJobs,
   expandHome,
-  priceBaseUrl,
+  priceEndpoints,
   resolvedNetwork,
   subgraphUrl,
 } from "../config/index.js";
@@ -58,6 +62,7 @@ import { loadSigner } from "../exec/wallets.js";
 import { errorText } from "../cli/format.js";
 import { Alerter } from "../observe/alerts.js";
 import { getLogger, safeLabel } from "../observe/logs.js";
+import { streamSocket } from "./stream-socket.js";
 import { Store } from "../state/store.js";
 import { bootstrap as bootstrapFromSubgraph } from "../sync/bootstrap.js";
 import { LogTail, type TailLogger } from "../sync/tail.js";
@@ -151,7 +156,7 @@ export interface JobStatusEntry {
   today: SummaryRow | Record<string, never>;
 }
 
-/** `status.json`, as the Python keeper writes it (the same keys), for `bazaar keeper status`. */
+/** `status.json`, which `bazaar keeper status` reads. */
 export interface KeeperStatus {
   /** seconds since the epoch */
   updated: number;
@@ -228,7 +233,8 @@ export class Keeper {
   readonly reader: Reader;
   /** the index: markets, open positions, live orders (replaced by the snapshot on connect) */
   store: Store;
-  readonly hermes: HermesClient;
+  /** the Pyth Pro client: the price stream, the request API and the symbols registry */
+  readonly pro: ProClient;
   readonly prices: PriceService;
   readonly subgraph: SubgraphClient | null;
   /** where the snapshot, the ledger and the status file live */
@@ -278,8 +284,6 @@ export class Keeper {
   private stopping: Promise<void> | null = null;
   private loopDone: Promise<void> | null = null;
   private readonly sleepers = new Set<() => void>();
-  /** `${job}:${market}` -> the one early re-plan pending there (see {@link replanAt}) */
-  private readonly earlyPlans = new Map<string, { at: number; timer: ReturnType<typeof setTimeout> }>();
   // feed id -> the markets that have it as a leg, rebuilt when the store's markets change
   private feedIndex = new Map<Hex, Market[]>();
   private feedIndexStore: Store | null = null;
@@ -307,21 +311,40 @@ export class Keeper {
       if (!this.net.sendUrl) throw new ConfigError(`rpc.send is 'sequencer', but ${this.net.name} has no sequencer endpoint preset`);
       send = this.net.sendUrl;
     }
-    let priceUrl: string;
+    let endpoints: ProEndpoints;
     try {
-      priceUrl = priceBaseUrl(cfg.prices);
+      endpoints = priceEndpoints(cfg.prices);
     } catch (e) {
-      throw new ConfigError(`prices.endpoint: ${e instanceof Error ? e.message : String(e)}`);
+      throw new ConfigError(e instanceof Error ? e.message : String(e)); // each message names its setting
     }
     this.loadsWallets = opts.loadWallets ?? true;
     this.chain = Chain.fromUrl(cfg.rpc.http, { perSecond: cfg.rpc.maxRequestsPerSecond, sendUrl: send });
     this.reader = new Reader(this.chain);
     this.store = new Store();
-    this.hermes = new HermesClient(priceUrl, cfg.prices.apiKey, cfg.prices.headers);
-    this.prices = new PriceService(this.hermes, {
+    try {
+      this.pro = new ProClient({
+        ...endpoints,
+        token: cfg.prices.token ?? null,
+        channel: cfg.prices.channel,
+        headers: cfg.prices.headers,
+        allowInsecure: cfg.prices.allowInsecure,
+        // The ws package's, bounded (stream-socket.ts): Node has a global WebSocket only from version 22,
+        // and its defaults would buffer frames of up to 100 MiB, compressed or not.
+        WebSocket: streamSocket,
+        // Streamed updates are judged against the chain's clock, as their prices are: on a chain whose
+        // clock was moved, this machine's would refuse every update as dated ahead.
+        clock: () => this.chainTime(),
+      });
+    } catch (e) {
+      // The client names the setting at fault and never quotes a value.
+      if (e instanceof ProError) throw new ConfigError(`prices: ${e.message}`);
+      throw e;
+    }
+    this.prices = new PriceService(this.pro, {
       stream: cfg.prices.stream,
       pollInterval: cfg.prices.pollInterval,
-      clock: () => this.now(),
+      // To the fraction of a second: a whole-second clock would judge a print up to a second younger than it is.
+      clock: () => this.chainTime(),
       sendMargin: cfg.prices.sendMarginSeconds,
       streamIdleTimeout: cfg.prices.streamIdleTimeoutSeconds,
       ethUsdMaxAge: cfg.gas.ethUsdMaxAgeSeconds,
@@ -341,6 +364,7 @@ export class Keeper {
       () => this.prices.ethUsd(),
       (kind, payload) => this.emit(kind, payload as never),
     );
+    this.executor.clock = () => this.chainTime();
     this.jobs = new Map();
     for (const [name, jc] of Object.entries(enabledJobs(cfg.jobs))) this.jobs.set(name, new JOBS[name as JobName](this, jc as never));
     this.alerts = new Alerter(cfg.alerts);
@@ -456,6 +480,11 @@ export class Keeper {
     return false;
   }
 
+  /** Log why a market's print is not attached to a call: at debug level, at most once a minute per market. */
+  unusablePrint(m: Market, why: string): void {
+    if (this.every(`print:${m.address}`, 60)) priceLog.debug("%s: %s; skipping it", m.label || m.address, why);
+  }
+
   // ---- markets ----
 
   /**
@@ -549,15 +578,7 @@ export class Keeper {
   private async label(markets: readonly Market[], descriptions?: ReadonlyMap<Address, string> | null): Promise<void> {
     const feeds = new Set<Hex>();
     for (const m of markets) for (const leg of m.legs) feeds.add(leg);
-    let symbols = await fetchSymbols(this.hermes, feeds);
-    if (symbols.size === 0 && this.hermes.base !== PUBLIC_FEED_METADATA_URL) {
-      const pub = new HermesClient(PUBLIC_FEED_METADATA_URL);
-      try {
-        symbols = await fetchSymbols(pub, feeds);
-      } finally {
-        await pub.close();
-      }
-    }
+    const symbols = await fetchSymbols(this.pro, feeds);
     const symbol = (leg: Hex | undefined) => (leg === undefined ? undefined : symbols.get(leg.toLowerCase() as Hex));
     for (const m of markets) {
       const d = descriptions?.get(m.address);
@@ -569,7 +590,7 @@ export class Keeper {
         const desc = m.description.trim();
         label = desc.length > 0 && desc.length <= 24 ? desc : m.address.slice(0, 10);
       }
-      // Symbols and descriptions come from the price endpoint and the lister: shown, never trusted.
+      // Symbols and descriptions come from the symbols registry and the lister: shown, never trusted.
       m.label = safeLabel(label) || m.address.slice(0, 10);
     }
   }
@@ -586,6 +607,15 @@ export class Keeper {
   }
 
   // ---- connecting and syncing ----
+
+  /**
+   * With prices.checkSigners on and the deployment read, have the price client use only updates
+   * signed by a signer the deployment's Pyth verifier trusts. The chain verifies every update a call
+   * carries either way; the ETH/USD print that prices gas reaches no contract, so only this checks it.
+   */
+  checkSigners(): void {
+    if (this.dep !== null && this.cfg.prices.checkSigners) this.pro.isTrustedSigner = verifierSignerCheck(this.chain, this.dep.oracle);
+  }
 
   /** Read the latest block: the head, the chain's clock and the base fee. */
   async updateBlock(): Promise<void> {
@@ -618,6 +648,7 @@ export class Keeper {
     }
     this.dep = await this.reader.deployment(this.net.factory);
     this.executor.lens = this.dep.lens;
+    this.checkSigners();
     const problems = await this.reader.wiringProblems();
     if (problems.length) throw new ConfigError("refusing to start: " + problems.join("; "));
     const snap = Store.load(join(this.stateDir, "snapshot.json"), cid, this.net.factory);
@@ -659,11 +690,32 @@ export class Keeper {
       }
     }
     const dep = this.dep!;
-    const start = this.net.startBlock;
+    const start = this.net.startBlock ?? (await this.factoryDeploymentBlock());
     log.info("indexing from chain logs, blocks %d to %d", start, this.head);
     await this.tail!.scan(start, this.head, [dep.factory, dep.terminator, ...this.store.markets.keys()]);
     this.store.head = this.head;
     this.store.headHash = (await this.chain.block(this.head)).hash;
+  }
+
+  /**
+   * Where the log scan starts when neither the config nor an official preset gives startBlock: the
+   * factory's deployment block, found by a binary search on its code (one read per halving of the
+   * chain's history). Nothing of Bazaar's can emit a log before its factory exists. A node without
+   * historical state cannot answer; then the keeper refuses to start rather than scan from block 0,
+   * which takes at least one log request per rpc.logChunk blocks of the chain's whole history.
+   */
+  private async factoryDeploymentBlock(): Promise<number> {
+    const factory = this.net.factory;
+    try {
+      const block = await findDeploymentBlock(this.chain, factory, { head: this.head });
+      log.info("found the factory's deployment block, %d (set startBlock: %d in the config to skip the search)", block, block);
+      return block;
+    } catch (e) {
+      throw new ConfigError(
+        `could not find the factory's deployment block (${errorText(e)}). Set startBlock in the config to the block ` +
+          "the factory was deployed in, use an RPC that keeps historical state, or configure a subgraph",
+      );
+    }
   }
 
   /**
@@ -806,43 +858,6 @@ export class Keeper {
     } finally {
       this.planning.delete(key);
     }
-  }
-
-  /**
-   * Plan `job` on `m` once more at chain time `at` (unix seconds), through {@link planSoon}. One is
-   * pending per job and market: a second request keeps the later time. Used when a refusal is most
-   * likely Pyth's on-chain cache answering for the pair (see Job.coolRefused); the tick and the print
-   * path plan as usual meanwhile. Nothing is scheduled while the keeper is not running; stop() cancels
-   * what is pending.
-   */
-  replanAt(job: Job, m: Market, at: number): void {
-    if (!this.running || this.stopRequested) return;
-    const key = `${job.name}:${m.address}`;
-    const pending = this.earlyPlans.get(key);
-    if (pending !== undefined) {
-      if (pending.at >= at) return;
-      clearTimeout(pending.timer);
-    }
-    const timer = setTimeout(
-      () => {
-        this.earlyPlans.delete(key);
-        if (this.running && !this.stopRequested && job.runnable(m)) this.planSoon(job, m);
-      },
-      // A millisecond past `at`, so the candidates' cooldowns (which end at `at`) have surely ended.
-      Math.ceil(Math.max(0, at - this.chainTime()) * 1000) + 1,
-    );
-    (timer as { unref?: () => void }).unref?.(); // never what keeps a process alive
-    this.earlyPlans.set(key, { at, timer });
-  }
-
-  /** How many early re-plans are pending (see {@link replanAt}). */
-  get pendingReplans(): number {
-    return this.earlyPlans.size;
-  }
-
-  private cancelReplans(): void {
-    for (const p of this.earlyPlans.values()) clearTimeout(p.timer);
-    this.earlyPlans.clear();
   }
 
   /** feed id -> markets with that leg; rebuilt only when the store or its market count changes. */
@@ -1005,6 +1020,7 @@ export class Keeper {
       this.store.markets.size,
       [...this.jobs.keys()].join(", ") || "none",
     );
+    if (!this.cfg.prices.checkSigners) log.warning("%s", UNCHECKED_SIGNERS_WARNING);
     try {
       while (this.running) {
         const t0 = monotonic();
@@ -1053,7 +1069,7 @@ export class Keeper {
    * Stop: end the price stream, the print path and the tick loop at once, dispatch nothing new, wait
    * (up to `timeout` seconds, default 60) for the loop and the in-flight sends, claim earnings if
    * `collect` (default jobs.collect.onShutdown), and save the snapshot. `stop({ collect: false })`,
-   * or Python-style `stop(false, 30)`. Calling it again while it runs returns the same promise.
+   * or `stop(false, 30)`. Calling it again while it runs returns the same promise.
    */
   stop(opts?: StopOptions | boolean | null, timeout?: number): Promise<void> {
     const o: StopOptions = typeof opts === "object" && opts !== null ? opts : { collect: opts ?? null, timeout };
@@ -1068,7 +1084,6 @@ export class Keeper {
     const left = () => deadline - monotonic();
     this.stopRequested = true;
     this.running = false;
-    this.cancelReplans();
     if (this.loopDone !== null) this.prices.stop(); // ends the stream now, not when the loop notices
     this.synced.release();
     this.wakeSleepers();
@@ -1097,9 +1112,8 @@ export class Keeper {
 
   /** Release the keeper's clients (call after stop(), or after one-shot use). */
   async close(): Promise<void> {
-    this.cancelReplans();
     this.prices.stop();
-    await this.hermes.close();
+    await this.pro.close();
     await this.alerts.close();
     if (this.subgraph) await this.subgraph.close();
   }

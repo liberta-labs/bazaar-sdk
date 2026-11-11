@@ -1,27 +1,56 @@
 /**
- * Prices: the Hermes client, the live price service, and Pyth accumulator updates.
+ * Prices: Pyth Pro's signed updates, the client that fetches and streams them, and the live price
+ * service built on it.
  *
- * The accumulator functions are generic names (parse, subset, build), so they are grouped under the
- * `accumulator` namespace, as the Python module is used: `accumulator.subset(p.blob, [p.feedId])`.
+ * The update codec's functions carry generic names (parse, split, build), so they are grouped under
+ * the `lazer` namespace: `lazer.parseUpdate(blob)`.
  */
 
-export * as accumulator from "./accumulator.js";
-export { AccumulatorError, Accumulator, type AccumulatorUpdate, type PriceMessage } from "./accumulator.js";
+export * as lazer from "./lazer.js";
 export {
-  HermesClient,
-  type HermesClientOptions,
-  HermesError,
-  type HermesParsedUpdate,
-  type HermesPrice,
-  type HermesUpdates,
+  CHANNEL_FIXED_RATE_1000,
+  CHANNEL_IDS,
+  type Channel,
+  type LazerFeed,
+  type LazerFeedInput,
+  type LazerPayload,
+  type LazerPayloadInput,
+  type LazerUpdate,
+  LazerError,
+  feedIdHex,
+  isRawFeedId,
+  proFeedId,
+} from "./lazer.js";
+export {
+  AUTH_SUBPROTOCOL,
+  DEFAULT_CHANNEL,
   MAX_RESPONSE_BYTES,
-  MAX_STREAM_LINE,
-  type PriceFeedMetadata,
+  MAX_STREAM_MESSAGE,
+  MAX_STREAM_NOTICES,
+  MAX_STRAY_MESSAGES,
+  MAX_UPDATE_AHEAD,
+  type MintedToken,
+  NoLivePriceError,
+  PRO_PROPERTIES,
   type Print,
+  ProClient,
+  type ProClientOptions,
+  ProError,
+  type ProSymbol,
+  type ProUpdate,
   STREAM_IDLE_TIMEOUT,
+  type SignerCheck,
   type StreamOptions,
-  parseResponse,
-} from "./hermes.js";
+  type TokenProvider,
+  UNKNOWN_EXPIRY_LIFETIME,
+  type WebSocketConstructor,
+  type WebSocketLike,
+  cachedToken,
+  isLivePrint,
+  mintProToken,
+  printsOf,
+  whyNotLive,
+} from "./pro.js";
 export {
   ETH_USD_BOUNDS,
   ETH_USD_MAX_AGE,
@@ -31,7 +60,9 @@ export {
   type PriceServiceOptions,
   type PriceSource,
   type PrintListener,
+  distinctBlobs,
   feedLabel,
+  fetchFeedInfo,
   fetchSymbols,
   marketLabel,
 } from "./service.js";

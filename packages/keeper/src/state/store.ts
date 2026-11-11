@@ -31,9 +31,8 @@ import {
 import type { Address, Hex } from "viem";
 
 /**
- * The snapshot format. 1 is the Python keeper's (snake_case, integers as JSON numbers); this one
- * writes camelCase with every bigint as a decimal string. Each keeper ignores the other's snapshot
- * and bootstraps afresh.
+ * The snapshot format: camelCase, with every bigint as a decimal string so it round-trips exactly.
+ * A snapshot of any other version is ignored, and the keeper bootstraps afresh.
  */
 export const SNAPSHOT_VERSION = 2;
 
@@ -403,7 +402,7 @@ function marketFromJson(x: unknown): Market {
   });
 }
 
-/** `snapshot.json` -> `snapshot.tmp`, as Python's `Path.with_suffix(".tmp")`. */
+/** `snapshot.json` -> `snapshot.tmp`: the extension replaced, not appended. */
 function tmpPath(path: string): string {
   return path.slice(0, path.length - extname(path).length) + ".tmp";
 }

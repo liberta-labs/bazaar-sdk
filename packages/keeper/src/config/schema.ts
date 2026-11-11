@@ -4,7 +4,7 @@
  * Unknown keys are refused everywhere, so a typo is an error rather than a silently ignored setting.
  */
 
-import { NETWORKS, PRICE_ENDPOINTS } from "@liberta-labs/bazaar-sdk";
+import { CHANNEL_IDS, type Channel, DEFAULT_CHANNEL, NETWORKS, PRICE_ENDPOINTS, type ProEndpoints, isUrl } from "@liberta-labs/bazaar-sdk";
 import { type Address, getAddress, isAddress } from "viem";
 import { z } from "zod";
 
@@ -43,19 +43,44 @@ export const SubgraphConfig = z
   })
   .strict();
 
+const CHANNELS = Object.keys(CHANNEL_IDS) as [Channel, ...Channel[]];
+
 export const PricesConfig = z
   .object({
-    /** bazaar | pyth | any Hermes-compatible URL */
+    /**
+     * pyth | bazaar | the base URL of a Pyth Pro compatible service: one that answers the request API
+     * and the symbols registry at that URL and streams at its `/v1/stream`.
+     */
     endpoint: z.string().default("bazaar"),
-    /** sent as "Authorization: Bearer <key>" */
-    apiKey: z.string().nullish(),
+    /** the Pyth Pro access token, sent as "Authorization: Bearer <token>" */
+    token: z.string().nullish(),
+    /** the channel streamed and polled: the faster it is, the sooner a move is seen and the more updates arrive */
+    channel: z.enum(CHANNELS).default(DEFAULT_CHANNEL),
+    /** the WebSocket stream endpoints, in place of the endpoint's own; the keeper connects to every one */
+    streamUrls: z.array(z.string()).min(1).nullish(),
+    /** the request API's base URL (`/v1/latest_price`, `/v1/price`), in place of the endpoint's own */
+    restUrl: z.string().nullish(),
+    /** the symbols registry's base URL (`/v1/symbols`), in place of the endpoint's own */
+    symbolsUrl: z.string().nullish(),
+    /** extra request headers for the request API and the stream connections (a proxy's, say) */
     headers: z.record(z.string()).default({}),
-    /** live prints over server-sent events; polls `latest` when off or failing */
+    /**
+     * Use only updates signed by a signer the deployment's Pyth verifier trusts. It costs one signature
+     * recovery per update taken, which adds up with many markets on a fast channel; the chain verifies
+     * every update a call carries either way.
+     */
+    checkSigners: z.boolean().default(true),
+    /**
+     * Send the token and the headers over plain http or ws to an endpoint on another machine. Refused
+     * by default, since anyone on the path could read them; an endpoint on this machine never needs it.
+     */
+    allowInsecure: z.boolean().default(false),
+    /** live prints over the WebSocket stream; polls the latest price when off or failing */
     stream: z.boolean().default(true),
     pollInterval: positive(1.0),
     /**
-     * A stream that sends nothing (not even a keep-alive) for this long is dropped and reconnected, so a
-     * silently stalled connection cannot leave the keeper on old prices. 0 waits forever.
+     * A stream that brings no new update for this long is dropped and reconnected, so a silently
+     * stalled connection cannot leave the keeper on old prices. 0 waits forever.
      */
     streamIdleTimeoutSeconds: nonNegative(10),
     /**
@@ -365,26 +390,91 @@ export function enabledJobs(jobs: JobsConfig): Partial<Record<JobName, JobConfig
   return out;
 }
 
-/** The price endpoint's base URL. */
-export function priceBaseUrl(p: PricesConfig): string {
-  if (p.endpoint in PRICE_ENDPOINTS) {
-    const url = PRICE_ENDPOINTS[p.endpoint];
-    if (!url) {
+/** What the keeper logs at start, and doctor shows, while prices.checkSigners is off. */
+export const UNCHECKED_SIGNERS_WARNING =
+  "prices.checkSigners is off: price updates are used whoever signed them. The chain refuses a forged one in any call, " +
+  "but the ETH/USD print that prices gas reaches no contract, so a forged one would skew every cost the keeper weighs";
+
+/**
+ * What a config that still holds `prices.apiKey` is told: the setting, the token it takes and the
+ * endpoints it may go to.
+ */
+export const PRICES_API_KEY_MESSAGE =
+  "prices.apiKey is not a setting: the Pyth Pro access token goes in prices.token (a Pyth Core or Hermes key does not work), " +
+  "and prices.endpoint must be pyth or the URL of a Pyth Pro compatible service";
+
+/**
+ * Why `url` (a price endpoint setting's value, named `setting`) must not be used, or null. A URL
+ * whose host or path names Hermes is a Pyth Core service: the keeper would send it the Pyth Pro token,
+ * which must go only to a Pyth Pro service. The message never quotes the URL, which may carry a key.
+ */
+export function hermesEndpointProblem(setting: string, url: string): string | null {
+  let host = "";
+  let path = "";
+  try {
+    const u = new URL(url.trim());
+    host = u.hostname;
+    path = u.pathname;
+  } catch {
+    return null;
+  }
+  if (!/hermes/i.test(host) && !/hermes/i.test(path)) return null;
+  return (
+    `${setting} names a Hermes (Pyth Core) service, and the keeper sends its Pyth Pro token wherever prices are asked for: ` +
+    "the token must go only to a Pyth Pro service. Set prices.endpoint to pyth, or to the URL of a Pyth Pro compatible service"
+  );
+}
+
+/**
+ * Where the keeper reads prices. `prices.endpoint` gives the three places (a preset's, or those a base
+ * URL implies: the request API and the symbols registry at the base, the stream at its `/v1/stream`
+ * over ws or wss), and `prices.streamUrls`, `prices.restUrl` and `prices.symbolsUrl` each replace one.
+ * Throws, naming the setting, when the endpoint is a preset without URLs or neither a preset nor an
+ * http(s) URL, and when a URL the token is sent to names Hermes ({@link hermesEndpointProblem}).
+ */
+export function priceEndpoints(p: PricesConfig): ProEndpoints {
+  let base: ProEndpoints;
+  if (Object.hasOwn(PRICE_ENDPOINTS, p.endpoint)) {
+    const preset = PRICE_ENDPOINTS[p.endpoint];
+    if (!preset) {
       throw new Error(
-        `the '${p.endpoint}' price endpoint has no URL yet; set prices.endpoint to 'pyth' with your own Pyth API key, ` +
-          "or to the URL of a Hermes-compatible service",
+        `prices.endpoint: the '${p.endpoint}' price endpoint has no URLs yet; set prices.endpoint to 'pyth' with your own Pyth Pro token ` +
+          "(prices.token), or to the URL of a Pyth Pro compatible service",
       );
     }
-    return url;
+    base = preset;
+  } else {
+    const url = p.endpoint.trim().replace(/\/+$/, "");
+    if (!isUrl(url) || !/^https?:/i.test(url)) {
+      throw new Error(`prices.endpoint: expected ${Object.keys(PRICE_ENDPOINTS).join(", ")} or an http(s) URL`);
+    }
+    const hermes = hermesEndpointProblem("prices.endpoint", url);
+    if (hermes) throw new Error(hermes);
+    base = { streamUrls: [`${url.replace(/^http/i, "ws")}/v1/stream`], restUrl: url, symbolsUrl: url };
   }
-  return p.endpoint.replace(/\/+$/, "");
+  // The symbols registry is asked without the token, so only the request API and the stream are checked.
+  for (const [setting, urls] of [["prices.restUrl", p.restUrl ? [p.restUrl] : []], ["prices.streamUrls", p.streamUrls ?? []]] as const) {
+    for (const u of urls) {
+      const hermes = hermesEndpointProblem(setting, u);
+      if (hermes) throw new Error(hermes);
+    }
+  }
+  return {
+    streamUrls: p.streamUrls ?? base.streamUrls,
+    restUrl: p.restUrl ?? base.restUrl,
+    symbolsUrl: p.symbolsUrl ?? base.symbolsUrl,
+  };
 }
 
 export interface ResolvedNetwork {
   readonly name: string;
   readonly chainId: number;
   readonly factory: Address;
-  readonly startBlock: number;
+  /**
+   * Where a first start without a subgraph begins reading logs: the factory's deployment block. Null
+   * when neither the config nor an official preset gives it; the keeper then finds it on chain.
+   */
+  readonly startBlock: number | null;
   readonly official: boolean;
   readonly subgraphUrl: string | null;
   readonly sendUrl: string | null;
@@ -398,7 +488,7 @@ export function resolvedNetwork(c: KeeperConfig): ResolvedNetwork {
     name: c.network,
     chainId: (c.chainId ?? preset?.chainId) as number,
     factory,
-    startBlock: c.startBlock ?? preset?.startBlock ?? 0,
+    startBlock: c.startBlock ?? (official && preset ? preset.startBlock : null),
     official,
     subgraphUrl: preset?.subgraphUrl ?? null,
     sendUrl: preset?.sendUrl ?? null,

@@ -8,7 +8,7 @@ import { Chain } from "@liberta-labs/bazaar-sdk";
 import type { Command } from "commander";
 import { parse as parseDotenv } from "dotenv";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { ConfigError, type KeeperConfig, enabledJobs, loadConfig, parseConfig } from "../src/config/index.js";
+import { ConfigError, type KeeperConfig, UNCHECKED_SIGNERS_WARNING, enabledJobs, loadConfig, parseConfig } from "../src/config/index.js";
 import { ActionResult } from "../src/exec/executor.js";
 import { runDoctor } from "../src/cli/doctor.js";
 import {
@@ -177,9 +177,13 @@ describe("argument parsing", () => {
           dryRun: true,
           force: true,
           yes: false,
+          storedPrice: undefined,
+          acceptStoredPrice: false,
         },
       ],
     ]);
+    const ts = await parse(["keeper", "run", "terminate-scheduled", "--market", "BTC/USD", "--stored-price", "never", "--accept-stored-price"]);
+    expect(ts.calls[0]![1]).toMatchObject({ operation: "terminate-scheduled", storedPrice: "never", acceptStoredPrice: true });
     const t = await parse(["keeper", "run", "execute-triggers", "--market", "ETH/USD", "--orders", "1,2, 30"]);
     expect(t.calls[0]![1]).toMatchObject({ operation: "execute-triggers", orders: [1n, 2n, 30n], dryRun: false, force: false });
     const id = "AB".repeat(32);
@@ -252,18 +256,45 @@ describe("argument parsing", () => {
   });
 
   it("mock-prices", async () => {
-    const r = await parse(["mock-prices", "--pyth", BTC, "--price", "0xFF61491A=3000", "--price", "ab12=1.5", "--port", "9000"]);
-    expect(r.calls).toEqual([
-      ["mockPrices", { rpc: "http://127.0.0.1:8545", pyth: BTC, price: { ff61491a: 3000, ab12: 1.5 }, host: "127.0.0.1", port: 9000 }],
-    ]);
-    expect((await parse(["mock-prices", "--pyth", BTC])).calls[0]![1]).toMatchObject({ price: {}, port: 8787 });
-    expect((await parse(["mock-prices"])).code).toBe(2); // --pyth is required
-    expect((await parse(["mock-prices", "--pyth", BTC, "--price", "3000"])).code).toBe(2);
-    expect((await parse(["mock-prices", "--pyth", BTC, "--port", "http"])).code).toBe(2);
+    // A feed is its Pyth Pro number, or the bytes32 that holds it: both land under the number.
+    const r = await parse(["mock-prices", "--price", "2=3000", "--price", `0x${"00".repeat(31)}ab = 1.5`, "--port", "9000"]);
+    expect(r.calls).toEqual([["mockPrices", { rpc: "http://127.0.0.1:8545", price: { "2": 3000, "171": 1.5 }, host: "127.0.0.1", port: 9000 }]]);
+    expect((await parse(["mock-prices"])).calls[0]![1]).toMatchObject({ price: {}, port: 8787 });
+    // No price, no feed, a negative price, an id that is no Pyth Pro feed (a composite's hash, zero, a Pyth Core id).
+    for (const price of ["3000", "=3000", "2=", "2=-1", "2=abc", `0x${"ab".repeat(32)}=1`, "0=1", "ff61491a=3000"]) {
+      const bad = await parse(["mock-prices", "--price", price]);
+      expect(bad.code, price).toBe(2);
+      expect(bad.err, price).toContain("expected FEED_ID=USD with a Pyth Pro feed id");
+    }
+    expect((await parse(["mock-prices", "--port", "http"])).code).toBe(2);
+    expect((await parse(["mock-prices", "--pyth", BTC])).code).toBe(2); // no such option: the mock needs no contract
+    // The token is named by its variable, never given on the command line.
+    expect((await parse(["mock-prices", "--host", "0.0.0.0", "--token-env", "MOCK_PRICES_TOKEN"])).calls[0]![1]).toMatchObject({
+      host: "0.0.0.0",
+      tokenEnv: "MOCK_PRICES_TOKEN",
+    });
+    expect((await parse(["mock-prices", "--token", "made-up-mock-token"])).code).toBe(2);
+  });
+
+  it("mock-prices listens beyond this machine only with a token, read from the environment", async () => {
+    const run = async (argv: string[]) => {
+      const cap = capture();
+      const code = await main(["mock-prices", ...argv], { out: cap.io });
+      return { code, err: cap.errText() };
+    };
+    for (const host of ["0.0.0.0", "::", "192.168.1.10", "mock.localhost"]) {
+      const r = await run(["--host", host]);
+      expect(r.code, host).toBe(2);
+      expect(r.err, host).toContain(`not listening on ${host}: other machines may reach the mock there`);
+    }
+    delete process.env.MADE_UP_MOCK_TOKEN;
+    const unset = await run(["--host", "0.0.0.0", "--token-env", "MADE_UP_MOCK_TOKEN"]);
+    expect(unset.code).toBe(2);
+    expect(unset.err).toContain("--token-env names MADE_UP_MOCK_TOKEN, which is not set or is empty");
   });
 
   it("usage errors exit 2, help exits 0", async () => {
-    for (const argv of [[], ["keeper"], ["bogus"], ["keeper", "bogus"], ["keeper", "status", "--bogus"], ["mock-prices", "-c", "x.yaml", "--pyth", BTC]]) {
+    for (const argv of [[], ["keeper"], ["bogus"], ["keeper", "bogus"], ["keeper", "status", "--bogus"], ["mock-prices", "-c", "x.yaml"]]) {
       const r = await parse(argv);
       expect(r.code, argv.join(" ")).toBe(2);
       expect(r.calls).toEqual([]);
@@ -336,7 +367,7 @@ describe("errors", () => {
 // ---- format ----
 
 describe("format", () => {
-  it("prints numbers the way Python's format specs did", () => {
+  it("prints grouped, fixed-point, dollar and %g numbers", () => {
     expect(formatG(0.5)).toBe("0.5");
     expect(formatG(3000)).toBe("3000");
     expect(formatG(1.25)).toBe("1.25");
@@ -401,6 +432,16 @@ function fakeKeeper(over: Record<string, unknown> = {}) {
       fresh: () => true,
       ethUsd: () => null,
     },
+    pro: {
+      // a stream that brings one ETH/USD print at once
+      stream: async function* () {
+        yield [{}];
+      },
+    },
+    signerChecks: 0,
+    checkSigners: () => {
+      (k.signerChecks as number) += 1;
+    },
     store: { markets: new Map() },
     discoverMarkets: async () => markets,
     updateBlock: async () => {},
@@ -434,6 +475,7 @@ describe("doctor", () => {
       "⚠ Subgraph       none configured: the first start indexes from chain logs",
       "⚠ Prices         1/2 markets have a print",
       "⚠ Prices         no fresh, plausible ETH/USD print: gas is priced at the $3000 fallback (never below gas.ethUsdFloor, $1000)",
+      "✔ Prices         the fixed_rate@200ms stream is delivering",
       `✔ Wallet default ${WALLET}, 0.10000 ETH (roughly 1,666 calls at today's base fee)`,
       "⚠ Jobs           liquidation takes losses: up to $0.1 a call, $2 a day",
       "⚠ Jobs           sweepExpired pays nothing; its daily loss budget is $0.25",
@@ -441,7 +483,79 @@ describe("doctor", () => {
     ]);
     expect(k.closed).toBe(true);
     expect((k.executor as { lens: string }).lens).toBe(ETH);
+    expect(k.signerChecks).toBe(1); // installed once the deployment is read, before any price is
     expect([...(k.store as { markets: Map<string, unknown> }).markets.keys()]).toEqual([BTC, ETH]);
+  });
+
+  it("checks the price stream, and masks the token and the endpoint's key in what it says", async () => {
+    const TOKEN = "made-up-pyth-pro-token-0123456789";
+    const priced = (prices: Record<string, unknown>) =>
+      parseConfig({ network: "anvil", factory: FACTORY, rpc: { http: "http://127.0.0.1:8545" }, prices: { token: TOKEN, ...prices } });
+    const REST = `https://pro.example/${KEY}`;
+    // A stream that fails: a warning that says what the keeper does instead, nothing secret in it.
+    const down = capture();
+    const quiet = fakeKeeper({
+      pro: {
+        stream: async function* () {
+          throw new Error(`price stream unreachable: ${REST}/v1/stream refused Bearer ${TOKEN} (check the stream URLs and the token)`);
+        },
+      },
+    });
+    expect(await runDoctor(priced({ endpoint: "pyth", restUrl: REST, channel: "real_time", pollInterval: 2 }), { Keeper: keeperClass(quiet), out: down.io })).toBe(true);
+    expect(down.out).toContain(
+      "⚠ Prices         the real_time stream is not delivering (price stream unreachable: https://pro.example/***/v1/stream refused Bearer *** " +
+        "(check the stream URLs and the token)): the keeper would poll the request API every 2 s instead",
+    );
+    expect(down.text()).not.toContain(TOKEN);
+    expect(down.text()).not.toContain(KEY);
+    // The request API failing is the failure; the stream is not asked after it.
+    const refused = capture();
+    let streamed = 0;
+    const k = fakeKeeper({
+      prices: {
+        fetch: async () => Promise.reject(new Error(`price endpoint refused the request (HTTP 401) for ${TOKEN}; check the token (prices.token)`)),
+      },
+      pro: {
+        stream: async function* () {
+          streamed += 1;
+        },
+      },
+    });
+    expect(await runDoctor(priced({ endpoint: "pyth" }), { Keeper: keeperClass(k), out: refused.io })).toBe(false);
+    expect(refused.out).toContain("✘ Prices         price endpoint refused the request (HTTP 401) for ***; check the token (prices.token)");
+    expect(streamed).toBe(0);
+    // With prices.stream off the keeper polls by choice: nothing to check.
+    const polling = capture();
+    expect(await runDoctor(priced({ endpoint: "pyth", stream: false }), { Keeper: keeperClass(fakeKeeper({ pro: null })), out: polling.io })).toBe(true);
+    expect(polling.text()).not.toContain("stream");
+  });
+
+  it("masks every configured secret of four characters or more, a header value word by word, wherever a message quotes it", async () => {
+    const conf = parseConfig({
+      network: "anvil",
+      factory: FACTORY,
+      rpc: { http: "http://127.0.0.1:8545" },
+      prices: { endpoint: "pyth", token: "tk42", headers: { Authorization: "Bearer hd55", "x-api-key": "k7y2" } },
+      subgraph: { url: "none", apiKey: "sg77" },
+      alerts: { telegram: { botToken: "bt1234", chatId: "1" } },
+    });
+    const cap = capture();
+    const k = fakeKeeper({ prices: { fetch: async () => Promise.reject(new Error("refused tk42, sg77, bt1234, Bearer hd55, hd55 and k7y2")) } });
+    expect(await runDoctor(conf, { Keeper: keeperClass(k), out: cap.io })).toBe(false);
+    expect(cap.out).toContain("✘ Prices         refused ***, ***, ***, ***, *** and ***");
+    for (const secret of ["tk42", "sg77", "bt1234", "hd55", "k7y2"]) expect(cap.text()).not.toContain(secret);
+  });
+
+  it("warns when prices.checkSigners is off: the gas price's print is then unchecked", async () => {
+    const unchecked = (checkSigners: boolean) =>
+      parseConfig({ network: "anvil", factory: FACTORY, rpc: { http: "http://127.0.0.1:8545" }, prices: { endpoint: "pyth", checkSigners } });
+    const off = capture();
+    expect(await runDoctor(unchecked(false), { Keeper: keeperClass(fakeKeeper()), out: off.io })).toBe(true);
+    expect(off.out).toContain(`⚠ Prices         ${UNCHECKED_SIGNERS_WARNING}`);
+    expect(UNCHECKED_SIGNERS_WARNING).toMatch(/^prices\.checkSigners is off: .*the ETH\/USD print that prices gas reaches no contract/);
+    const on = capture();
+    expect(await runDoctor(unchecked(true), { Keeper: keeperClass(fakeKeeper()), out: on.io })).toBe(true);
+    expect(on.text()).not.toContain("checkSigners");
   });
 
   it("fails on wiring, a low balance, a broken subgraph or an unknown market", async () => {
@@ -623,7 +737,7 @@ describe("status and earnings", () => {
   it.skipIf(!existsSync(new URL("../src/keeper/engine.ts", import.meta.url)))("finds the status file with the real engine", async () => {
     const dir = tempDir();
     const cfgPath = writeConfig(dir);
-    const stateDir = join(dir, "keeper", "31337-5fbdb231"); // chainId-factory[2:10], as the Python keeper named it
+    const stateDir = join(dir, "keeper", "31337-5fbdb231"); // chainId-factory[2:10]
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(join(stateDir, "status.json"), JSON.stringify(status()), "utf8");
     const cap = capture();
@@ -631,7 +745,7 @@ describe("status and earnings", () => {
     expect(cap.out[0]).toBe("Bazaar keeper · anvil · block 12,345 · indexed 12,340 · prices live · running");
   });
 
-  describe("earnings from a ledger the Python keeper wrote", () => {
+  describe("earnings from a snake_case ledger", () => {
     const dir = tempDir();
     const cfgPath = writeConfig(dir);
     const stateDir = join(dir, "state");
@@ -831,25 +945,54 @@ describe("commands against the keeper", () => {
     const result = (init: ConstructorParameters<typeof ActionResult>[0], set: Partial<ActionResult> = {}) =>
       Object.assign(new ActionResult(init), set);
 
-    function keeperWithOps() {
+    const CALL = { to: BTC, data: "0x5c3a" as const, value: 7n };
+    /** A planned scheduled termination, as Operations.planScheduledTermination returns one. */
+    const plannedUnder = (under: "chain" | "storedPrice") => ({
+      market: { address: ETH, label: "BTC/USD" },
+      plan: { under, settlementPrice: (under === "chain" ? 2150n : 2000n) * 10n ** 18n, call: CALL },
+      call: CALL,
+      summary:
+        under === "chain"
+          ? "terminate BTC/USD at its cutoff under the chain rule (the median of five chained prices), settling at 2150"
+          : "terminate BTC/USD at its cutoff at its stored price, 2000 (the last resort is open)",
+      storedPriceTs: under === "chain" ? null : 1_700_000_000,
+      notes: [],
+    });
+
+    function keeperWithOps(under: "chain" | "storedPrice" | "none" = "chain") {
       const calls: unknown[] = [];
-      const preview = result(
-        { status: "simulated", job: "terminateScheduledPair", market: "BTC/USD", summary: "terminate BTC/USD at its cutoff" },
-        { wouldSend: true, costUsd: 0.02 },
-      );
-      const sent = result(
-        { status: "confirmed", job: "terminateScheduledPair", market: "BTC/USD", summary: "terminate BTC/USD at its cutoff" },
+      const stalePreview = result({ status: "simulated", job: "terminateStalePair", market: "BTC/USD", summary: "end BTC/USD (dead oracle)" }, { wouldSend: true, costUsd: 0.02 });
+      const staleSent = result(
+        { status: "confirmed", job: "terminateStalePair", market: "BTC/USD", summary: "end BTC/USD (dead oracle)" },
         { costUsd: 0.021, txHash: `0x${"12".repeat(32)}` },
       );
+      const planned = under === "none" ? null : plannedUnder(under);
+      const scheduled = (status: "simulated" | "confirmed") =>
+        result(
+          { status, job: "terminateScheduledPair", market: "BTC/USD", summary: planned?.summary ?? "", reason: under === "storedPrice" ? "this settles the market irreversibly at its stored price, 2000, stored 22 d 0 h ago (2023-11-14 22:13:20 UTC): no Pyth update proves it" : "" },
+          status === "simulated" ? { wouldSend: true, costUsd: 0.03 } : { costUsd: 0.031, txHash: `0x${"34".repeat(32)}` },
+        );
       const k = {
         run: {
           liquidate: async (...args: unknown[]) => {
             calls.push(["liquidate", ...args]);
             return [result({ status: "skipped", job: "liquidation", market: "BTC/USD", summary: "liquidation", reason: "no position is below its maintenance margin" })];
           },
-          terminateScheduledPair: async (market: string, opts: { dryRun: boolean }) => {
-            calls.push(["terminateScheduledPair", market, opts]);
-            return opts.dryRun ? preview : sent;
+          terminateStalePair: async (market: string, opts: { dryRun: boolean }) => {
+            calls.push(["terminateStalePair", market, opts]);
+            return opts.dryRun ? stalePreview : staleSent;
+          },
+          planScheduledTermination: async (market: string, opts: unknown) => {
+            calls.push(["planScheduledTermination", market, opts]);
+            return planned ?? result({ status: "skipped", job: "terminateScheduledPair", market: "BTC/USD", summary: "terminate BTC/USD at its cutoff", reason: "no settlement updates are available yet" });
+          },
+          sendScheduledTermination: async (p: { summary: string }, opts: { dryRun?: boolean }) => {
+            calls.push(["sendScheduledTermination", p.summary, opts]);
+            return scheduled(opts.dryRun ? "simulated" : "confirmed");
+          },
+          terminateScheduledPair: async (market: string, opts: { expect?: unknown }) => {
+            calls.push(["terminateScheduledPair", market, { ...opts, expect: opts.expect === planned ? "the previewed plan" : opts.expect }]);
+            return scheduled("confirmed");
           },
           factory: {
             activateIdentifierUpgrade: async (opts: unknown) => {
@@ -863,8 +1006,8 @@ describe("commands against the keeper", () => {
       return { k, calls };
     }
 
-    const run = async (argv: string[], opts: MainOptions = {}) => {
-      const { k, calls } = keeperWithOps();
+    const run = async (argv: string[], opts: MainOptions = {}, under: "chain" | "storedPrice" | "none" = "chain") => {
+      const { k, calls } = keeperWithOps(under);
       const cap = capture();
       const code = await main(["keeper", "run", ...argv, "-c", cfgPath], {
         out: cap.io,
@@ -872,8 +1015,17 @@ describe("commands against the keeper", () => {
         engine: engine({ Keeper: { create: async () => k } }),
         ...opts,
       });
-      return { code, calls, out: cap.out };
+      return { code, calls, out: cap.out, err: cap.err };
     };
+
+    const prompts = (asked: string[], answer: boolean | Error) =>
+      ({
+        confirm: async (q: { message: string }) => {
+          asked.push(q.message);
+          if (answer instanceof Error) throw answer;
+          return answer;
+        },
+      }) as unknown as Prompts;
 
     it("an automatic job runs once and shows its results", async () => {
       const r = await run(["liquidate", "--market", "BTC/USD", "--accounts", WALLET, "--force"]);
@@ -885,10 +1037,10 @@ describe("commands against the keeper", () => {
     });
 
     it("a manual operation is shown, and not sent without a terminal or --yes", async () => {
-      const r = await run(["terminate-scheduled", "--market", "BTC/USD"]);
-      expect(r.calls).toEqual([["terminateScheduledPair", "BTC/USD", { dryRun: true }], "close"]);
+      const r = await run(["terminate-stale", "--market", "BTC/USD"]);
+      expect(r.calls).toEqual([["terminateStalePair", "BTC/USD", { dryRun: true }], "close"]);
       expect(r.out).toEqual([
-        "simulated  terminateScheduledPair  BTC/USD  terminate BTC/USD at its cutoff",
+        "simulated  terminateStalePair  BTC/USD  end BTC/USD (dead oracle)",
         "   would earn $0.0000 for about $0.0200 of gas",
         "Not sent: pass --yes to send without confirming.",
       ]);
@@ -896,38 +1048,30 @@ describe("commands against the keeper", () => {
 
     it("a manual operation is sent after a yes, or at once with --yes", async () => {
       const asked: string[] = [];
-      const prompts = (answer: boolean | Error) =>
-        ({
-          confirm: async (q: { message: string }) => {
-            asked.push(q.message);
-            if (answer instanceof Error) throw answer;
-            return answer;
-          },
-        }) as unknown as Prompts;
-      const no = await run(["terminate-scheduled", "--market", "BTC/USD"], { isTTY: true, prompts: prompts(false) });
-      expect(no.calls).toEqual([["terminateScheduledPair", "BTC/USD", { dryRun: true }], "close"]);
-      const ctrlC = await run(["terminate-scheduled", "--market", "BTC/USD"], {
+      const no = await run(["terminate-stale", "--market", "BTC/USD"], { isTTY: true, prompts: prompts(asked, false) });
+      expect(no.calls).toEqual([["terminateStalePair", "BTC/USD", { dryRun: true }], "close"]);
+      const ctrlC = await run(["terminate-stale", "--market", "BTC/USD"], {
         isTTY: true,
-        prompts: prompts(Object.assign(new Error("closed"), { name: "ExitPromptError" })),
+        prompts: prompts(asked, Object.assign(new Error("closed"), { name: "ExitPromptError" })),
       });
       expect(ctrlC.code).toBe(0);
       expect(ctrlC.calls).toHaveLength(2);
-      const yes = await run(["terminate-scheduled", "--market", "BTC/USD"], { isTTY: true, prompts: prompts(true) });
+      const yes = await run(["terminate-stale", "--market", "BTC/USD"], { isTTY: true, prompts: prompts(asked, true) });
       expect(asked).toEqual(["Send it?", "Send it?", "Send it?"]);
       expect(yes.calls).toEqual([
-        ["terminateScheduledPair", "BTC/USD", { dryRun: true }],
-        ["terminateScheduledPair", "BTC/USD", { dryRun: false }],
+        ["terminateStalePair", "BTC/USD", { dryRun: true }],
+        ["terminateStalePair", "BTC/USD", { dryRun: false }],
         "close",
       ]);
       expect(yes.out.slice(-3)).toEqual([
-        "confirmed  terminateScheduledPair  BTC/USD  terminate BTC/USD at its cutoff",
+        "confirmed  terminateStalePair  BTC/USD  end BTC/USD (dead oracle)",
         "   earned $0.0000, gas $0.0210",
         `   tx 0x${"12".repeat(32)}`,
       ]);
-      const flag = await run(["terminate-scheduled", "--market", "BTC/USD", "--yes"]);
+      const flag = await run(["terminate-stale", "--market", "BTC/USD", "--yes"]);
       expect(flag.calls).toHaveLength(3);
-      expect(flag.out[0]).toBe("confirmed  terminateScheduledPair  BTC/USD  terminate BTC/USD at its cutoff"); // no preview
-      const dry = await run(["terminate-scheduled", "--market", "BTC/USD", "--dry-run", "--yes"]);
+      expect(flag.out[0]).toBe("confirmed  terminateStalePair  BTC/USD  end BTC/USD (dead oracle)"); // no preview
+      const dry = await run(["terminate-stale", "--market", "BTC/USD", "--dry-run", "--yes"]);
       expect(dry.calls).toHaveLength(2);
     });
 
@@ -936,9 +1080,73 @@ describe("commands against the keeper", () => {
       expect(r.calls).toEqual([["activateIdentifierUpgrade", { dryRun: true }], "close"]);
       expect(r.out).toEqual(["skipped  activateIdentifierUpgrade    activate", "   nothing queued"]);
     });
+
+    it("terminate-scheduled sends the very settlement it showed, after a yes that says it is irreversible", async () => {
+      const asked: string[] = [];
+      const r = await run(["terminate-scheduled", "--market", "BTC/USD"], { isTTY: true, prompts: prompts(asked, true) });
+      expect(r.code).toBe(0);
+      // Planned once, the call shown simulated, then sent only if the plan made at sending is that one.
+      expect(r.calls).toEqual([
+        ["planScheduledTermination", "BTC/USD", { storedPrice: undefined }],
+        ["sendScheduledTermination", plannedUnder("chain").summary, { dryRun: true }],
+        ["terminateScheduledPair", "BTC/USD", { storedPrice: undefined, acceptStoredPrice: false, expect: "the previewed plan" }],
+        "close",
+      ]);
+      expect(asked).toEqual(["Send it? It fixes the settlement price for good, at the price shown."]);
+      expect(r.out[0]).toBe(`simulated  terminateScheduledPair  BTC/USD  ${plannedUnder("chain").summary}`);
+      expect(r.out.slice(-3)).toEqual([
+        `confirmed  terminateScheduledPair  BTC/USD  ${plannedUnder("chain").summary}`,
+        "   earned $0.0000, gas $0.0310",
+        `   tx 0x${"34".repeat(32)}`,
+      ]);
+      // --yes skips the question, never the preview; --dry-run stops after it.
+      const yes = await run(["terminate-scheduled", "--market", "BTC/USD", "--yes"]);
+      expect(yes.calls.map((c) => (Array.isArray(c) ? c[0] : c))).toEqual(["planScheduledTermination", "sendScheduledTermination", "terminateScheduledPair", "close"]);
+      expect(yes.out[0]).toMatch(/^simulated/);
+      const dry = await run(["terminate-scheduled", "--market", "BTC/USD", "--dry-run", "--yes"]);
+      expect(dry.calls).toHaveLength(3);
+      // Nothing to send: the reason, and nothing asked.
+      const none = await run(["terminate-scheduled", "--market", "BTC/USD", "--yes"], {}, "none");
+      expect(none.calls).toEqual([["planScheduledTermination", "BTC/USD", { storedPrice: undefined }], "close"]);
+      expect(none.out).toEqual(["skipped  terminateScheduledPair  BTC/USD  terminate BTC/USD at its cutoff", "   no settlement updates are available yet"]);
+    });
+
+    it("terminate-scheduled sends a settlement at the stored price only with --accept-stored-price, even with --yes", async () => {
+      const refused = await run(["terminate-scheduled", "--market", "BTC/USD", "--stored-price", "always", "--yes"], {}, "storedPrice");
+      expect(refused.calls).toEqual([
+        ["planScheduledTermination", "BTC/USD", { storedPrice: "always" }],
+        ["sendScheduledTermination", plannedUnder("storedPrice").summary, { dryRun: true }],
+        "close",
+      ]);
+      expect(refused.out).toEqual([
+        `simulated  terminateScheduledPair  BTC/USD  ${plannedUnder("storedPrice").summary}`,
+        "   this settles the market irreversibly at its stored price, 2000, stored 22 d 0 h ago (2023-11-14 22:13:20 UTC): no Pyth update proves it",
+        "   would earn $0.0000 for about $0.0300 of gas",
+        "Not sent: this settles the market at its stored price, which no Pyth update proves. Pass --accept-stored-price to send it.",
+      ]);
+      const asked: string[] = [];
+      const accepted = await run(["terminate-scheduled", "--market", "BTC/USD", "--accept-stored-price"], { isTTY: true, prompts: prompts(asked, true) }, "storedPrice");
+      expect(asked).toEqual(["Send it? It fixes the settlement price for good, at the market's stored price, which no Pyth update proves."]);
+      expect(accepted.calls[2]).toEqual(["terminateScheduledPair", "BTC/USD", { storedPrice: undefined, acceptStoredPrice: true, expect: "the previewed plan" }]);
+    });
+
+    it("refuses the stored-price flags on any other operation, and a policy it does not know", async () => {
+      for (const argv of [
+        ["terminate-stale", "--market", "BTC/USD", "--accept-stored-price"],
+        ["finalize", "--market", "BTC/USD", "--stored-price", "always"],
+      ]) {
+        const r = await run(argv);
+        expect(r.code, argv.join(" ")).toBe(2);
+        expect(r.calls).toEqual([]);
+        expect(r.err.join("\n")).toContain("--stored-price and --accept-stored-price apply to terminate-scheduled only");
+      }
+      const bad = await run(["terminate-scheduled", "--market", "BTC/USD", "--stored-price", "sometimes"]);
+      expect(bad.code).toBe(2);
+      expect(bad.err.join("\n")).toMatch(/Allowed choices are whenAbsent, always, never/);
+    });
   });
 
-  it("renders results the way the Python CLI did", () => {
+  it("renders action results", () => {
     const cap = capture();
     const r = Object.assign(new ActionResult({ status: "confirmed", job: "collect", market: "", summary: "collect 2 market(s)" }), {
       costUsd: 0.01,
@@ -1089,7 +1297,7 @@ function scripted(steps: readonly Step[]) {
   return { prompts, done: () => i === steps.length, at: () => i };
 }
 
-const ENV_NAMES = ["RPC_HTTP_URL", "SUBGRAPH_URL", "PYTH_API_KEY", "PRICE_ENDPOINT_URL", "PRICE_API_KEY", "KEEPER_KEYSTORE_PASSWORD", "OTHER"];
+const ENV_NAMES = ["RPC_HTTP_URL", "SUBGRAPH_URL", "PYTH_PRO_TOKEN", "PRICE_ENDPOINT_URL", "PRICE_TOKEN", "KEEPER_KEYSTORE_PASSWORD", "OTHER"];
 function clearEnv(): void {
   for (const n of ENV_NAMES) delete process.env[n];
 }
@@ -1098,7 +1306,7 @@ describe("wizard", () => {
   const RPC = `https://arb-sepolia.g.alchemy.com/v2/${KEY}`;
   const BAD_RPC = `https://bad.example/v2/${KEY}`;
   const SG = `https://gateway.thegraph.com/api/${KEY}/subgraphs/id/Qm123`;
-  const PYTH_KEY = "pyth-key-0123456789abcdef";
+  const PYTH_TOKEN = "made-up-pyth-pro-token-0123456789";
   const PW = "correct horse#battery $1";
   const FORWARD = "0x90f79bf6eb2c4f870365e785982e1f101e93b906";
   /** BTC/USD relisted after a termination: a second market with the same label */
@@ -1157,7 +1365,7 @@ describe("wizard", () => {
       ["select", "Subgraph", "custom"],
       ["input", "Subgraph GraphQL URL", SG],
       ["select", "Price endpoint", "pyth"],
-      ["password", "Pyth API key", PYTH_KEY],
+      ["password", "Pyth Pro access token", ` ${PYTH_TOKEN}\n`], // pasted with blanks around it
       ["select", "Keeper wallet", "new"],
       ["password", "Choose a keystore password", "first"],
       ["password", "Repeat it", "second"],
@@ -1214,7 +1422,7 @@ describe("wizard", () => {
         "",
         "prices:",
         "  endpoint: pyth",
-        "  apiKey: ${PYTH_API_KEY}",
+        "  token: ${PYTH_PRO_TOKEN}",
         "",
         "wallets:",
         "  default:",
@@ -1244,11 +1452,11 @@ describe("wizard", () => {
         "",
       ].join("\n"),
     );
-    for (const secret of [KEY, PYTH_KEY, PW, "correct horse"]) expect(yaml).not.toContain(secret);
+    for (const secret of [KEY, PYTH_TOKEN, PW, "correct horse"]) expect(yaml).not.toContain(secret);
 
     const envText = readFileSync(envPath, "utf8");
-    expect(envText).toBe(`OTHER=1\nRPC_HTTP_URL=${RPC}\nSUBGRAPH_URL=${SG}\nPYTH_API_KEY=${PYTH_KEY}\nKEEPER_KEYSTORE_PASSWORD='${PW}'\n`);
-    expect(parseDotenv(envText)).toEqual({ OTHER: "1", RPC_HTTP_URL: RPC, SUBGRAPH_URL: SG, PYTH_API_KEY: PYTH_KEY, KEEPER_KEYSTORE_PASSWORD: PW });
+    expect(envText).toBe(`OTHER=1\nRPC_HTTP_URL=${RPC}\nSUBGRAPH_URL=${SG}\nPYTH_PRO_TOKEN=${PYTH_TOKEN}\nKEEPER_KEYSTORE_PASSWORD='${PW}'\n`);
+    expect(parseDotenv(envText)).toEqual({ OTHER: "1", RPC_HTTP_URL: RPC, SUBGRAPH_URL: SG, PYTH_PRO_TOKEN: PYTH_TOKEN, KEEPER_KEYSTORE_PASSWORD: PW });
     if (process.platform !== "win32") expect(statSync(envPath).mode & 0o777).toBe(0o600);
 
     // What the wizard printed: each check, no key.
@@ -1262,8 +1470,8 @@ describe("wizard", () => {
       `✔ wrote ${cfgPath} and ${envPath} (secrets only in .env)`,
       "Next: bazaar keeper doctor, then bazaar keeper start",
     ]);
-    // The market listing got the real URL and key, in memory only.
-    expect(listed[0]).toMatchObject({ network: "anvil", factory: FACTORY, rpc: { http: RPC }, prices: { apiKey: PYTH_KEY }, subgraph: { url: "none" } });
+    // The market listing got the real URL and token, in memory only.
+    expect(listed[0]).toMatchObject({ network: "anvil", factory: FACTORY, rpc: { http: RPC }, prices: { endpoint: "pyth", token: PYTH_TOKEN }, subgraph: { url: "none" } });
 
     // The keeper loads what was written, with the secrets filled from .env.
     clearEnv();
@@ -1271,7 +1479,7 @@ describe("wizard", () => {
       const cfg = loadConfig(cfgPath);
       expect(cfg.rpc.http).toBe(RPC);
       expect(cfg.subgraph.url).toBe(SG);
-      expect(cfg.prices).toMatchObject({ endpoint: "pyth", apiKey: PYTH_KEY });
+      expect(cfg.prices).toMatchObject({ endpoint: "pyth", token: PYTH_TOKEN });
       expect(cfg.wallets.default).toMatchObject({ type: "keystore", path: ksPath, password: PW });
       expect(cfg.jobs.liquidation).toMatchObject({ markets: [BTC, RELISTED], allowLoss: true, maxLossUsdPerCall: 0.1, lossBudgetUsdPerDay: 1 });
       expect(cfg.jobs.triggers?.markets).toEqual([BTC, RELISTED]);
@@ -1288,7 +1496,7 @@ describe("wizard", () => {
     writeFileSync(cfgPath, "old", "utf8");
     const ks = join(dir, "my keystore.json");
     writeFileSync(ks, "{}", "utf8");
-    const PRICE_URL = `https://hermes.example/${KEY}/v2`;
+    const PRICE_URL = `https://pro.example/${KEY}/v1`;
     const s = scripted([
       ["confirm", `${cfgPath} exists. Replace it?`, true],
       ["select", "Network", "arbitrum-one"],
@@ -1298,8 +1506,8 @@ describe("wizard", () => {
       ["select", "Subgraph", "none"],
       ["select", "Price endpoint", "custom"],
       ["input", "Price endpoint URL", PRICE_URL],
-      ["confirm", "Does it need an API key?", true],
-      ["password", "API key", "price-key-123"],
+      ["confirm", "Does it need an access token?", true],
+      ["password", "Access token", "made-up-price-token"],
       ["select", "Keeper wallet", "keystore"],
       ["input", "Keystore file", ks],
       ["confirm", "Store the keystore password in .env", false],
@@ -1329,7 +1537,7 @@ describe("wizard", () => {
         "",
         "prices:",
         "  endpoint: ${PRICE_ENDPOINT_URL}",
-        "  apiKey: ${PRICE_API_KEY}",
+        "  token: ${PRICE_TOKEN}",
         "",
         "wallets:",
         "  default:",
@@ -1346,19 +1554,36 @@ describe("wizard", () => {
       ].join("\n"),
     );
     expect(readFileSync(join(dir, ".env"), "utf8")).toBe(
-      `RPC_HTTP_URL=https://arb1.example/rpc\nPRICE_ENDPOINT_URL=${PRICE_URL}\nPRICE_API_KEY=price-key-123\n`,
+      `RPC_HTTP_URL=https://arb1.example/rpc\nPRICE_ENDPOINT_URL=${PRICE_URL}\nPRICE_TOKEN=made-up-price-token\n`,
     );
-    expect(cap.out).toContain("⚠ could not read a print yet: price endpoint unreachable: https://hermes.example/***/v2");
+    expect(cap.out).toContain("⚠ could not read a print yet: price endpoint unreachable: https://pro.example/***/v1");
     expect(cap.text()).not.toContain(KEY);
     clearEnv();
     try {
       const cfg = loadConfig(cfgPath);
-      expect(cfg.prices).toMatchObject({ endpoint: PRICE_URL, apiKey: "price-key-123" });
+      expect(cfg.prices).toMatchObject({ endpoint: PRICE_URL, token: "made-up-price-token" });
       expect(cfg.rpc.send).toBe("sequencer");
       expect(Object.keys(enabledJobs(cfg.jobs))).toEqual([]);
     } finally {
       clearEnv();
     }
+  });
+
+  it("refuses a Hermes URL as the price endpoint: the Pyth Pro token would go there", async () => {
+    const dir = tempDir();
+    const s = scripted([
+      ["select", "Network", "anvil"],
+      ["input", "Factory address", FACTORY],
+      ["input", "RPC URL", "http://127.0.0.1:8545"],
+      ["select", "Subgraph", "none"],
+      ["select", "Price endpoint", "custom"],
+      ["input", "Price endpoint URL", "https://hermes.example/v2"],
+    ]);
+    const { d } = deps({ prompts: s.prompts });
+    await expect(runWizard(join(dir, "bazaar-keeper.yaml"), d)).rejects.toThrow(
+      /fails the validation of "Price endpoint URL": prices\.endpoint names a Hermes \(Pyth Core\) service/,
+    );
+    expect(s.done()).toBe(true);
   });
 
   it("a custom network; jobs keep running on all markets when they cannot be listed", async () => {
@@ -1373,7 +1598,7 @@ describe("wizard", () => {
       ["select", "Subgraph", "none"],
       ["select", "Price endpoint", "custom"],
       ["input", "Price endpoint URL", "http://127.0.0.1:8787"],
-      ["confirm", "Does it need an API key?", false],
+      ["confirm", "Does it need an access token?", false],
       ["select", "Keeper wallet", "none"],
       ["checkbox", "Jobs to run automatically", ["adl", "sweepExpired"]],
       ["confirm", "Should any job also send calls", false],
@@ -1408,7 +1633,7 @@ describe("wizard", () => {
       ["select", "Subgraph", "none"],
       ["select", "Price endpoint", "custom"],
       ["input", "Price endpoint URL", "http://127.0.0.1:8787"],
-      ["confirm", "Does it need an API key?", false],
+      ["confirm", "Does it need an access token?", false],
       ["select", "Keeper wallet", "new"],
       ["password", "Choose a keystore password", PW],
       ["password", "Repeat it", PW],

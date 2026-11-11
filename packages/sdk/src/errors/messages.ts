@@ -3,13 +3,15 @@
  * what happened and what to do, with the error's arguments formatted (BAZAAR-precision amounts as
  * dollars, prices with their decimals, basis points as percent, times as dates with a relative hint).
  *
+ * {@link REASON_MESSAGES} does the same for the plain reason strings Pyth's verifier reverts with.
+ *
  * Importing this module registers them with chain/errors.ts, so `DecodedError.message` returns them;
  * {@link installUserMessages} does the same explicitly (bundlers may drop a module imported only for
  * its side effect). {@link walletErrorMessage} explains failures the wallet raises before anything
  * reaches the chain, and {@link errorMessage} picks the right text for any error a call can throw.
  */
 
-import { DecodedError, decodeError, registerUserMessages } from "../chain/errors.js";
+import { DecodedError, decodeError, registerReasonMessages, registerUserMessages } from "../chain/errors.js";
 import { toRpcError } from "../chain/rpc.js";
 import { BAZAAR_SCALE } from "../constants.js";
 import { formatDecimal } from "../client/units.js";
@@ -89,6 +91,19 @@ export function formatTime(v: unknown, now: number = Date.now() / 1000): string 
   const delta = t - now;
   const rel = Math.abs(delta) < 1 ? "now" : delta > 0 ? `in ${formatDuration(delta)}` : `${formatDuration(delta)} ago`;
   return `${abs} (${rel})`;
+}
+
+/**
+ * A Unix time (seconds) as "2026-11-08 14:00:05 UTC", with no hint relative to this machine's clock:
+ * for a time judged against the chain's clock, which the decoder does not know and which may differ.
+ */
+export function formatUtc(v: unknown): string {
+  const t = Number(big(v));
+  if (!Number.isFinite(t) || t <= 0) return "an unknown time";
+  const d = new Date(t * 1000);
+  if (Number.isNaN(d.getTime())) return "an unknown time";
+  const iso = d.toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 19)} UTC`;
 }
 
 const usd = formatUsd;
@@ -296,7 +311,8 @@ export const USER_MESSAGES: Readonly<Record<string, Message>> = {
   Factory__CompositePairMustBeNonContinuous: "A market priced through an FX leg cannot trade 24/7. List it as a market with trading hours.",
   Factory__DeploymentNotExpired: (a) => `This listing proposal can be released ${when(a.expiryTs)}.`,
   Factory__DescriptionInvalid: "The description must be 1 to 200 characters: letters, digits, spaces and . , & / - only.",
-  Factory__FeedNotOnPyth: "Pyth has no price feed with that id. Check the feed id.",
+  Factory__InvalidFeedId:
+    "That is not a Pyth Pro feed ID (a number such as 1) or a composite feed registered on Bazaar's oracle. Check the feed ID, or register the composite first.",
   Factory__IdentifierNotAssertTruth: "That UMA identifier cannot be used: Bazaar needs an ASSERT_TRUTH-style identifier.",
   Factory__IdentifierNotWhitelisted:
     "UMA does not currently accept that identifier. New listings are paused until an identifier upgrade moves Bazaar to one UMA accepts.",
@@ -373,26 +389,51 @@ export const USER_MESSAGES: Readonly<Record<string, Message>> = {
     const bp = p > 0n ? (big(a.confidence) * 10_000n) / p : 0n;
     return `Pyth's price is too uncertain right now (±${pct(bp)}; the limit is 2%). Try again in a moment.`;
   },
-  BazaarOracle__InvalidCompositeLegs: "Those two feeds cannot be combined into a composite price.",
+  BazaarOracle__FeeMismatch: (a) => `The ETH sent to verify the price (${formatEth(a.supplied)}) must equal Pyth's fee (${formatEth(a.required)}). Rebuild the transaction with the current fee.`,
+  BazaarOracle__FeedNotInUpdate: "The price update does not carry this market's price feed. Rebuild the transaction with a price update for this market.",
+  BazaarOracle__IncompleteFeed:
+    "The price update is missing part of this market's price (its price, exponent, confidence or the time it was generated). Rebuild the transaction with a current price update.",
+  BazaarOracle__InvalidCompositeLegs: "Those two feeds cannot be combined into a composite price: both must be Pyth Pro feed IDs, and different ones.",
+  BazaarOracle__InvalidFeedId: "That is not a Pyth Pro feed ID or a registered composite feed.",
   BazaarOracle__InvalidPrice: "Pyth reported an invalid price for this feed. Try again shortly.",
   BazaarOracle__SampleCountMismatch: (a) => `The settlement needs ${big(a.expected)} price updates; ${big(a.updates)} were given.`,
-  BazaarOracle__SampleFeeMismatch: (a) => `The ETH sent (${formatEth(a.supplied)}) must equal the Pyth fee (${formatEth(a.required)}).`,
+  BazaarOracle__SampleNotProven: (a) =>
+    `The settlement price updates do not prove the price for ${when(a.target)}: the update for ${when(a.tick)} is out of place. Rebuild the settlement from the market's closing time.`,
+  BazaarOracle__SampleTooLate: (a) =>
+    `A settlement price update is for ${when(a.tick)}, after the latest time this settlement accepts (${when(a.maxPublishTime)}).`,
+  BazaarOracle__StalePrice: (a) =>
+    `The price in this transaction was generated at ${formatUtc(a.generatedTs)}, more than 3 seconds from the block's time when it ran. Rebuild the transaction and send it right away; a closed market has no fresh price until it reopens.`,
+  BazaarOracle__WrongTick: "A settlement price update is not Pyth's one-second update for the required second.",
   BazaarOracle__ZeroAddress: ZERO_ADDRESS,
+  LazerPayloadLib__Malformed: "The price update could not be read. Rebuild the transaction with a current price update.",
+};
+
+/**
+ * User-facing messages for the plain reason strings Pyth's verifier reverts with, by the string
+ * (chain/errors.ts VERIFIER_REASON_HINTS says what each means for an operator).
+ */
+export const REASON_MESSAGES: Readonly<Record<string, string>> = {
+  "invalid signer": "The price update was signed by a key Pyth no longer accepts. Rebuild the transaction with a current price update.",
+  "invalid signature": "The price update's signature is not valid. Rebuild the transaction with a current price update.",
+  "Insufficient fee provided": "Not enough ETH was sent to verify the price update. Rebuild the transaction so it carries the current fee.",
+  "input too short": "The price update is incomplete. Rebuild the transaction with a current price update.",
+  "invalid evm magic": "The price update is not in the format this network verifies. Rebuild the transaction with a current price update.",
 };
 
 let installed = false;
 
-/** Register {@link USER_MESSAGES} so `DecodedError.message` returns them. Idempotent. */
+/** Register {@link USER_MESSAGES} and {@link REASON_MESSAGES} so `DecodedError.message` returns them. Idempotent. */
 export function installUserMessages(): void {
   if (installed) return;
   registerUserMessages(USER_MESSAGES);
+  registerReasonMessages(REASON_MESSAGES);
   installed = true;
 }
 installUserMessages();
 
 /** The user-facing message for a custom error by name, with its arguments; the name itself when unknown. */
 export function userMessage(name: string, args: Args = {}): string {
-  const m = USER_MESSAGES[name];
+  const m = Object.hasOwn(USER_MESSAGES, name) ? USER_MESSAGES[name] : undefined;
   if (m === undefined) return name;
   try {
     return typeof m === "string" ? m : m(args);
@@ -418,6 +459,7 @@ const WALLET_CODES: Readonly<Record<number, string>> = {
 const INSUFFICIENT_GAS = "Your wallet does not have enough ETH for gas (plus any ETH the call sends). Add ETH on this network and try again.";
 const NONCE = "Your wallet's transaction count is out of date: another transaction already used it. Wait for pending transactions to confirm (or reset the account in your wallet) and try again.";
 const CHAIN = "Your wallet is on a different network than this app. Switch networks in your wallet and try again.";
+const NO_FRESH_PRICE = "No fresh price is available for this market right now, and this action needs one. Try again in a moment.";
 
 /**
  * A message for a failure the wallet raised rather than the contract: the EIP-1193 provider errors
@@ -451,14 +493,16 @@ export function walletErrorMessage(e: unknown): string | null {
 
 /**
  * The text to show a user for any error a Bazaar call can throw: a wallet-side failure, a decoded
- * revert (from a `CallError`, a simulation's `DecodedError`, or revert data inside an RPC error), or an
- * input the SDK refused before building. Falls back to a generic sentence, never a raw URL.
+ * revert (from a `CallError`, a simulation's `DecodedError`, or revert data inside an RPC error), an
+ * input the SDK refused before building, or a market with no fresh price for a call that needs one
+ * (feeds.ts `NoFreshPriceError`). Falls back to a generic sentence, never a raw URL.
  */
 export function errorMessage(e: unknown): string {
   if (e instanceof DecodedError) return e.message;
   if (e && typeof e === "object") {
     const o = e as { name?: unknown; message?: unknown; decoded?: unknown };
     if (o.name === "InputError" && typeof o.message === "string") return o.message;
+    if (o.name === "NoFreshPriceError") return NO_FRESH_PRICE;
     if (o.decoded instanceof DecodedError) return o.decoded.message;
   }
   const wallet = walletErrorMessage(e);
