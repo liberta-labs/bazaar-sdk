@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import { JsonRpc, redactUrl, redactUrls, urlCredential, urlSecrets } from "../src/index.js";
 
 // Made-up keys in each provider's shape.
-const ALCHEMY = "https://arb-mainnet.g.alchemy.com/v2/pz2BQ3JpUyM2t-2nXpbt3aTvP8vTtM-a";
-const INFURA = "https://arbitrum-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
+const ALCHEMY = "https://arb-mainnet.g.alchemy.com/v2/fakeAlchemyKey-0123456789abcdefg";
+const INFURA = "https://arbitrum-mainnet.infura.io/v3/0123456789abcdef0123456789abcdef";
 const QUICKNODE = "https://solitary-few-shard.arbitrum-mainnet.quiknode.pro/7f6e5d4c3b2a19087f6e5d4c3b2a190871ab2cd3/";
 const GRAPH =
   "https://gateway.thegraph.com/api/0123abcd4567ef890123abcd4567ef89/subgraphs/id/5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV";
-const DRPC = "https://lb.drpc.org/ogrpc?network=arbitrum&dkey=Ak80gSCleU1Frwnafb5Ka4V3cFQ9C-oR8Kg9gkl9-Mvm";
+const DRPC = "https://lb.drpc.org/ogrpc?network=arbitrum&dkey=fakeDrpcKey-0123456789abcdefghijklmnopqrstuv";
 const USERINFO = "https://keeper:hunter2@rpc.example.com";
 const TOKEN_PARAM = "wss://rpc.example.com/ws?token=abc";
 
@@ -51,7 +51,7 @@ describe("credentials in URLs", () => {
       new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32600, message: "Must be authenticated!" } }), { status: 401 });
     const rpc = new JsonRpc(ALCHEMY, { retries: 0, fetch: refuse });
     const err = await rpc.request({ method: "eth_chainId" }).catch((e: Error) => e);
-    expect(String(err)).not.toContain("pz2BQ3JpUyM2t");
+    expect(String(err)).not.toContain("fakeAlchemyKey");
     expect((err as Error).message).toBe(
       "HTTP 401 from https://arb-mainnet.g.alchemy.com/v2/***: the provider refused the request; check the key in the URL",
     );
@@ -69,7 +69,7 @@ const MISSED: [string, string, string][] = [
   ["base64 split by /", "https://rpc.example.com/rpc/abc+def/ghiJKL1234==", "ghiJKL1234"],
   ["percent-encoded", "https://rpc.example.com/k/AbC%2Bd3fGh1jkLmNoPq", "d3fGh1jk"],
   ["a 12-character key", "https://rpc.example.com/a1b2c3d4e5f6", "a1b2c3d4e5f6"],
-  ["a uuid", "https://rpc.example.com/v1/9aa3d95b-3bc4-40fa-88ea-12eaa4456161", "9aa3d95b"],
+  ["a uuid", "https://rpc.example.com/v1/01234567-89ab-4cde-8f01-23456789abcd", "01234567"],
   ["22 letters", "https://arbitrum.gateway.tenderly.co/AbCdEfGhIjKlMnOpQrStUv", "AbCdEfGh"],
   ["x-api-key with a dot", "https://hermes.example.com/?x-api-key=live.AbC123dEf456", "AbC123dEf456"],
   ["access-token, letters only", "https://hermes.example.com/?access-token=abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnop"],
@@ -213,7 +213,7 @@ describe("URLs inside text", () => {
 
   it("urlSecrets lists what redactUrl masks, so each part can be masked where it appears alone", () => {
     expect(urlSecrets(USERINFO)).toEqual(["keeper:hunter2", "hunter2"]); // the password, not the user name on its own
-    expect(urlSecrets(ALCHEMY)).toEqual(["pz2BQ3JpUyM2t-2nXpbt3aTvP8vTtM-a"]);
+    expect(urlSecrets(ALCHEMY)).toEqual(["fakeAlchemyKey-0123456789abcdefg"]);
     expect(urlSecrets(TOKEN_PARAM)).toEqual(["abc"]);
     expect(urlSecrets("https://pyth-lazer.dourolabs.app")).toEqual([]);
     expect(urlSecrets("not a URL")).toEqual([]);

@@ -209,7 +209,7 @@ describe("config", () => {
 
   it("URLs carrying keys must come from the environment", () => {
     const f = join(dir, "k.yaml");
-    const alchemyKey = "pz2BQ3JpUyM2t-2nXpbt3aTvP8vTtM-a";
+    const alchemyKey = "fakeAlchemyKey-0123456789abcdefg";
     const write = (rpc: string, subgraph = "none") =>
       writeFileSync(
         f,
@@ -229,7 +229,7 @@ describe("config", () => {
     expect(msg).not.toContain(alchemyKey);
     expect(msg).toContain("https://arb-mainnet.g.alchemy.com/v2/${NAME}");
 
-    write("https://lb.drpc.org/ogrpc?network=arbitrum&dkey=Ak80gSCleU1Frwnafb5Ka4V3cFQ9C-oR8Kg9gkl9-Mvm");
+    write("https://lb.drpc.org/ogrpc?network=arbitrum&dkey=fakeDrpcKey-0123456789abcdefghijklmnopqrstuv");
     expect(() => loadConfig(f)).toThrow(/rpc\.http is a URL with a key in its dkey parameter/);
 
     write(
@@ -240,11 +240,11 @@ describe("config", () => {
 
     // A URL without a key may be written in; a keyed one may carry its key as a ${NAME}.
     process.env.ALCHEMY_KEY = alchemyKey;
-    process.env.DRPC_KEY = "Ak80gSCleU1Frwnafb5Ka4V3cFQ9C-oR8Kg9gkl9-Mvm";
+    process.env.DRPC_KEY = "fakeDrpcKey-0123456789abcdefghijklmnopqrstuv";
     write("https://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}", "https://api.studio.thegraph.com/query/1/bazaar/v0.0.1");
     expect(loadConfig(f).rpc.http).toBe(`https://arb-mainnet.g.alchemy.com/v2/${alchemyKey}`);
     write("https://lb.drpc.org/ogrpc?network=arbitrum&dkey=${DRPC_KEY}");
-    expect(loadConfig(f).rpc.http.endsWith("dkey=Ak80gSCleU1Frwnafb5Ka4V3cFQ9C-oR8Kg9gkl9-Mvm")).toBe(true);
+    expect(loadConfig(f).rpc.http.endsWith("dkey=fakeDrpcKey-0123456789abcdefghijklmnopqrstuv")).toBe(true);
   });
 });
 
