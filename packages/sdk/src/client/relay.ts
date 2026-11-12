@@ -119,7 +119,7 @@ async function resolveFields(ctx: BazaarContext, pair: Address, signer: Address,
 /**
  * The bounds of each action that need no chain read, as the pair enforces them for a relayed call:
  * deposits of at least 5 USDC that exceed the fee, a withdrawal larger than the fee, a non-zero share
- * amount, 1-200 distinct cancel ids, 1-32 well-formed amendments, a spec the order rules accept.
+ * amount, 1-34 distinct cancel ids, 1-32 well-formed amendments, a spec the order rules accept.
  * `terminalPayout`: for a withdrawal on a terminated pair, what it pays ({@link terminalWithdrawal},
  * `amount × principalRatio`), which is what the fee is judged against there; a payout of 0 takes
  * the fee from the wallet instead and passes this check.

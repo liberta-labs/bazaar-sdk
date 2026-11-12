@@ -134,7 +134,8 @@ Each round:
    the grid. A side that would grow the net position past `MAX_POSITION` gets size 0.
 2. **Cancel** extra quotes (anything beyond one per side), a side whose size is now 0, and quotes with
    less than 10 minutes left: an order with less than about a minute left cannot be moved by an
-   amendment, so they are replaced before that. One `cancelOrders` call takes up to 200 ids.
+   amendment, so they are replaced before that. One `cancelOrders` call takes up to 34 ids, every
+   order an account can hold live.
 3. **Amend** the resting quotes to the new prices in one `amendOrders` call. Each amendment sets the new
    **total** size, so `filled + size` restores a partly filled quote to full size. `bestEffort: true`
    means a quote that filled or expired in the meantime is skipped rather than reverting the batch.

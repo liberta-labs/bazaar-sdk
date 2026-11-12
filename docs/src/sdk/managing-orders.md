@@ -119,9 +119,11 @@ price and block they were checked at.
 
 ## Canceling
 
-`bz.trade.cancelOrders(pair, from, orderIds)` cancels up to 200 of `from`'s orders in one call
-(`MAX_CANCELS_PER_CALL`). Each is unlinked from the book in the same transaction, and any keeper bounty
-it still holds returns to `from`'s claimable balance. There is no margin check and no price update.
+`bz.trade.cancelOrders(pair, from, orderIds)` cancels up to 34 of `from`'s orders in one call
+(`MAX_CANCELS_PER_CALL`), every order one account can hold live on a market. Each is unlinked from
+the book in the same transaction, and any keeper bounty it still holds returns to `from`'s claimable
+balance. There is no margin check and no price update. Ended orders still holding a bounty (below)
+count toward the 34 as well, so more of them than fit take further calls.
 
 ```ts
 {{#include ../../examples/trading/managing-orders.ts:cancel}}
@@ -130,7 +132,7 @@ it still holds returns to `from`'s claimable balance. There is no margin check a
 The builder refuses the following (`trade.checkCancelIds(ids)` runs the list checks alone, with no
 reads):
 
-- an empty list, more than 200 ids, a duplicate, or a non-positive id;
+- an empty list, more than 34 ids, a duplicate, or a non-positive id;
 - an order that does not exist or is not `from`'s;
 - an order that has already ended (filled, expired, auto-canceled) and holds no bounty: "Order #12 is
   already closed." or "... has already expired.".

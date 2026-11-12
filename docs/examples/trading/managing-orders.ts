@@ -67,9 +67,9 @@ try {
 // ANCHOR: cancel
 await run(await bz.trade.cancelOrders(eth.address, user, [42n, 43n]));
 
-// Everything at once: every live order, up to 200 per call.
+// Everything at once: every order an account can hold live fits in one call.
 const ids = snap.orders.map((o) => o.orderId);
-if (ids.length > 0) await run(await bz.trade.cancelOrders(eth.address, user, ids.slice(0, 200)));
+if (ids.length > 0) await run(await bz.trade.cancelOrders(eth.address, user, ids));
 // ANCHOR_END: cancel
 
 // ANCHOR: execute

@@ -612,7 +612,7 @@ export async function amendOrders(ctx: BazaarContext, pair: Address, from: Addre
 
 // ---- cancellation ----
 
-/** 1 to 200 distinct order ids, as cancelOrders takes them. */
+/** 1 to MAX_CANCELS_PER_CALL (34) distinct order ids, as cancelOrders takes them. */
 export function checkCancelIds(orderIds: readonly bigint[]): void {
   if (orderIds.length === 0) throw new InputError("orderIds", "Choose at least one order to cancel.");
   if (orderIds.length > MAX_CANCELS_PER_CALL) throw new InputError("orderIds", `At most ${MAX_CANCELS_PER_CALL} orders can be canceled at once.`);
@@ -625,8 +625,9 @@ export function checkCancelIds(orderIds: readonly bigint[]): void {
 }
 
 /**
- * Cancel the trader's orders (up to 200): each is unlinked from the book in the same write and its
- * remaining keeper bounty returns to the trader's claimable balance (claimFees). An order that
+ * Cancel the trader's orders (up to 34, every order one account can hold live): each is unlinked from
+ * the book in the same write and its remaining keeper bounty returns to the trader's claimable
+ * balance (claimFees). An order that
  * already ended (filled, expired, auto-canceled) but still holds a bounty can be "canceled" to
  * reclaim it; one with nothing left is refused here, as the pair would refuse it. No margin gate.
  */

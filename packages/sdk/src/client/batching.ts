@@ -2,7 +2,7 @@
  * Several PreparedCalls in one transaction, from a smart account.
  *
  * Bazaar has no batch form of createOrder: each order is one call (cancelOrders and amendOrders are
- * batched already, up to 200 and 32). A contract account that calls the pair several times in one
+ * batched already, up to 34 and 32). A contract account that calls the pair several times in one
  * transaction gets most of what a batch entry point would (docs/guide/batching.md): one
  * transaction's overhead, warm storage for the second and later calls, one price store. The account
  * is then the trader: collateral, positions, resting orders and claimable fees belong to its address,

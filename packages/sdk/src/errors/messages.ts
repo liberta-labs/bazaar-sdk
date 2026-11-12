@@ -147,7 +147,7 @@ export const USER_MESSAGES: Readonly<Record<string, Message>> = {
   BazaarPair__AmountLteRelayerFee: "The amount paid out would not cover the relayer's fee. Withdraw more, or send the transaction yourself.",
   BazaarPair__EmptyLiquidationList: "No accounts were given to liquidate.",
   BazaarPair__EthRefundFailed: "The market could not refund the unused ETH to the sender. Send exactly the price-update fee, or send from an address that accepts ETH.",
-  BazaarPair__ExceedsMaxCancelsPerCall: "Cancel between 1 and 200 orders per transaction.",
+  BazaarPair__ExceedsMaxCancelsPerCall: "Cancel between 1 and 34 orders per transaction.",
   BazaarPair__InsufficientPythFee: "Not enough ETH was sent for the price update's fee. Rebuild the transaction so it carries the current fee.",
   BazaarPair__InsuranceDepositRequiresFreshPrice:
     "While the market holds liquidated positions, an insurance deposit needs a live price, and the market is closed. Try again when it reopens.",

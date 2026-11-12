@@ -367,7 +367,7 @@ describe("cancelOrders", () => {
     expect((await rejectsInput(cancelOrders(ctx, PAIR, alice.address, [4n]))).message).toMatch(/not yours/);
     expect((await rejectsInput(cancelOrders(ctx, PAIR, alice.address, [1n, 1n]))).message).toMatch(/twice/);
     expect((await rejectsInput(cancelOrders(ctx, PAIR, alice.address, []))).field).toBe("orderIds");
-    expect((await rejectsInput(cancelOrders(ctx, PAIR, alice.address, Array.from({ length: 201 }, (_, i) => BigInt(i + 1))))).message).toMatch(/200/);
+    expect((await rejectsInput(cancelOrders(ctx, PAIR, alice.address, Array.from({ length: 35 }, (_, i) => BigInt(i + 1))))).message).toMatch(/34/);
   });
 });
 

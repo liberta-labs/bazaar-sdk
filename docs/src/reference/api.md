@@ -291,7 +291,7 @@ Order specs, checks and packing, with no chain read except the `read*` functions
 | [`orders.NEVER_EXPIRE_BLOCK`](../sdk/orders.md) | const | The expiry the pair stamps on TakeProfit and StopLoss orders: they never expire. |
 | [`orders.MAX_ACTIVE_LIMIT_ORDERS_PER_USER`](../sdk/orders.md) | const | Active Limit + StopLimit orders one account may hold on one pair. |
 | [`orders.MAX_AMENDS_PER_CALL`](../sdk/orders.md) | const | Amendments per amendOrders call (the per-user cap, so one batch can requote every order). |
-| [`orders.MAX_CANCELS_PER_CALL`](../sdk/managing-orders.md) | const | Order ids per cancelOrders call (BazaarPair.MAX_CANCELS_PER_CALL). |
+| [`orders.MAX_CANCELS_PER_CALL`](../sdk/managing-orders.md) | const | Order ids per cancelOrders call (BazaarPair.MAX_CANCELS_PER_CALL): every order one account can hold live on a pair, its Limit and StopLimit orders plus a take-profit and a stop-loss. |
 | [`orders.AMEND_BEST_EFFORT_BIT`](../sdk/orders.md) | const | Bit 192 of an amendment's id word: skip the amendment instead of reverting the batch. |
 | [`orders.CLOSE_POSITION`](../sdk/orders.md) | const | A TakeProfit or StopLoss of this size closes the whole position, whatever it is when it fires. |
 | [`orders.L2_BLOCKS_PER_SECOND`](../sdk/orders.md) | const | Arbitrum produces about four L2 blocks a second; expiries are counted in them. |
@@ -327,8 +327,8 @@ Every trading write, and the price and hint helpers they use.
 | [`trade.createOrder`](../sdk/orders.md) | function, bz | Create an order, matched against the book in the same transaction. |
 | [`trade.prepareAmends`](../sdk/managing-orders.md) | function, bz | Check amendments the way `OrderManagementLib._amendOne` will and fill in hints for the ones that move. |
 | [`trade.amendOrders`](../sdk/managing-orders.md) | function, bz | Amend resting Limit (GTC) orders in place: each gets a new price and total size and keeps its id, expiry and integrator. |
-| [`trade.checkCancelIds`](../sdk/managing-orders.md) | function | 1 to 200 distinct order ids, as cancelOrders takes them. |
-| [`trade.cancelOrders`](../sdk/managing-orders.md) | function, bz | Cancel the trader's orders (up to 200): each is unlinked from the book in the same write and its remaining keeper bounty returns to the trader's claimable balance (claimFees). |
+| [`trade.checkCancelIds`](../sdk/managing-orders.md) | function | 1 to MAX_CANCELS_PER_CALL (34) distinct order ids, as cancelOrders takes them. |
+| [`trade.cancelOrders`](../sdk/managing-orders.md) | function, bz | Cancel the trader's orders (up to 34, every order one account can hold live): each is unlinked from the book in the same write and its remaining keeper bounty returns to the trader's claimable balance (claimFees). |
 | [`trade.claimFees`](../sdk/managing-orders.md) | function, bz | Pay the caller everything the pair owes it: refunded trigger bounties, keeper rewards, relayer and integrator fees. |
 | [`trade.executeTriggeredOrders`](../sdk/managing-orders.md) | function, bz | Fire the trader's own trigger orders (StopLimit, TakeProfit, StopLoss) whose trigger the live price has reached: how a zero-bounty order is executed, by its owner. |
 | [`trade.PriceUpdateError`](../sdk/sending.md) | class | A price update that is not a Pyth Pro update, or does not cover the pair's feeds. |

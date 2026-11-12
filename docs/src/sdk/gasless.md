@@ -50,7 +50,7 @@ a market.
 | `{ action: "amendOrders", amendments }` | `AmendInput[]` ([Managing Orders](managing-orders.md#amending)), checked and given hints as `prepareAmends` does. |
 | `{ action: "depositCollateral", amount }`, `{ action: "withdrawCollateral", amount }`, `{ action: "depositToInsurance", amount }` | An amount in BAZAAR precision. Deposits are floored to micro-USDC first. |
 | `{ action: "requestInsuranceWithdrawal", shareAmount }`, `{ action: "executeInsuranceWithdrawal" }` | See [Insurance](insurance.md). |
-| `{ action: "cancelOrders", orderIds }` | 1 to 200 distinct order ids. |
+| `{ action: "cancelOrders", orderIds }` | 1 to 34 distinct order ids. |
 | `{ action: "createOrder", spec }`, `{ action: "amendOrders", amends }` | An already built `OrderSpec`, or the flat amendment words, signed as given. |
 
 | Option | Default | Meaning |
@@ -139,7 +139,7 @@ Where it comes from depends on the action:
 `checkSignedFields(fields, relayerFee, terminalPayout?)` enforces the bounds that need no read, and
 `signRelayed` and `verifyRelayed` both run it: deposits of at least 5 USDC that exceed the fee, a
 withdrawal larger than the fee (or, on a terminated market, a payout larger than the fee), a non-zero
-share amount, 1 to 200 distinct cancel ids, 1 to 32 well-formed amendments, and an order spec the order
+share amount, 1 to 34 distinct cancel ids, 1 to 32 well-formed amendments, and an order spec the order
 rules accept. A withdrawal on a terminated market that would pay nothing is refused.
 
 ### Permits on the Gasless Path

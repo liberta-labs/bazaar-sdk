@@ -145,7 +145,7 @@ Arbitrum blocks (`orders.blocksIn(3600)`, about four blocks a second).
 
 The pair numbers orders itself; the new order's id is in the `OrderUpdated` event of the receipt,
 which `live.decodeLiveLog` turns into a typed event (`payload.action` 0 is "created"). Canceling takes
-a list of up to 200 ids. Every order option is on [Placing Orders](../sdk/orders.md), canceling and
+a list of up to 34 ids. Every order option is on [Placing Orders](../sdk/orders.md), canceling and
 amending on [Managing Orders](../sdk/managing-orders.md).
 
 ## 7. Run It

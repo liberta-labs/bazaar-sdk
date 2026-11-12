@@ -1,7 +1,7 @@
 # Smart Accounts & Batching
 
 Bazaar has no batch form of `createOrder`: each order is one call. (Canceling and amending are
-batched already: `cancelOrders` takes up to 200 ids and `amendOrders` up to 32 amendments.) To place
+batched already: `cancelOrders` takes up to 34 ids and `amendOrders` up to 32 amendments.) To place
 several orders at once, or to approve, deposit and trade in one step, trade from a **contract account**
 that calls the pair several times in one transaction. That gets most of what a batch entry point would:
 one transaction's overhead, warm storage for the later calls, and one price update for all of them.

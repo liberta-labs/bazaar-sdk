@@ -113,7 +113,7 @@ On the `orders` namespace:
 | `orders.L2_BLOCKS_PER_SECOND` | `4` | Arbitrum's block rate, for `orders.blocksIn(seconds)`. |
 | `orders.MAX_ACTIVE_LIMIT_ORDERS_PER_USER` | `32` | Live Limit (GTC) and StopLimit orders per account per market. |
 | `orders.MAX_AMENDS_PER_CALL` | `32` | Amendments per `amendOrders`. |
-| `orders.MAX_CANCELS_PER_CALL` | `200` | Order ids per `cancelOrders`. |
+| `orders.MAX_CANCELS_PER_CALL` | `34` | Order ids per `cancelOrders`: the 32 Limit and StopLimit orders an account may hold, plus a take-profit and a stop-loss. |
 | `orders.CLOSE_POSITION` | `MAX_UINT256` | The size of a TP or SL that closes the whole position. |
 | `orders.AMEND_BEST_EFFORT_BIT` | `2n ** 192n` | The flag in an amendment's id word that skips rather than reverts. |
 

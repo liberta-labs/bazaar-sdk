@@ -60,8 +60,11 @@ export const NEVER_EXPIRE_BLOCK = (1n << 64n) - 1n;
 export const MAX_ACTIVE_LIMIT_ORDERS_PER_USER = 32;
 /** Amendments per amendOrders call (the per-user cap, so one batch can requote every order). */
 export const MAX_AMENDS_PER_CALL = 32;
-/** Order ids per cancelOrders call (BazaarPair.MAX_CANCELS_PER_CALL). */
-export const MAX_CANCELS_PER_CALL = 200;
+/**
+ * Order ids per cancelOrders call (BazaarPair.MAX_CANCELS_PER_CALL): every order one account can hold
+ * live on a pair, its Limit and StopLimit orders plus a take-profit and a stop-loss.
+ */
+export const MAX_CANCELS_PER_CALL = MAX_ACTIVE_LIMIT_ORDERS_PER_USER + 2;
 /** Bit 192 of an amendment's id word: skip the amendment instead of reverting the batch. */
 export const AMEND_BEST_EFFORT_BIT = 1n << 192n;
 /** A TakeProfit or StopLoss of this size closes the whole position, whatever it is when it fires. */
