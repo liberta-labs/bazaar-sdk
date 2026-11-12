@@ -1,7 +1,7 @@
-import { type Abi, type Hex, decodeFunctionData, getAddress, keccak256, toBytes } from "viem";
+import { type Abi, type Address, type Hex, decodeFunctionData, getAddress, keccak256, toBytes } from "viem";
 import { describe, expect, it } from "vitest";
 import { bazaarPairAbi } from "../src/abi/index.js";
-import { ERC20_ABI, approveUsdc, usdcFunding } from "../src/client/allowance.js";
+import { ERC20_ABI, FAUCET_ABI, approveUsdc, claimFaucet, faucetStatus, usdcFunding } from "../src/client/allowance.js";
 import {
   TRADING_ACCOUNT_ABI,
   decodeTradingAccountResults,
@@ -44,7 +44,7 @@ import {
 } from "../src/client/trade.js";
 import { LIMIT, MARKET, STOP_LIMIT, STOP_LOSS, TAKE_PROFIT } from "../src/constants.js";
 import { pairPrice } from "../src/formulas/index.js";
-import { FEED, INTEGRATOR, PAIR, USDC, alice, bob, bucket, fakeContext, mockUpdate, storedOrder } from "./client-writes-fake.js";
+import { FEED, INTEGRATOR, PAIR, Revert, USDC, alice, bob, bucket, fakeContext, mockUpdate, storedOrder } from "./client-writes-fake.js";
 import { type FeedSpec, fid, unsigned } from "./pro-fakes.js";
 import type { PriceUpdateSource } from "../src/client/context.js";
 import { NoFreshPriceError, NoLiquidationPriceError, liquidationUpdateFor, priceUpdateFor, updateProblem } from "../src/client/feeds.js";
@@ -531,6 +531,58 @@ describe("allowance", () => {
     fake.usdc("balanceOf", 30_000_000n).usdc("allowance", 10_000_000n);
     const f = await usdcFunding(ctx, alice.address, PAIR, 25n * E18 + 1n);
     expect(f).toEqual({ needUsdc: 25_000_001n, balance: 30_000_000n, allowance: 10_000_000n, enoughBalance: true, enoughAllowance: false, approveUsdc: 25_000_001n });
+  });
+});
+
+describe("the testnet USDC faucet", () => {
+  const TOKEN_ABI = [...ERC20_ABI, ...FAUCET_ABI] as unknown as Abi;
+
+  function faucet(lastClaim: bigint) {
+    const { fake, ctx } = fakeContext();
+    fake
+      .on(USDC, TOKEN_ABI, "FAUCET_AMOUNT", 10_000_000000n)
+      .on(USDC, TOKEN_ABI, "FAUCET_COOLDOWN", 86_400n)
+      .on(USDC, TOKEN_ABI, "lastClaimTs", ([who]: readonly [Address]) => (getAddress(who) === alice.address ? lastClaim : 0n));
+    return { fake, ctx };
+  }
+
+  it("builds a claim for an address that never claimed, judged at the chain's time", async () => {
+    const { fake, ctx } = faucet(0n);
+    const s = await faucetStatus(ctx, alice.address);
+    expect(s).toEqual({ available: true, amountUsdc: 10_000_000000n, cooldown: 86_400, lastClaimTs: 0, nextClaimTs: fake.timestamp, canClaimNow: true, now: fake.timestamp });
+    const call = await claimFaucet(ctx, alice.address);
+    expect(call.to).toBe(USDC);
+    expect(call.from).toBe(alice.address);
+    expect(decodeFunctionData({ abi: FAUCET_ABI, data: call.data }).functionName).toBe("claim");
+    expect(call.summary).toBe("Claim 10000 test USDC from the faucet");
+    expect(call.value).toBe(0n);
+    expect(call.pullsUsdc).toBe(0n);
+  });
+
+  it("refuses a claim inside the cooldown, naming when it ends, and allows one once it has passed", async () => {
+    const { fake, ctx } = faucet(BigInt(1_700_000_000 - 3_600));
+    const s = await faucetStatus(ctx, alice.address);
+    expect(s.canClaimNow).toBe(false);
+    expect(s.nextClaimTs).toBe(1_700_000_000 - 3_600 + 86_400);
+    const e = await rejectsInput(claimFaucet(ctx, alice.address));
+    expect(e.field).toBe("owner");
+    expect(e.message).toMatch(/can claim again at .* UTC \(in 23 h 0 min\)/);
+    fake.timestamp += 86_400;
+    expect((await faucetStatus(ctx, alice.address)).canClaimNow).toBe(true);
+  });
+
+  it("reports native USDC as having no faucet, and refuses a claim on it", async () => {
+    const { fake, ctx } = fakeContext();
+    // Native USDC has no such functions: each read reverts with empty data.
+    const absent = () => {
+      throw new Revert();
+    };
+    for (const fn of ["FAUCET_AMOUNT", "FAUCET_COOLDOWN", "lastClaimTs"]) fake.on(USDC, [...ERC20_ABI, ...FAUCET_ABI] as unknown as Abi, fn, absent);
+    const s = await faucetStatus(ctx, alice.address);
+    expect(s.available).toBe(false);
+    expect(s.canClaimNow).toBe(false);
+    const e = await rejectsInput(claimFaucet(ctx, alice.address));
+    expect(e.message).toMatch(/no faucet/);
   });
 });
 

@@ -229,6 +229,23 @@ withdrawal that would pay nothing is refused (`InputError` on `amount`). Registe
 paid at the separate `profitRatio`; `previewWithdrawal(...).terminal` and the account snapshot's
 `terminal` give the whole entitlement. [Termination & Settlement](termination.md) covers the rest.
 
+## The Testnet Faucet
+
+On a testnet deployment USDC is Bazaar's test token, whose faucet pays 10,000 test USDC to the caller
+at most once a day per address. `bz.allowance.faucetStatus(user)` says whether `user` can claim now
+(`available`, `canClaimNow`, `nextClaimTs`, `amountUsdc`, judged at the latest block's time), and
+`bz.allowance.claimFaucet(user)` builds the claim, a `PreparedCall` the wallet sends and pays the gas
+for:
+
+```ts
+const faucet = await bz.allowance.faucetStatus(user);
+if (faucet.canClaimNow) await run(await bz.allowance.claimFaucet(user));
+```
+
+`claimFaucet` refuses, with an `InputError` on `owner`, while the address waits out its cooldown (with
+the time it ends) and on a deployment whose USDC has no faucet, which `faucetStatus` reports as
+`available: false`.
+
 ## What Can Go Wrong
 
 | You see | It means |

@@ -455,6 +455,10 @@ USDC balance, allowance and approvals.
 | [`allowance.usdcFunding`](../sdk/collateral.md) | function, bz | Whether `owner` can fund a pull of `pullBazaar` (BAZAAR precision, e.g. `PreparedCall.pullsUsdc`) to `spender`: balance and allowance in one read. |
 | [`allowance.ERC20_ABI`](../sdk/collateral.md) | const | The ERC-20 / ERC-2612 functions the SDK calls on USDC, hand-written (USDC is not a Bazaar ABI). |
 | [`allowance.UsdcFunding`](../sdk/collateral.md) | interface | What `usdcFunding` returns: the USDC a call needs, the balance and allowance, and what to approve. |
+| [`allowance.faucetStatus`](../sdk/collateral.md#the-testnet-faucet) | function, bz | Whether `owner` can claim from the testnet USDC faucet now, and when it can next. |
+| [`allowance.claimFaucet`](../sdk/collateral.md#the-testnet-faucet) | function, bz | Claim test USDC from the deployment's testnet faucet (a `PreparedCall` sent from the wallet). |
+| [`allowance.FaucetStatus`](../sdk/collateral.md#the-testnet-faucet) | interface | What `faucetStatus` returns. |
+| [`allowance.FAUCET_ABI`](../sdk/collateral.md#the-testnet-faucet) | const | The testnet USDC's faucet functions. |
 
 ### `relay`
 

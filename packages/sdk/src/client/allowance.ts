@@ -102,6 +102,105 @@ export async function approveUsdc(
   };
 }
 
+/**
+ * The faucet functions of Bazaar's testnet USDC (`TestnetUSDC`, in the protocol repository's
+ * test/mocks), hand-written: it is a test token, not one of the five Bazaar ABIs. Native USDC has
+ * none of them, so these reads fail on a mainnet deployment and {@link faucetStatus} reports the
+ * faucet as absent.
+ */
+export const FAUCET_ABI = [
+  { type: "function", name: "claim", stateMutability: "nonpayable", inputs: [], outputs: [] },
+  { type: "function", name: "lastClaimTs", stateMutability: "view", inputs: [{ name: "", type: "address" }], outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "FAUCET_AMOUNT", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "FAUCET_COOLDOWN", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint256" }] },
+] as const;
+
+type FaucetFn = (typeof FAUCET_ABI)[number]["name"];
+
+function faucetData(fn: FaucetFn, ...args: readonly unknown[]): Hex {
+  return encodeFunctionData({ abi: FAUCET_ABI, functionName: fn, args } as never);
+}
+
+/** Where an address stands with the deployment's USDC faucet. */
+export interface FaucetStatus {
+  /** The deployment's USDC has a faucet (a test token). False on native USDC, with every other field 0 or false but `now`. */
+  readonly available: boolean;
+  /** What one claim pays, in USDC units. */
+  readonly amountUsdc: bigint;
+  /** Seconds an address waits between claims. */
+  readonly cooldown: number;
+  /** When the address last claimed (unix seconds), 0 for never. */
+  readonly lastClaimTs: number;
+  /** The earliest chain time the address may claim: `now` when it may claim now. */
+  readonly nextClaimTs: number;
+  /** Whether a claim would land now. */
+  readonly canClaimNow: boolean;
+  /** The latest block's time, which the token compares against. */
+  readonly now: number;
+}
+
+/**
+ * Whether `owner` can claim from the testnet USDC faucet now, and when it can next: the faucet's
+ * amount, cooldown and `owner`'s last claim in one batch, judged at the latest block's time. A token
+ * without the faucet reads `available: false` rather than throwing.
+ */
+export async function faucetStatus(ctx: BazaarContext, owner: Address): Promise<FaucetStatus> {
+  const who = getAddress(owner);
+  const [res, block] = await Promise.all([
+    ctx.chain.batch([
+      { to: ctx.usdc, data: faucetData("FAUCET_AMOUNT") },
+      { to: ctx.usdc, data: faucetData("FAUCET_COOLDOWN") },
+      { to: ctx.usdc, data: faucetData("lastClaimTs", who) },
+    ]),
+    ctx.chain.block("latest"),
+  ]);
+  const now = block.timestamp;
+  const read = (i: number): bigint | null => {
+    const [ok, data] = res[i]!;
+    // A contract without the function answers empty data (no fallback) or reverts.
+    if (!ok || data.length < 66) return null;
+    return uint(data);
+  };
+  const amount = read(0);
+  const cooldown = read(1);
+  const last = read(2);
+  if (amount === null || cooldown === null || last === null || amount === 0n) {
+    return { available: false, amountUsdc: 0n, cooldown: 0, lastClaimTs: 0, nextClaimTs: 0, canClaimNow: false, now };
+  }
+  const next = last === 0n ? now : Math.max(now, Number(last + cooldown));
+  return { available: true, amountUsdc: amount, cooldown: Number(cooldown), lastClaimTs: Number(last), nextClaimTs: next, canClaimNow: next <= now, now };
+}
+
+/**
+ * Claim test USDC from the deployment's testnet faucet: `FAUCET_AMOUNT` (10,000 USDC on Bazaar's
+ * token) to `owner`, at most once per `FAUCET_COOLDOWN` (a day) per address. It has no gasless form:
+ * `owner` sends it and pays the gas.
+ *
+ * Refuses up front, with an InputError on `owner`, when the deployment's USDC has no faucet and while
+ * `owner` waits out its cooldown (naming when it ends). The token's own revert for the cooldown,
+ * `TestnetUSDC__FaucetCooldown`, is not among the errors the SDK decodes, so the check runs here.
+ */
+export async function claimFaucet(ctx: BazaarContext, owner: Address): Promise<PreparedCall> {
+  const s = await faucetStatus(ctx, owner);
+  if (!s.available) throw new InputError("owner", "This deployment's USDC has no faucet: it is not a test token.");
+  if (!s.canClaimNow) {
+    const minutes = Math.ceil((s.nextClaimTs - s.now) / 60);
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    const at = new Date(s.nextClaimTs * 1000).toISOString().slice(0, 16).replace("T", " ");
+    throw new InputError("owner", `This address claimed test USDC recently. It can claim again at ${at} UTC (in ${h > 0 ? `${h} h ` : ""}${m} min).`);
+  }
+  return {
+    action: "claim",
+    to: ctx.usdc,
+    data: faucetData("claim"),
+    value: 0n,
+    from: getAddress(owner),
+    summary: `Claim ${formatUsdcUnits(s.amountUsdc)} test USDC from the faucet`,
+    pullsUsdc: 0n,
+  };
+}
+
 /** USDC units -> "12.5". */
 export function formatUsdcUnits(units: bigint): string {
   const whole = units / 1_000_000n;
