@@ -26,3 +26,11 @@ CLAUDE.md
 
 # Editor local-history snapshots (they can hold copies of .env)
 .history/
+
+# Logs, editor settings and OS clutter
+*.log
+npm-debug.log*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
