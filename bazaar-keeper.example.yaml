@@ -69,6 +69,8 @@ jobs:
 profit:
   minProfitUsd: 0.001
   gasSafetyMultiplier: 1.25
+  # enforce: false                 # send calls whatever they earn, held only by the budget's spend caps
+  #                                 # (a job's enforceProfit: false does it for that job alone)
 budget:
   maxSpendUsdPerDay: 10
   # maxSpendEthPerDay: 0.01         # the same cap in ETH, checked on wei so no price feed can lift it

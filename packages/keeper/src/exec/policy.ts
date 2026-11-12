@@ -7,6 +7,11 @@
  * A loss-taking call still has to fit three caps: the per-call cap, the job's daily loss budget and the
  * global daily loss budget. Every call, profitable or not, forced or not, has to fit the global daily
  * spend caps: maxSpendUsdPerDay, and maxSpendEthPerDay in wei, which no ETH/USD price can lift.
+ *
+ * The profit rule is on unless the operator switches it off (profit.enforce, or a job's
+ * enforceProfit). With it off, a call that fails it is sent anyway ("unchecked"), held only by the
+ * spend caps: the loss rules go with it, so its loss counts against no loss budget. An unpaid duty
+ * switched on by name keeps its own per-call cap and the loss budgets either way.
  */
 
 import type { JobConfig, KeeperConfig } from "../config/index.js";
@@ -29,8 +34,8 @@ export class Quote {
   }
 }
 
-/** profit | loss | unpaid | forced | skip, or a job's own (collect, forward). */
-export type DecisionKind = "profit" | "loss" | "unpaid" | "forced" | "skip" | (string & {});
+/** profit | loss | unpaid | unchecked | forced | skip, or a job's own (collect, forward). */
+export type DecisionKind = "profit" | "loss" | "unpaid" | "unchecked" | "forced" | "skip" | (string & {});
 
 export interface Decision {
   readonly send: boolean;
@@ -55,6 +60,11 @@ export function fmtG(x: number): string {
 /** The daily ETH spend cap: budget.maxSpendEthPerDay, or maxSpendUsdPerDay at the gas.ethUsdFloor price. */
 export function maxSpendEthPerDay(cfg: KeeperConfig): number {
   return cfg.budget.maxSpendEthPerDay ?? cfg.budget.maxSpendUsdPerDay / cfg.gas.ethUsdFloor;
+}
+
+/** Whether `job` sends only calls that pass the profit rule: its enforceProfit, else profit.enforce. */
+export function enforcesProfit(cfg: KeeperConfig, job: JobConfig | null | undefined): boolean {
+  return job?.enforceProfit ?? cfg.profit.enforce;
 }
 
 export class SpendPolicy {
@@ -103,6 +113,13 @@ export class SpendPolicy {
     const mult = jobCfg?.gasSafetyMultiplier ?? this.cfg.profit.gasSafetyMultiplier;
     if (paid && q.netUsd >= minProfit && q.rewardUsd >= q.costUsd * mult) {
       return { send: true, kind: "profit", reason: `earns $${q.rewardUsd.toFixed(4)} for $${q.costUsd.toFixed(4)} of gas` };
+    }
+    if (consentCap === null && !enforcesProfit(this.cfg, jobCfg)) {
+      return {
+        send: true,
+        kind: "unchecked",
+        reason: `profit rule off: earns $${q.rewardUsd.toFixed(4)} for $${q.costUsd.toFixed(4)} of gas`,
+      };
     }
 
     const consented = consentCap !== null || Boolean(jobCfg?.allowLoss);

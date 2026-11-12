@@ -23,7 +23,7 @@ const log = getLogger("bazaar_sdk.exec");
 
 export type EntryStatus = "confirmed" | "reverted" | "unknown";
 
-/** What an entry is: profit | loss | unpaid | collect | forward | manual | forced. */
+/** What an entry is: profit | loss | unpaid | unchecked | collect | forward | manual | forced. */
 export type EntryKind = string;
 
 export interface EntryInit {

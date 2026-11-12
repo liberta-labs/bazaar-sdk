@@ -641,6 +641,18 @@ describe("collect", () => {
     expect(f.job.firstSeen.has(`${ME}:${f.m.address}`)).toBe(false);
   });
 
+  it("with the profit rule off, claims at the threshold whatever the gas, and any balance on shutdown", async () => {
+    const f = collect({ thresholdUsd: 5, enforceProfit: false });
+    f.claimable.set(f.m.address, 10n * S);
+    const [a] = await f.job.claims(false);
+    expect(a!.decide!(new Quote(0, 9)).send).toBe(true);
+    f.claimable.set(f.m.address, S);
+    const [b] = await f.job.claims(false);
+    expect(b!.decide!(new Quote(0, 0.01)).send).toBe(false); // the threshold still holds
+    const [c] = await f.job.claims(true);
+    expect(c!.decide!(new Quote(0, 2)).send).toBe(true);
+  });
+
   it("respects the job's scope and in-flight claims", async () => {
     const f = collect({ exclude: ["ETH/USD"] });
     f.k.resolveScopes();

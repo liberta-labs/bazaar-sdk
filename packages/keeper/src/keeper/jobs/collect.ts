@@ -4,7 +4,7 @@ import { USDC_DECIMALS, pair } from "@liberta-labs/bazaar-sdk";
 import { type Address, concatHex, encodeAbiParameters } from "viem";
 import type { CollectJob as CollectJobConfig } from "../../config/index.js";
 import { type Action, type ActionResult, lockKey } from "../../exec/executor.js";
-import { type Decision, type Quote, fmtG } from "../../exec/policy.js";
+import { type Decision, type Quote, enforcesProfit, fmtG } from "../../exec/policy.js";
 import { ALL_STATUSES, Job, monotonic, units } from "./base.js";
 
 const PAIR = pair();
@@ -34,6 +34,7 @@ export class CollectJob extends Job<CollectJobConfig> {
   async claims(shutdown: boolean, markets: ReadonlySet<Address> | null = null): Promise<Action[]> {
     const actions: Action[] = [];
     const mult = this.cfg.gasSafetyMultiplier || this.k.cfg.profit.gasSafetyMultiplier;
+    const enforce = enforcesProfit(this.k.cfg, this.cfg);
     const inflight = this.k.executor.inflight;
     for (const lane of this.k.executor.lanes.values()) {
       const owed = await this.k.reader.claimable(lane.address);
@@ -52,12 +53,16 @@ export class CollectJob extends Job<CollectJobConfig> {
         const aged = Date.now() / 1000 - first > this.cfg.maxAgeDays * 86_400;
         const threshold = this.cfg.thresholdUsd;
 
+        // With the profit rule off a claim no longer has to cover its gas; thresholdUsd still holds
+        // outside a shutdown or an aged balance.
         const decide = (q: Quote): Decision => {
           if (shutdown || aged) {
-            if (owedUsd >= q.costUsd) return { send: true, kind: "collect", reason: `claims $${owedUsd.toFixed(2)} for $${q.costUsd.toFixed(4)}` };
+            if (!enforce || owedUsd >= q.costUsd) {
+              return { send: true, kind: "collect", reason: `claims $${owedUsd.toFixed(2)} for $${q.costUsd.toFixed(4)}` };
+            }
             return { send: false, kind: "skip", reason: `$${owedUsd.toFixed(4)} does not cover the claim's gas` };
           }
-          if (owedUsd >= threshold && owedUsd >= q.costUsd * mult) {
+          if (owedUsd >= threshold && (!enforce || owedUsd >= q.costUsd * mult)) {
             return { send: true, kind: "collect", reason: `claims $${owedUsd.toFixed(2)} for $${q.costUsd.toFixed(4)}` };
           }
           return { send: false, kind: "skip", reason: `$${owedUsd.toFixed(2)} is below the $${fmtG(threshold)} collect threshold` };

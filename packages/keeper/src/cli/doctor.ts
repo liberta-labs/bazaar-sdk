@@ -3,6 +3,7 @@
 import { ETH_USD_FEED, type ProClient, isUrl, redactUrl } from "@liberta-labs/bazaar-sdk";
 import type { Address, Hex } from "viem";
 import { ConfigError, type KeeperConfig, UNCHECKED_SIGNERS_WARNING, enabledJobs } from "../config/index.js";
+import { enforcesProfit } from "../exec/policy.js";
 import { WalletError } from "../exec/wallets.js";
 import type * as Engine from "../keeper/engine.js";
 import { type Output, FAIL, OK, WARN, c, consoleOutput, errorText, formatG, grouped, redactUrls } from "./format.js";
@@ -210,10 +211,11 @@ export async function runDoctor(cfg: KeeperConfig, opts: DoctorOptions = {}): Pr
     if (!names.length) warn("Jobs", "no job is enabled");
     for (const [name, j] of Object.entries(enabled)) {
       if (!j) continue;
-      if (name === "sweepExpired") {
+      if (!enforcesProfit(cfg, j)) {
+        warn("Jobs", `${name} has the profit rule off: it sends calls whatever they earn, held only by the daily spend caps`);
+      } else if (name === "sweepExpired") {
         warn("Jobs", `sweepExpired pays nothing; its daily loss budget is $${formatG(j.lossBudgetUsdPerDay)}`);
-      }
-      if (j.allowLoss && name !== "sweepExpired") {
+      } else if (j.allowLoss) {
         warn("Jobs", `${name} takes losses: up to $${formatG(j.maxLossUsdPerCall)} a call, $${formatG(j.lossBudgetUsdPerDay)} a day`);
       }
     }

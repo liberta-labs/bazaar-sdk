@@ -51,10 +51,27 @@ R ≥ C × gasSafetyMultiplier   (default 1.25)
 |---|---|---|
 | `profit.minProfitUsd` | `0.001` | the least net profit worth a call |
 | `profit.gasSafetyMultiplier` | `1.25` | headroom against the gas estimate being low |
-| `jobs.<job>.minProfitUsd`, `jobs.<job>.gasSafetyMultiplier` | the `profit` values | per-job overrides |
+| `profit.enforce` | `true` | whether calls must pass the rule at all |
+| `jobs.<job>.minProfitUsd`, `jobs.<job>.gasSafetyMultiplier`, `jobs.<job>.enforceProfit` | the `profit` values | per-job overrides |
 
 Otherwise it is skipped: `below the profit rule: earns $0.0400 for $0.0500 of gas, needs ×1.25 and
 $0.001 net (allowLoss is off)`, unless the job takes losses.
+
+**Switching the rule off.** With `enforce: false` (or a job's `enforceProfit: false`), a call that fails
+the rule is sent anyway, whatever it earns or costs: on a testnet, say, where every stop order should
+fire. Its ledger kind is `unchecked`. The loss rules go with the profit rule, so `allowLoss`,
+`maxLossUsdPerCall` and the loss budgets do not hold it, and its loss counts against no loss budget.
+What still holds it: the daily spend caps (section 1), `minEthBalance`, and the fee ceilings. An
+unpaid duty switched on by name (`finalize`, health pokes) keeps its own per-call cap and the loss
+budgets either way. `bazaar keeper doctor` warns about every job running with the rule off.
+
+```yaml
+profit:
+  enforce: true          # the default: only calls that pass the rule are sent
+jobs:
+  triggers:
+    enforceProfit: false # this job alone sends whatever its calls earn
+```
 
 ## 3. Losing Calls
 
@@ -101,7 +118,9 @@ estimate) counts toward the spend caps, not the loss budgets.
 
 `collect` replaces the profit rule with its own (claiming earns nothing new): claim a balance once it
 reaches `thresholdUsd` and covers the gas × `gasSafetyMultiplier`; claim a balance older than
-`maxAgeDays`, or anything on shutdown, whenever it covers the gas. Forwarding sends whenever the
+`maxAgeDays`, or anything on shutdown, whenever it covers the gas. With the profit rule off for
+`collect`, a claim no longer has to cover its gas: a balance at `thresholdUsd` is claimed, and any
+balance once aged or on shutdown. Forwarding sends whenever the
 wallet's USDC reaches `forwardMinUsd`. Both still fit the spend caps and the fee ceilings.
 [The Jobs](jobs.md#collect).
 
@@ -196,7 +215,7 @@ Every transaction the keeper sends becomes one line in `ledger.jsonl` in the sta
 | `market` | the market's label, or empty |
 | `wallet` | the sending wallet's address |
 | `tx`, `status` | the transaction and `confirmed`, `reverted` or `unknown` |
-| `kind` | `profit`, `loss`, `unpaid`, `forced`, `collect` or `forward` |
+| `kind` | `profit`, `loss`, `unpaid`, `unchecked`, `forced`, `collect` or `forward` |
 | `cost_usd` | the gas actually paid (or the estimate, for `unknown`) |
 | `reward_usd`, `claimed_usd` | the `FeeAccrued` and `FeesClaimed` amounts the receipt logged for this wallet |
 | `expected_reward_usd` | what the simulation said |

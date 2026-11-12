@@ -320,6 +320,33 @@ describe("spend policy", () => {
     expect(d.send).toBe(false);
   });
 
+  it("the profit rule is on by default, and a job can switch it off alone", () => {
+    const { cfg, p } = policy({ jobs: { triggers: { enforceProfit: false }, liquidation: {} } });
+    expect(cfg.profit.enforce).toBe(true);
+    const d = p.decide("triggers", cfg.jobs.triggers, new Quote(0, 0.02));
+    expect(d).toEqual({ send: true, kind: "unchecked", reason: "profit rule off: earns $0.0000 for $0.0200 of gas" });
+    expect(p.decide("triggers", cfg.jobs.triggers, new Quote(0.05, 0.01)).kind).toBe("profit");
+    expect(p.decide("liquidation", cfg.jobs.liquidation, new Quote(0, 0.02)).send).toBe(false);
+  });
+
+  it("with the profit rule off, only the spend caps and a named duty's own cap hold", () => {
+    const { cfg, p } = policy({
+      profit: { enforce: false },
+      jobs: { triggers: {}, liquidation: { enforceProfit: true } },
+      budget: { maxSpendUsdPerDay: 1, maxLossUsdPerDay: 0.01 },
+    });
+    // Far past the per-call loss cap and the global loss budget: neither applies.
+    expect(p.decide("triggers", cfg.jobs.triggers, new Quote(0, 0.5)).kind).toBe("unchecked");
+    expect(p.decide("triggers", cfg.jobs.triggers, new Quote(0, 0.5), { paid: false }).kind).toBe("unchecked");
+    expect(p.decide("liquidation", cfg.jobs.liquidation, new Quote(0, 0.5)).send).toBe(false); // the job's switch wins
+    expect(p.decide("triggers", cfg.jobs.triggers, new Quote(0, 2)).reason).toContain("daily gas budget reached");
+    const duty = p.decide("triggers", cfg.jobs.triggers, new Quote(0, 0.2), { paid: false, consentCapUsd: 0.1 });
+    expect(duty.reason).toContain("per-call cap");
+    // An unchecked call's loss counts against no loss budget.
+    const e = new Entry({ ts: 0, job: "triggers", market: "", wallet: "", tx: "", status: "confirmed", kind: "unchecked", costUsd: 0.5 });
+    expect(e.lossUsd).toBe(0);
+  });
+
   it("loss taking within its caps", () => {
     const { cfg, p } = policy({ jobs: { adl: { allowLoss: true, maxLossUsdPerCall: 0.05, lossBudgetUsdPerDay: 0.08 } } });
     const job = cfg.jobs.adl;

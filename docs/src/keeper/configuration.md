@@ -216,6 +216,7 @@ out, null, or `enabled: false`. Every job takes the common keys; most also have 
 | `dryRun` | boolean | `false` | plan and simulate, never send (as `start --dry-run` does for every job) |
 | `minProfitUsd` | number | `profit.minProfitUsd` | this job's profit rule |
 | `gasSafetyMultiplier` | number | `profit.gasSafetyMultiplier` | this job's profit rule |
+| `enforceProfit` | boolean | `profit.enforce` | `false` sends this job's calls whatever they earn, held only by the daily spend caps |
 | `allowLoss` | boolean | `false` (`true` for `sweepExpired`) | also send calls that cost more than they earn, within the caps below |
 | `maxLossUsdPerCall` | number ≥ 0 | `0.05` | the most one losing call may lose |
 | `lossBudgetUsdPerDay` | number ≥ 0 | `1.0` (`0.25` for `sweepExpired`) | the most this job may lose in 24 hours; also the budget for its unpaid duties (`finalize`, health pokes) |
@@ -298,8 +299,9 @@ address.
 |---|---|---|---|
 | `minProfitUsd` | number | `0.001` | a paid call is sent when reward − gas ≥ this… |
 | `gasSafetyMultiplier` | number ≥ 1 | `1.25` | …and reward ≥ gas × this |
+| `enforce` | boolean | `true` | `false` switches the rule off: every call is sent whatever it earns or costs, held only by the daily spend caps |
 
-Each job can override both. [Budgets & Losing Calls](budgets.md#2-the-profit-rule).
+Each job can override all three (`enforceProfit` for `enforce`). [Budgets & Losing Calls](budgets.md#2-the-profit-rule).
 
 ## `gas`
 

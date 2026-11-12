@@ -138,6 +138,8 @@ const jobShape = {
   dryRun: z.boolean().default(false),
   minProfitUsd: z.number().nullish(),
   gasSafetyMultiplier: z.number().nullish(),
+  /** This job's switch for the profit rule; left out, profit.enforce decides. */
+  enforceProfit: z.boolean().nullish(),
   /**
    * Losing calls: a call whose gas costs more than it earns is skipped unless allowLoss is on. Then
    * it is sent as long as the loss fits both caps.
@@ -230,7 +232,15 @@ export const JobsConfig = z
   .strict();
 
 export const ProfitConfig = z
-  .object({ minProfitUsd: z.number().default(0.001), gasSafetyMultiplier: z.number().gte(1).default(1.25) })
+  .object({
+    minProfitUsd: z.number().default(0.001),
+    gasSafetyMultiplier: z.number().gte(1).default(1.25),
+    /**
+     * Whether a call must pass the profit rule to be sent. false sends every call whatever it earns
+     * or costs, held only by the daily spend caps; a job's enforceProfit overrides it.
+     */
+    enforce: z.boolean().default(true),
+  })
   .strict();
 
 export const GasConfig = z

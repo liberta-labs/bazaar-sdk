@@ -13,7 +13,7 @@ export {
   lockKey,
 } from "./executor.js";
 export { DAY, Entry, type EntryInit, type EntryKind, type EntryStatus, Ledger, type SummaryRow } from "./ledger.js";
-export { type DecideOptions, type Decision, type DecisionKind, Quote, SpendPolicy } from "./policy.js";
+export { type DecideOptions, type Decision, type DecisionKind, Quote, SpendPolicy, enforcesProfit } from "./policy.js";
 export {
   KEYS_DIR,
   type KeystoreV3,
