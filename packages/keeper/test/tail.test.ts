@@ -104,6 +104,27 @@ describe("log tail", () => {
     expect(Math.max(...calls.slice(-5).map(([s, e]) => e - s + 1))).toBe(2_000); // back to full chunks well before the end
   });
 
+  it("keeps a reduced range across scans, logging the refusal once", async () => {
+    // A provider that serves at most 10 blocks a request, tailed 15 blocks a tick.
+    const chain = new FakeChain(new Map(), 10);
+    const lines: string[] = [];
+    const tail = new LogTail(chain, new Store(), { factory: FACTORY, terminator: TERMINATOR }, new Set(), 2_000, {
+      info: (m) => lines.push(m),
+      warn: (m) => lines.push(m),
+    });
+    const ticks = 40;
+    for (let t = 0; t < ticks; t++) await tail.scan(t * 15, t * 15 + 14, [PAIR]);
+    const refusedCalls = chain.calls.filter(([s, e]) => e - s + 1 > 10).length;
+    // The first tick's refusal, then only the wider try after every REGROW_AFTER full-size requests.
+    const fullSize = chain.calls.filter(([s, e]) => e - s + 1 === 7).length;
+    expect(refusedCalls).toBeLessThanOrEqual(1 + Math.ceil(fullSize / REGROW_AFTER));
+    expect(refusedCalls).toBeLessThan(ticks / 2);
+    expect(lines).toEqual([expect.stringContaining("the node refused logs for 15 blocks")]);
+    const ok = chain.calls.filter(([s, e]) => e - s + 1 <= 10);
+    for (let i = 1; i < ok.length; i++) expect(ok[i]![0]).toBe(ok[i - 1]![1] + 1); // every block read once
+    expect(ok[ok.length - 1]![1]).toBe(ticks * 15 - 1);
+  });
+
   it("raises failures that are not refusals at once", async () => {
     const chain = new FakeChain(new Map(), null, [0]);
     await expect(tailFor(chain).scan(0, 4_999, [PAIR])).rejects.toThrow(TypeError);

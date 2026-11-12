@@ -85,8 +85,9 @@ emptied): later starts resume from the snapshot.
 
 The node must support `eth_call` state overrides for rewards to be measured ([What the Keeper
 Does](overview.md#what-you-need)). A log range it refuses (too many blocks or logs) is halved and asked
-for again, down to one block, and widened again after eight successes in a row; a lower `logChunk`
-avoids the refused requests. Rate-limit answers (HTTP 429), timeouts and connection failures are
+for again, down to one block. The reduced range is kept for later requests, and tried twice as wide
+again after eight full-size successes in a row; only the first refusal is logged. A `logChunk` within the
+provider's block limit avoids the refused requests. Rate-limit answers (HTTP 429), timeouts and connection failures are
 not refusals: the sync step fails and the next tick resumes after the last chunk applied.
 
 ## `subgraph`

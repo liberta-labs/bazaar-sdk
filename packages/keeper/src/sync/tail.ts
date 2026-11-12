@@ -47,6 +47,12 @@ export class LogTail {
    * returns it.
    */
   private pending: Effects | null = null;
+  /** Blocks a log request asks for after the node refused a wider range; null asks for `chunk`. */
+  private size: number | null = null;
+  /** Requests in a row that succeeded at the full reduced size. */
+  private run = 0;
+  /** Whether a refusal has been logged. */
+  private toldRefusal = false;
 
   constructor(
     public chain: Pick<Chain, "logs" | "block">,
@@ -74,10 +80,13 @@ export class LogTail {
   /**
    * Apply the logs of `addresses` from `fromBlock` to `toBlock`, at most `chunk` blocks a request.
    *
-   * A range the node refuses is halved and asked for again, down to one block. After REGROW_AFTER
-   * requests in a row succeed at a smaller range it tries one twice as wide, since a refusal for too
-   * many logs may have been one busy stretch. With `trackHead`, store.head moves to the end of each
-   * chunk as it is applied, so a failure part-way leaves what was applied recorded.
+   * A range the node refuses is halved and asked for again, down to one block. The reduced range
+   * carries over to later scans: a provider with a fixed block limit would otherwise refuse the first
+   * request of every tick. After REGROW_AFTER requests in a row succeed at the full reduced range it
+   * tries one twice as wide, since a refusal for too many logs may have been one busy stretch. Only
+   * the first refusal is logged; the later ones are those wider tries. With `trackHead`, store.head
+   * moves to the end of each chunk as it is applied, so a failure part-way leaves what was applied
+   * recorded.
    */
   async scan(
     fromBlock: number,
@@ -90,22 +99,20 @@ export class LogTail {
     const { store, wallets } = this;
     const { factory, terminator } = this.dep;
     let start = fromBlock;
-    let size = this.chunk;
-    let run = 0;
-    let told = false;
     while (start <= toBlock) {
+      const size = Math.min(this.size ?? this.chunk, this.chunk);
       const end = Math.min(toBlock, start + size - 1);
       let logs: RawLog[];
       try {
         logs = await this.chain.logs(start, end, addresses);
       } catch (e) {
         if (end === start || !refused(e)) throw e;
-        size = Math.max(1, Math.floor((end - start + 1) / 2));
-        run = 0;
-        if (!told) {
-          told = true;
+        this.size = Math.max(1, Math.floor((end - start + 1) / 2));
+        this.run = 0;
+        if (!this.toldRefusal) {
+          this.toldRefusal = true;
           this.log.info(
-            `the node refused logs for ${end - start + 1} blocks (${errorText(e)}); asking for ${size} at a time. ` +
+            `the node refused logs for ${end - start + 1} blocks (${errorText(e)}); asking for ${this.size} at a time. ` +
               "A lower rpc.logChunk avoids the refused requests",
           );
         }
@@ -117,11 +124,14 @@ export class LogTail {
         store.head = end;
         store.headHash = "";
       }
+      const width = end - start + 1;
       start = end + 1;
-      run += 1;
-      if (size < this.chunk && run >= REGROW_AFTER) {
-        size = Math.min(this.chunk, size * 2);
-        run = 0;
+      // A short request (the end of the range) says nothing about whether the full size still works.
+      if (this.size === null || this.size >= this.chunk || width < size) continue;
+      this.run += 1;
+      if (this.run >= REGROW_AFTER) {
+        this.size = Math.min(this.chunk, this.size * 2);
+        this.run = 0;
       }
     }
     return fx;
