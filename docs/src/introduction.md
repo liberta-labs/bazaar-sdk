@@ -5,9 +5,10 @@ any asset with a Pyth price feed can be listed and traded on a fully on-chain ce
 book, margined in USDC. The contracts are immutable, with no owner, pauser or upgrade key, and every
 role an exchange keeps for itself (listing, insuring, liquidating, firing stops) is open to anyone.
 
-The protocol is not yet deployed: there is no official deployment on any network, so these pages use
-placeholder factory addresses until Bazaar's
-[deployments page](https://docs.bazaar.finance/reference/networks.html) lists one.
+The protocol runs on the Arbitrum Sepolia testnet; there is no mainnet deployment yet. Bazaar's
+[deployments page](https://docs.bazaar.finance/reference/networks.html) lists the official
+addresses, and the `arbitrum-sepolia` network preset carries the testnet's factory. Examples that
+take a factory address use a placeholder.
 
 This site documents the TypeScript tools for building on it. They come in two packages:
 

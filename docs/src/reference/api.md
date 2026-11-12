@@ -59,11 +59,13 @@ regenerated.
 | [`requirePair`](security.md) | function | `pair`, checksummed, once the context's factory confirms it is one of its pairs (`factory.isPair`); an `InputError` on `pair` otherwise. |
 | [`NetworkPreset`](../sdk/connecting.md) | interface | A built-in network: name, chain id, factory (null until launch), start block, subgraph URL, whether official, and the sequencer URL. |
 | [`NETWORKS`](../sdk/connecting.md) | const | The built-in networks: `arbitrum-one`, `arbitrum-sepolia` and `anvil`. |
+| [`officialNetwork`](../sdk/connecting.md) | function | The network whose official deployment runs on a chain id, or null when that chain has none yet; what `connect` uses when no factory is given. |
+| [`OfficialNetwork`](../sdk/connecting.md) | type | A `NetworkPreset` whose official deployment is live, so its `factory` is an address. |
 | [`PRICE_ENDPOINTS`](../sdk/connecting.md) | const | `prices.endpoint` shortcuts, each a set of Pyth Pro endpoints: `pyth`, Pyth's own, which need a Pyth Pro API key. |
 | [`ProEndpoints`](../sdk/connecting.md) | interface | Where Pyth Pro is served: its stream endpoints, its request API, and its symbols registry. |
 | [`PYTH_PRO`](../sdk/connecting.md) | const | Pyth's own Pyth Pro endpoints: their request API and stream serve only the holder of a Pyth Pro API key. |
 | [`isPythProPriceEndpoint`](../sdk/connecting.md) | function | Whether a URL is one of Pyth's own price endpoints (the host of `PYTH_PRO`'s request API or of one of its stream endpoints), which a `ProClient` serves only with a token. |
-| [`connect`](../sdk/connecting.md) | function | Read the deployment's wiring from its factory and return a context bound to it. |
+| [`connect`](../sdk/connecting.md) | function | Read the deployment's wiring from its factory (the chain's official one when none is given) and return a context bound to it. |
 | [`requirePrices`](../sdk/connecting.md) | function | The context's price source; throws `ConnectError` when the context was connected without one. |
 | [`requireSubgraph`](../sdk/connecting.md) | function | The context's subgraph source; throws `ConnectError` when the context was connected without one. |
 | [`PriceUpdateSource`](../sdk/connecting.md) | interface | Signed Pyth Pro price updates, as the pair's calls carry them: `latest`, and optionally `atTick` and `useSignerCheck`. |
@@ -72,7 +74,7 @@ regenerated.
 | [`VERIFIER_SIGNER_ABI`](../sdk/connecting.md) | const | The verifier's `isValidSigner` view. |
 | [`SubgraphSource`](../sdk/connecting.md) | interface | A GraphQL endpoint serving Bazaar's subgraph. |
 | [`BazaarContext`](../sdk/connecting.md) | interface | A connection: the `Chain`, the chain id, the deployment's addresses (factory, lens, terminator, oracle, USDC), and the optional price source, subgraph and integrator. |
-| [`ConnectOptions`](../sdk/connecting.md) | interface | What `connect` takes: `transport`, `factory`, and the optional `prices`, `subgraph`, `integrator`, `chainId` and `checkSigners`. |
+| [`ConnectOptions`](../sdk/connecting.md) | interface | What `connect` takes: `transport`, and the optional `factory` (the chain's official one by default), `prices`, `subgraph` (the official subgraph by default, for the official factory), `integrator`, `chainId` and `checkSigners`. |
 | [`ConnectError`](../sdk/connecting.md) | class | Connecting failed, or a call needs a price source or subgraph the context was connected without. |
 
 ### Calls, Price Updates and Units

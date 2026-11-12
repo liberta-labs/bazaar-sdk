@@ -19,10 +19,10 @@ const MY_FEE_ADDRESS: Address = "0x0000000000000000000000000000000000000001";
 // ANCHOR: options
 const bz = await Bazaar.connect({
   transport: window.ethereum, // an EIP-1193 provider, a viem client, a JsonRpc, or a JSON-RPC URL
-  factory: FACTORY, // the deployment: everything else is read from it
+  factory: FACTORY, // optional: the deployment, everything else is read from it (default: the chain's official one)
   chainId: 42161, // optional: refuse any other chain
   prices: PRICES, // optional: Pyth Pro client options, a ProClient, or any source
-  subgraph: "https://subgraph.example.com/bazaar", // optional: a URL, { url, apiKey }, or a source
+  subgraph: "https://subgraph.example.com/bazaar", // optional: a URL, { url, apiKey }, a source, or null (default: the official one, for the official factory)
   integrator: MY_FEE_ADDRESS, // optional: named on every order this connection creates
 });
 

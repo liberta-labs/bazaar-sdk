@@ -11,8 +11,8 @@ Before you start, have at hand:
   your API key; the wizard keeps them out of the config file);
 - a Pyth Pro API key (from Pyth; a Pyth Core or Hermes key does not work), which Pyth's own price
   endpoints require, or the URL of another Pyth Pro compatible price service;
-- the factory address of the Bazaar deployment you want to keep (the network presets carry no
-  official address yet);
+- the factory address of the Bazaar deployment you want to keep, unless it is the official
+  Arbitrum Sepolia testnet, whose preset carries it (there is no mainnet deployment yet);
 - a little ETH on that network for gas.
 
 ## 1. Install
@@ -71,7 +71,7 @@ no leaves everything as it was).
 
 ### Factory Address
 
-Asked for a custom network, and for any preset without an official factory (at present all of them).
+Asked for a custom network, and for any preset without an official factory (at present `arbitrum-one`).
 It must be an address; it is written as `factory: "0x…"`. Everything else (the lens, the terminator,
 the oracle, the markets and their feeds) is read from the factory.
 
@@ -93,7 +93,7 @@ straight to the sequencer** (default yes), which writes `rpc.send: sequencer`.
 
 | Answer | Writes |
 |---|---|
-| Bazaar's subgraph for this network (offered only when the network preset has one; none does yet) | `subgraph.url: default` |
+| Bazaar's subgraph for this network (offered only when the network preset has one; at present only `arbitrum-sepolia`'s does) | `subgraph.url: default` |
 | None: index from chain logs | `subgraph.url: none` |
 | Custom URL | `subgraph.url: ${SUBGRAPH_URL}`, the URL in `.env` |
 
@@ -182,13 +182,12 @@ from anywhere. A typical result:
 # Written by bazaar keeper init. Secrets live in .env next to this file.
 
 network: arbitrum-sepolia
-factory: "0x0000000000000000000000000000000000000000"
 
 rpc:
   http: ${RPC_HTTP_URL}
 
 subgraph:
-  url: none
+  url: default
 
 prices:
   endpoint: pyth
@@ -250,9 +249,9 @@ URLs and keys are masked in everything it prints.
 
 ```text
 ✔ RPC            chain 421614, latency 84 ms, eth_call state overrides supported
-✔ Factory        0x0000000000000000000000000000000000000000 not an official deployment, 3 market(s)
+✔ Factory        0x9f077B7D49EE7B451ae0858e391dC6960F144612 official deployment, 3 market(s)
 ✔ Wiring         lens and terminator both point back at this factory
-⚠ Subgraph       none configured: the first start indexes from chain logs
+✔ Subgraph       synced to block 123,987,690 (10 blocks behind)
 ✔ Prices         3/3 markets have a print
 ✔ Prices         the fixed_rate@200ms stream is delivering
 ✔ Wallet default 0x14dC79964da2C08b23698B3D3cc7Ca32193d9955, 0.02000 ETH (roughly 3,333 calls at today's base fee)
@@ -291,15 +290,18 @@ bazaar keeper start
 
 The first start connects, checks the chain and the factory's wiring, and builds its index: from the
 subgraph if one is configured, or by replaying the chain's logs from the factory's deployment block.
-Without `startBlock`, it first finds that block with about 30 historical `eth_getCode` reads. The log
-shows each step:
+Without `startBlock` (which a preset with an official factory supplies), it first finds that block
+with about 30 historical `eth_getCode` reads. A subgraph that cannot be reached is not fatal: the
+keeper logs a warning and indexes from chain logs instead. On the testnet preset, whose subgraph is
+the default, the log shows:
 
 ```text
-12:00:01 INFO    found the factory's deployment block, 123456789 (set startBlock: 123456789 in the config to skip the search)
-12:00:01 INFO    indexing from chain logs, blocks 123456789 to 123987654
-12:00:41 WARNING factory 0x0000000000000000000000000000000000000000 is not an official deployment
-12:00:41 INFO    keeper running on arbitrum-sepolia (3 markets, jobs: liquidation, triggers, unload, adl, refresh, collect, terminalSettlement)
+12:00:02 INFO    loaded 41 open positions and 230 live orders from the subgraph at block 123987654
+12:00:02 INFO    keeper running on arbitrum-sepolia (3 markets, jobs: liquidation, triggers, unload, adl, refresh, collect, terminalSettlement)
 ```
+
+Indexing from chain logs instead (`subgraph.url: none`, or a custom factory with no `startBlock`)
+logs `found the factory's deployment block, …` and `indexing from chain logs, blocks … to …` first.
 
 From then on it logs each sent call and its result, and each distinct skip reason at most every five
 minutes (the rest at debug level):
@@ -327,7 +329,6 @@ bazaar keeper status
 
 ```text
 Bazaar keeper · arbitrum-sepolia · block 123,987,700 · indexed 123,987,699 · prices live · running
-factory 0x0000000000000000000000000000000000000000 is not an official deployment
  JOB                 MARKETS  LAST ACTION                                                  TODAY EARNED    GAS    NET
  liquidation               3  ETH/USD liquidate 2 account(s), $4,100 notional (confirmed)         $0.10  $0.00  $0.10
  triggers                  3  -                                                                   $0.00  $0.00  $0.00

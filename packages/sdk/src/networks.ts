@@ -2,7 +2,8 @@
  * Built-in networks and price endpoints.
  *
  * The factory addresses must match the Bazaar docs' deployments page, the canonical registry of
- * official deployments. Until a network launches its factory is null and a config must give one.
+ * official deployments. Until a network launches its factory is null, and a keeper config or a
+ * connect call must name one.
  */
 
 import type { Address } from "viem";
@@ -31,9 +32,9 @@ export const NETWORKS: Readonly<Record<string, NetworkPreset>> = {
   "arbitrum-sepolia": {
     name: "arbitrum-sepolia",
     chainId: 421614,
-    factory: null,
-    startBlock: 0,
-    subgraphUrl: null,
+    factory: "0x9f077B7D49EE7B451ae0858e391dC6960F144612",
+    startBlock: 328418565,
+    subgraphUrl: "https://api.studio.thegraph.com/query/1764016/bazaar-arbitrum-sepolia/v0.1.0",
     official: true,
     sendUrl: null,
   },
@@ -47,6 +48,17 @@ export const NETWORKS: Readonly<Record<string, NetworkPreset>> = {
     sendUrl: null,
   },
 };
+
+/** A network whose official deployment is live: it carries that deployment's factory. */
+export type OfficialNetwork = NetworkPreset & { readonly factory: Address };
+
+/** The network whose official deployment runs on `chainId`, or null when that chain has none yet. */
+export function officialNetwork(chainId: number): OfficialNetwork | null {
+  for (const n of Object.values(NETWORKS)) {
+    if (n.official && n.factory !== null && n.chainId === chainId) return n as OfficialNetwork;
+  }
+  return null;
+}
 
 /** Where Pyth Pro is served: its price stream, its request API, and its symbols registry. */
 export interface ProEndpoints {

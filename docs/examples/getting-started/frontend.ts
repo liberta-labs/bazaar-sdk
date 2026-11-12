@@ -18,8 +18,7 @@ import {
 import { type Address, type Hex, getAddress, toHex } from "viem";
 
 // ANCHOR: config
-const FACTORY: Address = "0x0000000000000000000000000000000000000000"; // from Bazaar's deployments page
-const CHAIN_ID = 421614; // Arbitrum Sepolia
+const CHAIN_ID = 421614; // Arbitrum Sepolia, where the SDK knows the official deployment
 // The relayer that sends orders: it attaches the fresh signed Pyth price an order carries, which only
 // a server holding the Pyth Pro key can fetch. The page holds no key and never builds a priced call.
 const RELAYER_URL = "https://relayer.example.com/relay";
@@ -51,7 +50,8 @@ async function connect(): Promise<void> {
   user = getAddress(accounts[0]!);
   // Ask the wallet for the right network first: connect() refuses any other chain.
   await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: toHex(CHAIN_ID) }] });
-  bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, chainId: CHAIN_ID });
+  // No factory: the SDK connects to the chain's official deployment, and its subgraph.
+  bz = await Bazaar.connect({ transport: window.ethereum, chainId: CHAIN_ID });
   status(`Connected as ${user}`);
 }
 // ANCHOR_END: connect

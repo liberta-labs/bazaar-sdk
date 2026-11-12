@@ -7,8 +7,7 @@ through a relayer. At the end the page follows the account live. It is one TypeS
 lines in all.
 
 You need a browser wallet (MetaMask, Rabby, ...) on Arbitrum Sepolia with a little ETH for gas and
-some of the deployment's USDC, the deployment's factory address (Bazaar's
-[deployments page](https://docs.bazaar.finance/reference/networks.html)), and a relayer to send
+some of the deployment's USDC, and a relayer to send
 orders through. An order carries a fresh signed Pyth Pro price, and only a server may hold the Pyth Pro
 API key, so the page never builds an order itself: the user signs it, and the relayer attaches the
 price and sends it (see [Gasless Trading & Relayers](../sdk/gasless.md)).
@@ -91,7 +90,9 @@ ever sets `textContent`.
 wallet to the right network (it fails with error 4902 when the wallet does not know the chain; add it
 first with `wallet_addEthereumChain`). `Bazaar.connect` then reads the deployment's wiring from the
 factory in one batched call and checks the chain: with `chainId` set, it throws a `ConnectError` on
-any other. The result, `bz`, carries every area of the SDK with this connection bound
+any other. Given no `factory`, it uses the official deployment on the wallet's chain, listed on
+Bazaar's [deployments page](https://docs.bazaar.finance/reference/networks.html), and that
+deployment's subgraph; pass `factory` to use another deployment. The result, `bz`, carries every area of the SDK with this connection bound
 (`bz.markets`, `bz.account`, `bz.trade`, ...). All options are on [Connecting](../sdk/connecting.md).
 
 ## 5. List the Markets
@@ -203,7 +204,7 @@ appears in the position view as soon as the transaction lands.
 |---|---|
 | "You rejected the request in your wallet." | The user declined a prompt (EIP-1193 error 4001). |
 | "This network has not been added to your wallet yet. Add it and try again." | `wallet_switchEthereumChain` failed with 4902. |
-| "Something went wrong. Please try again." on connect | A `ConnectError`: the wallet is on another chain, or `FACTORY` is not a Bazaar factory on this chain. Log `e.message` for which. |
+| "Something went wrong. Please try again." on connect | A `ConnectError`: the wallet is on another chain, or a `factory` you passed is not a Bazaar factory on this chain. Log `e.message` for which. |
 | "Something went wrong..." on the first market list | The RPC could not be reached (labels fall back to short addresses when only Pyth's symbols registry fails). |
 | A sentence naming a field, such as "limitPrice: A limit price must be within 50% of the market price: ..." | An `InputError`: the SDK refused the order before building it. |
 | "This order needs $... of collateral ..." | The simulation reverted: not enough collateral for the order's margin. Deposit first. |

@@ -21,7 +21,8 @@ What a connection is, and what the SDK caches on it, is on [Core Concepts](../ge
 2. Wraps the transport in a `Chain`: a URL becomes the SDK's own HTTP client (`JsonRpc`), anything
    else is used as given.
 3. Reads the chain id and, in one batched call alongside it, the factory's `lens`, `pairTerminator`,
-   `oracle` and `usdc`. (The first batch also detects how this node batches; see
+   `oracle` and `usdc`. Without a `factory` it reads the chain id first and uses that chain's
+   official factory. (The first batch also detects how this node batches; see
    [Transports](#transports).)
 4. Checks the chain id against `chainId`, when given, and that the factory answered all four reads.
 
@@ -31,11 +32,11 @@ the market list loads on the first `listMarkets` (or anything that resolves a ma
 | Option | Type | Default | Meaning |
 |---|---|---|---|
 | `transport` | `Transport \| string` | required | An EIP-1193 provider (a browser wallet's, a viem client, a `JsonRpc`) or a JSON-RPC URL. See [Transports](#transports). |
-| `factory` | `Address` | required | The deployment's `BazaarFactory`. Everything else is read from it. Take it from Bazaar's [deployments page](https://docs.bazaar.finance/reference/networks.html): anyone can deploy a fork. |
+| `factory` | `Address \| null` | the chain's official factory | The deployment's `BazaarFactory`. Everything else is read from it. Left out, the official factory of the chain the transport is on, from the SDK's network presets (`officialNetwork(chainId)`), which match Bazaar's [deployments page](https://docs.bazaar.finance/reference/networks.html); on a chain with no official deployment (at present every chain but Arbitrum Sepolia) connect throws a `ConnectError`. Name a factory to use any other deployment: anyone can deploy a fork. |
 | `chainId` | `number` | none | Refuse to connect on any other chain. |
 | `prices` | `ProClientOptions \| ProClient \| PriceUpdateSource \| null` | `null` | Where signed Pyth Pro updates come from. Options (`{ token, ... }`) or a `ProClient` are made into a `proPriceSource`. Without one the connection is read-only for prices: every call that carries a price throws a `ConnectError`. See [Prices](#prices). |
 | `checkSigners` | `boolean` | `true` | Have the price source use only updates signed by a signer the deployment's Pyth verifier trusts. See [Prices](#prices). |
-| `subgraph` | `string \| { url, apiKey? } \| SubgraphSource \| null` | `null` | Bazaar's subgraph. A string or `{ url, apiKey }` is made into an `httpSubgraph`. Needed only for history (and for market descriptions in the market list). See [The Subgraph](#the-subgraph). |
+| `subgraph` | `string \| { url, apiKey? } \| SubgraphSource \| null` | the official subgraph, for the official factory | Bazaar's subgraph. A string or `{ url, apiKey }` is made into an `httpSubgraph`. Left out, the network's official subgraph when the factory is its official one, and none for any other factory; `null` for none. Needed only for history (and for market descriptions in the market list). See [The Subgraph](#the-subgraph). |
 | `integrator` | `Address \| null` | the zero address | Named on every order this connection creates; earns the integrator fee on their fills. See [The Integrator Address](#the-integrator-address). |
 
 The returned object has:
@@ -63,11 +64,11 @@ context in the facade.
 | Option | Type | Default |
 |---|---|---|
 | `transport` | `Transport \| string` | required |
-| `factory` | `Address` | required |
+| `factory` | `Address \| null` | the chain's official factory |
 | `chainId` | `number` | none |
 | `prices` | `PriceUpdateSource \| null` | `null` |
 | `checkSigners` | `boolean` | `true` |
-| `subgraph` | `SubgraphSource \| null` | `null` |
+| `subgraph` | `SubgraphSource \| null` | the official subgraph, for the official factory |
 | `integrator` | `Address \| null` | the zero address |
 
 The SDK keeps its caches per context object. Two contexts built from the same options (or a copy made
@@ -222,6 +223,11 @@ also takes it in the URL path; such a URL is masked in errors). Its options:
 | `headers` | none | Extra request headers. |
 | `fetch` | `globalThis.fetch` | The fetch to use. |
 
+Left out, `subgraph` is the official subgraph of the network whose official factory the connection
+uses (`officialNetwork(chainId).subgraphUrl`), queried through `httpSubgraph`. A connection to any
+other factory gets none by default, since the official subgraph indexes the official deployment only.
+Pass `null` to connect without one.
+
 The same rule about keys applies as for prices. Without a subgraph, every `history` function throws a
 `ConnectError`; the rest of the SDK is unaffected. See [History](history.md).
 
@@ -238,7 +244,8 @@ market.
 
 With `chainId` given, `connect` throws a `ConnectError` when the transport is on another chain. Give
 it in a frontend: a wallet can be on any network, and a factory address means nothing on the wrong
-one. The SDK does not follow the wallet's `chainChanged` events: listen for them yourself and connect
+one. Without a `factory`, the wallet's chain picks the deployment, so `chainId` is what keeps a wallet
+on another chain from connecting to that chain's official deployment instead of failing. The SDK does not follow the wallet's `chainChanged` events: listen for them yourself and connect
 again.
 
 Signing (permits, gasless requests) also checks the clocks: deadlines are counted from the lower of
@@ -272,6 +279,7 @@ further check.
 |---|---|---|
 | `ConnectError` | `connected to chain 421614, expected 42161` | The transport (the wallet) is on another chain. |
 | `ConnectError` | `0x... does not answer as a Bazaar factory on chain 42161` | The factory's reads reverted: the address is some other contract. |
+| `ConnectError` | `chain 42161 has no official Bazaar deployment: pass the factory of the deployment to use` | No `factory` was given, and the transport's chain has no official deployment. |
 | viem's `AbiDecodingZeroDataError` | `Cannot decode zero data ("0x") ...` | The factory address has no contract on this chain at all (the reads "succeed" with empty answers). |
 | viem's `InvalidAddressError` | `Address "..." is invalid.` | `factory` or `integrator` is not an address. |
 | `HttpError` | `HTTP 401 from https://.../v2/***: the provider refused the request; check the key in the URL` | The RPC refused the request. |

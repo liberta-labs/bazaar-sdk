@@ -17,7 +17,8 @@ number, received string` a value of the wrong type. Every key is in [Configurati
 Reference](configuration.md).
 
 **`… has no official factory address in this release yet; set factory to the deployment you want to keep`**
-No network preset carries an official factory address yet. Add `factory: "0x…"` (quoted).
+Only the `arbitrum-sepolia` preset carries an official factory address; `arbitrum-one` has none until
+mainnet launches. Add `factory: "0x…"` (quoted).
 
 **`a custom network needs chainId and factory`**
 `network: custom` needs both.

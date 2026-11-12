@@ -45,13 +45,13 @@ Three YAML details matter here:
 |---|---|---|---|
 | `network` | string | required | `arbitrum-one`, `arbitrum-sepolia`, `anvil`, or `custom` |
 | `chainId` | integer | the preset's | required for `custom`; on a preset it replaces the preset's chain id |
-| `factory` | address | the preset's | the deployment's factory. Required for `custom`, and for any preset without an official factory (at present all of them) |
+| `factory` | address | the preset's | the deployment's factory. Required for `custom`, and for any preset without an official factory (at present `arbitrum-one`) |
 | `startBlock` | integer ≥ 0 | see below | where a first start without a subgraph begins reading logs: the factory's deployment block |
 
 | Preset | Chain id | Sequencer endpoint (`rpc.send: sequencer`) | Official factory |
 |---|---|---|---|
 | `arbitrum-one` | 42161 | `https://arb1-sequencer.arbitrum.io/rpc` | not yet |
-| `arbitrum-sepolia` | 421614 | none | not yet |
+| `arbitrum-sepolia` | 421614 | none | `0x9f077B7D49EE7B451ae0858e391dC6960F144612`, from block 328418565 |
 | `anvil` | 31337 | none | never (a local chain) |
 
 The keeper reads everything else from the factory: the lens, the terminator, the oracle, USDC, every
@@ -93,7 +93,7 @@ not refusals: the sync step fails and the next tick resumes after the last chunk
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `url` | string | `default` | `default` (the network preset's subgraph; no preset has one yet, so this means none), `none`, or any deployment of Bazaar's subgraph |
+| `url` | string | `default` | `default` (the network preset's subgraph; only `arbitrum-sepolia` has one, so on the other presets this means none), `none`, or any deployment of Bazaar's subgraph |
 | `apiKey` | string | none | sent as `Authorization: Bearer <key>`. A `${NAME}` reference |
 
 The subgraph only finds accounts and orders for the first start: the keeper reads its `_meta` block,

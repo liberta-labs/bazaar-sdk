@@ -74,7 +74,10 @@ export interface BazaarOptions extends Omit<ConnectOptions, "prices" | "subgraph
    * priced calls through a relayer, or points `restUrl` and `streamUrls` at a proxy of its own.
    */
   prices?: PriceUpdateSource | ProClient | ProClientOptions | null;
-  /** Bazaar's subgraph (URL, or { url, apiKey }), or any SubgraphSource. Needed only for history. */
+  /**
+   * Bazaar's subgraph (URL, or { url, apiKey }), or any SubgraphSource; null for none. Needed only for
+   * history. Left out, the official network's subgraph when the factory is its official one.
+   */
   subgraph?: SubgraphSource | string | { url: string; apiKey?: string | null } | null;
 }
 
@@ -117,7 +120,9 @@ function priceSource(p: BazaarOptions["prices"]): PriceUpdateSource | null {
   return pricesNs.proPriceSource(v as ProClientOptions);
 }
 
-function subgraphSource(s: BazaarOptions["subgraph"]): SubgraphSource | null {
+/** The context's subgraph; undefined, when left out, so that connect can supply the official one. */
+function subgraphSource(s: BazaarOptions["subgraph"]): SubgraphSource | null | undefined {
+  if (s === undefined) return undefined;
   if (!s) return null;
   if (typeof s === "string") return historyNs.httpSubgraph(s);
   if ("url" in s && typeof s.url === "string") return historyNs.httpSubgraph(s.url, s.apiKey ?? undefined);

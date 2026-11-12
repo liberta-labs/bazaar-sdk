@@ -9,7 +9,9 @@ import { factory as factoryCodec } from "../chain/codec.js";
 import type { Transport } from "../chain/rpc.js";
 import { ZERO_ADDRESS } from "../constants.js";
 import { installUserMessages } from "../errors/messages.js";
+import { officialNetwork } from "../networks.js";
 import type { ProUpdate, SignerCheck } from "../prices/pro.js";
+import { httpSubgraph } from "./history.js";
 import { verifierSignerCheck } from "./signers.js";
 
 /** Signed Pyth Pro price updates, as the pair's calls carry them. */
@@ -61,8 +63,16 @@ export interface BazaarContext {
 export interface ConnectOptions {
   /** An EIP-1193 provider (a browser wallet, a viem client) or a JSON-RPC URL. */
   transport: Transport | string;
-  factory: Address;
+  /**
+   * The deployment's BazaarFactory. Left out, the official factory of the chain the transport is on
+   * ({@link officialNetwork}); connect fails on a chain with no official deployment.
+   */
+  factory?: Address | null;
   prices?: PriceUpdateSource | null;
+  /**
+   * Bazaar's subgraph, for history; null for none. Left out, the official network's subgraph when the
+   * factory is that network's official one, and none for any other factory.
+   */
   subgraph?: SubgraphSource | null;
   integrator?: Address | null;
   /** Expected chain id: connect fails on any other chain. */
@@ -80,24 +90,46 @@ export class ConnectError extends Error {
   override readonly name = "ConnectError";
 }
 
+function expectChain(chainId: number, expected: number | undefined): void {
+  if (expected !== undefined && chainId !== expected) throw new ConnectError(`connected to chain ${chainId}, expected ${expected}`);
+}
+
+/** The official factory on `chainId`, for a connection that names none. */
+function officialFactory(chainId: number, expected: number | undefined): Address {
+  expectChain(chainId, expected);
+  const network = officialNetwork(chainId);
+  if (!network) throw new ConnectError(`chain ${chainId} has no official Bazaar deployment: pass the factory of the deployment to use`);
+  return network.factory;
+}
+
 /** Read the deployment's wiring from its factory and return a context bound to it. */
 export async function connect(opts: ConnectOptions): Promise<BazaarContext> {
   // Decoded reverts read as sentences for users from here on (idempotent; survives tree-shaking).
   installUserMessages();
   const chain = typeof opts.transport === "string" ? Chain.fromUrl(opts.transport) : new Chain(opts.transport);
-  const factory = getAddress(opts.factory);
+  // Without a factory the chain decides which deployment to read, so its id is read first; with one,
+  // both reads go out together.
+  const knownChainId = opts.factory == null ? await chain.chainId() : undefined;
+  const factory = getAddress(opts.factory ?? officialFactory(knownChainId!, opts.chainId));
   const f = factoryCodec();
   const names = ["lens", "pairTerminator", "oracle", "usdc"] as const;
   const [chainId, res] = await Promise.all([
-    chain.chainId(),
+    knownChainId ?? chain.chainId(),
     chain.batch(names.map((n) => ({ to: factory, data: f.encode(n) }))),
   ]);
-  if (opts.chainId !== undefined && chainId !== opts.chainId) {
-    throw new ConnectError(`connected to chain ${chainId}, expected ${opts.chainId}`);
-  }
+  expectChain(chainId, opts.chainId);
   if (!res.every(([ok]) => ok)) throw new ConnectError(`${factory} does not answer as a Bazaar factory on chain ${chainId}`);
   const [lens, terminator, oracle, usdc] = res.map(([, data], i) => f.decode<Address>(names[i]!, data));
   if (opts.checkSigners !== false) opts.prices?.useSignerCheck?.(verifierSignerCheck(chain, oracle!));
+  // The official subgraph indexes the official deployment alone: any other factory gets none unless
+  // one is given, rather than another deployment's history.
+  const network = officialNetwork(chainId);
+  const subgraph =
+    opts.subgraph !== undefined
+      ? opts.subgraph
+      : network?.subgraphUrl && getAddress(network.factory) === factory
+        ? httpSubgraph(network.subgraphUrl)
+        : null;
   return {
     chain,
     chainId,
@@ -107,7 +139,7 @@ export async function connect(opts: ConnectOptions): Promise<BazaarContext> {
     oracle: oracle!,
     usdc: usdc!,
     prices: opts.prices ?? null,
-    subgraph: opts.subgraph ?? null,
+    subgraph,
     integrator: opts.integrator ? getAddress(opts.integrator) : ZERO_ADDRESS,
     checkSigners: opts.checkSigners !== false,
   };

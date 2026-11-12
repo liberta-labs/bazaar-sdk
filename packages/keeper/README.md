@@ -52,7 +52,8 @@ readable line; add `--debug` for the full trace. URLs and keys are masked in eve
 ## Configuration in brief
 
 - **Network.** `arbitrum-one`, `arbitrum-sepolia`, `anvil`, or `custom` with `chainId`. Give `factory`
-  until the network's preset carries the official address. Everything else (lens, terminator, oracle,
+  unless the network's preset carries the official address (at present only `arbitrum-sepolia`'s
+  does). Everything else (lens, terminator, oracle,
   markets, feeds) is read from the factory, and the keeper refuses to start if the lens or terminator
   belongs to a different factory.
 - **RPC.** Any JSON-RPC provider. It needs `eth_call` state overrides to measure rewards before sending

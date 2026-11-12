@@ -3,7 +3,8 @@
 
 # ---- Where ----
 network: arbitrum-sepolia           # arbitrum-one | arbitrum-sepolia | anvil | custom
-factory: "0x0000000000000000000000000000000000000000"   # needed until the network's preset has one
+# factory: "0x…"                    # the arbitrum-sepolia preset carries the official testnet factory;
+#                                   # needed for arbitrum-one until mainnet launches, and for custom
 # chainId: 42161                    # custom networks only
 # startBlock: 0                     # the factory's deployment block, where a first start without a subgraph
 #                                   # begins reading logs (left out, the keeper finds it on chain)
@@ -13,7 +14,7 @@ rpc:
   # send: sequencer                 # Arbitrum One: submit straight to the sequencer; or any URL
 
 subgraph:
-  url: none                         # default | none | a GraphQL URL
+  url: default                      # default (the preset's subgraph, falling back to chain logs) | none | a GraphQL URL
 
 prices:
   endpoint: pyth                    # pyth (Pyth Pro, the default) | the URL of a Pyth Pro compatible service

@@ -4,8 +4,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NETWORKS } from "@liberta-labs/bazaar-sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ConfigError, loadConfig } from "../src/config/index.js";
+import { ConfigError, loadConfig, resolvedNetwork, subgraphUrl } from "../src/config/index.js";
 
 const FACTORY = "0x" + "12".repeat(20);
 const KEY = "abcDEF123456ghiJKL789";
@@ -132,11 +133,14 @@ describe("the secrets rule", () => {
     process.env.PYTH_PRO_TOKEN = KEY;
     process.env.KEEPER_KEYSTORE_PASSWORD = "pw";
     const f = join(dir, "bazaar-keeper.yaml");
-    // Its factory placeholder is the zero address: give it a real-looking one, as the comment asks.
-    writeFileSync(f, readFileSync(EXAMPLE, "utf8").replace(/factory: "0x0{40}"/, `factory: "${FACTORY}"`));
+    // It names arbitrum-sepolia and leaves the factory and the subgraph to that preset, so it loads as written.
+    writeFileSync(f, readFileSync(EXAMPLE, "utf8"));
     const cfg = loadConfig(f);
     expect(cfg.rpc.http).toBe(process.env.RPC_HTTP_URL);
     expect(cfg.prices).toMatchObject({ endpoint: "pyth", token: KEY, channel: "fixed_rate@200ms" });
     expect(cfg.wallets.default).toMatchObject({ type: "keystore", password: "pw" });
+    const preset = NETWORKS["arbitrum-sepolia"]!;
+    expect(resolvedNetwork(cfg)).toMatchObject({ factory: preset.factory, startBlock: preset.startBlock, official: true });
+    expect(subgraphUrl(cfg)).toBe(preset.subgraphUrl);
   });
 });
