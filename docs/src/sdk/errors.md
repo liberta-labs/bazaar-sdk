@@ -22,7 +22,7 @@ never returns a raw URL or a stack trace. Use it as the default, and add the cas
 
 | Error | From | Means |
 |---|---|---|
-| `InputError` | Every builder, `buildOrderSpec`, `parseRelayed`; `ProClient`, `proPriceSource` and `Bazaar.connect` for Pyth's own endpoints without a token | An argument the SDK refused before building or signing anything. `field` names it (`prices.token` for a missing Pyth Pro API key). |
+| `InputError` | Every builder, `buildOrderSpec`, `parseRelayed`; `ProClient`, `proPriceSource` and `Bazaar.connect` for Pyth's own endpoints without a token, or with a fixed string in a web page | An argument the SDK refused before building or signing anything. `field` names it (`prices.token` for a missing Pyth Pro API key, or for a key a page would make public). |
 | `DecodedError` | `Simulation.error`, `CallError.decoded`, `decodeError(data)` | A revert, decoded: the custom error's name, arguments and user message. Not thrown by the SDK itself; a simulation returns it. |
 | `CallError` | `sendCall` (`bz.send`), `buildAndSend`, `waitForReceipt`, `batching.sendCalls` | A send the wallet refused or that reverted, with `decoded` when the revert data came back. |
 | `SigningError` | `signTypedDataV4`, `signPermit`, `signRelayed` | The wallet declined to sign, or returned a signature Bazaar cannot verify (a smart-contract wallet's, a high-s one). |

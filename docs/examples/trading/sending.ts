@@ -8,7 +8,7 @@ const FACTORY: Address = "0x0000000000000000000000000000000000000000";
 const bz = await Bazaar.connect({
   transport: window.ethereum,
   factory: FACTORY,
-  prices: { token: pythToken },
+  prices: PRICES,
 });
 const [user] = (await window.ethereum.request({ method: "eth_requestAccounts" })) as Address[];
 const eth = await bz.markets.getMarket("ETH/USD");

@@ -72,9 +72,6 @@ export const PYTH_PRO: ProEndpoints = {
   symbolsUrl: "https://pyth.dourolabs.app",
 };
 
-/** Where a Pyth Pro API key is exchanged for a short-lived token (`POST`, the key as the bearer). */
-export const PYTH_PRO_TOKEN_URL = "https://pyth.dourolabs.app/auth/token";
-
 /** The hosts of Pyth's own request API and stream endpoints ({@link PYTH_PRO}). */
 const PYTH_PRO_PRICE_HOSTS: ReadonlySet<string> = new Set([PYTH_PRO.restUrl, ...PYTH_PRO.streamUrls].map((u) => new URL(u).hostname));
 

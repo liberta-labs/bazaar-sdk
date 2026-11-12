@@ -10,7 +10,7 @@ const MY_FRONTEND: Address = "0x0000000000000000000000000000000000000002";
 const bz = await Bazaar.connect({
   transport: window.ethereum,
   factory: FACTORY,
-  prices: { token: pythToken },
+  prices: PRICES,
   // A URL, { url, apiKey }, or any object with query(query, variables).
   subgraph: "https://subgraph.example.com/subgraphs/name/bazaar-arbitrum-one",
 });

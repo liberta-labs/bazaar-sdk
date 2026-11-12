@@ -117,25 +117,24 @@ position, an insurance exit) carry a signed Pyth Pro update, fetched from the co
 Pro's symbols registry, and snapshots ask the source for the price of trading-hours markets to tell
 whether their venue is open.
 
-Pyth Pro needs a token on every request and every stream connection. There are two kinds: the
-long-lived **API key**, and **short-lived tokens** minted from it (they live at most 15 minutes).
-A server (a bot, a keeper, a relayer) may hold the key. A browser must not: code in a bundle is
-public. A frontend therefore either gets short-lived tokens from its own backend
-([below](#tokens-for-a-browser)), or leaves prices out and routes orders through a relayer that
-attaches the update ([Gasless Trading](gasless.md)).
+Pyth Pro serves prices only to the holder of an **API key**, presented on every request and every
+stream connection. A server (a bot, a keeper, a relayer) holds the key. A browser must not: code in a
+bundle is public. A frontend therefore leaves prices out and sends its orders through a relayer that
+attaches the update ([Gasless Trading](gasless.md)), showing prices that a server of its own
+publishes; or it points `prices` at a proxy of its own that adds the key on its server.
 
 The SDK holds you to this. A client for Pyth's own endpoints (the default ones, `PYTH_PRO`) without a
 token is refused when it is made: `new ProClient(...)`, `proPriceSource(...)` and `Bazaar.connect({
-prices: { ... } })` throw an `InputError` on `prices.token` asking for a Pyth Pro API key, or, in a
-browser, a function returning tokens your backend mints from it (`mintProToken`). An endpoint of your
-own (a proxy that adds the key, a local mock) may run without one, provided both the request API
+prices: { ... } })` throw an `InputError` on `prices.token` asking for a Pyth Pro API key. In a web
+page the key is refused the same way for Pyth's own endpoints, since anything a page holds is public.
+An endpoint of your own (a proxy that adds the key, a local mock) may run without one, provided both
+the request API
 (`restUrl`) and every stream endpoint (`streamUrls`) are yours: both default to Pyth's. The symbols
 registry needs no token either way.
 
 `prices` takes three forms:
 
-- **Options for a client**: `{ token }`, where `token` is the API key (servers), or a function that
-  returns a short-lived token and is called for each request and each connection attempt. The other
+- **Options for a client**: `{ token }`, where `token` is the API key (on a server). The other
   `ProClient` options go in the same object.
 - **A `ProClient`** you made, to share it with a live stream.
 - **A `PriceUpdateSource`** you build: `proPriceSource(...)`, a `LivePrices` stream, or your own.
@@ -148,7 +147,7 @@ registry needs no token either way.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `token` | none: required for Pyth's own endpoints | A string, or `() => string \| Promise<string>`. Sent as `Authorization: Bearer <token>`; on a stream connection in a browser, in the subprotocol list instead, since a browser cannot set a WebSocket's headers. Without one, a client whose `restUrl` or a `streamUrls` entry is Pyth's throws an `InputError` on `prices.token`. |
+| `token` | none: required for Pyth's own endpoints | The API key, a string. Sent as `Authorization: Bearer <token>`; on a stream connection in a browser (to an endpoint of your own), in the subprotocol list instead, since a browser cannot set a WebSocket's headers. Without one, a client whose `restUrl` or a `streamUrls` entry is Pyth's throws an `InputError` on `prices.token`. |
 | `channel` | `"fixed_rate@200ms"` | The channel streamed and read by `latest`: `real_time`, `fixed_rate@50ms`, `fixed_rate@200ms` or `fixed_rate@1000ms`. A feed is served on its registry `min_channel` and every slower one. |
 | `streamUrls` | Pyth's three | The WebSocket endpoints. The stream connects to all of them, as Pyth requires, and yields each update once. |
 | `restUrl` | Pyth's | Base URL of the request API (`/v1/latest_price`, `/v1/price`). A URL with a query or a fragment is refused: a key goes in `token` or `headers`. |
@@ -187,25 +186,6 @@ carries either way.
 **Feed IDs.** A Pyth Pro feed is a number (BTC/USD is 1). The contracts hold it in a `bytes32`
 (`0x00…01`), and the SDK uses that form everywhere a feed ID appears; `feedIdHex(1)` and
 `proFeedId(id)` convert. A composite market's ID is a hash, and its two legs are raw feed IDs.
-
-### Tokens for a Browser
-
-Your backend exchanges the API key for a short-lived token and hands that to your page:
-
-```ts
-{{#include ../../examples/reads/price-proxy.ts:tokens}}
-```
-
-The page asks for one when it needs it, and keeps it until shortly before it expires:
-
-```ts
-{{#include ../../examples/reads/connecting.ts:token}}
-```
-
-`cachedToken(mint, { margin })` calls `mint` only when it holds no token or the one it holds expires
-within `margin` seconds (default 60), and shares one call among concurrent requests. A token whose
-expiry the endpoint does not give is reused for five minutes. Gate the endpoint like any other of
-yours: whoever is handed a token can read prices on your key until it expires.
 
 ### Your Own Source
 
@@ -296,7 +276,7 @@ further check.
 | viem's `InvalidAddressError` | `Address "..." is invalid.` | `factory` or `integrator` is not an address. |
 | `HttpError` | `HTTP 401 from https://.../v2/***: the provider refused the request; check the key in the URL` | The RPC refused the request. |
 | `TypeError` | `JsonRpc: the ... header's value holds a line break, ...` | A header value (often from an `.env` file) has a stray character. |
-| `ProError` | `the price token (prices.token) holds a line break ...` | The same, for the Pyth Pro token. Raised when the client is made, or when a token provider returns one. |
+| `ProError` | `the price token (prices.token) holds a line break ...` | The same, for the Pyth Pro token. Raised when the client is made. |
 | `InputError` | `prices.token: Pyth's own price endpoints serve only the holder of a Pyth Pro API key. ...` | `prices` names Pyth's endpoints (the default) without a token. Raised when the client is made, before anything is read. |
 | `ConnectError` | `this call needs a fresh Pyth Pro price: connect with a price source (prices)` | Later, from a builder: the connection has no `prices`. |
 | `ConnectError` | `history comes from Bazaar's subgraph: connect with a subgraph source` | Later, from `history`: the connection has no `subgraph`. |

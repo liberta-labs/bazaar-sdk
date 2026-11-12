@@ -53,7 +53,7 @@ import { Bazaar, OrderType, parseUnits18 } from "@liberta-labs/bazaar-sdk";
 const bz = await Bazaar.connect({
   transport: window.ethereum,            // any EIP-1193 provider, a viem client, or an RPC URL
   factory: "0x...",
-  prices: { token: pythToken },          // Pyth Pro: short-lived tokens from your backend, never the API key
+  prices: PRICES,                        // Pyth Pro through your own proxy: a page never holds the API key
   subgraph: "https://subgraph.example",  // optional: history
   integrator: "0xYourFrontend",          // optional: earns the integrator fee on your users' fills
 });

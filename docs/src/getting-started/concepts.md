@@ -180,9 +180,9 @@ shows a raw URL. Log the error itself for the detail. See [Errors & Messages](..
 
 The SDK is written to run in a page an attacker can link to and feed data:
 
-- **No secrets in the bundle.** A Pyth Pro API key or a subgraph key in browser code is public. Give
-  `prices` short-lived tokens your backend mints from the key (see
-  [Connecting](../sdk/connecting.md#tokens-for-a-browser)), or leave prices to a relayer.
+- **No secrets in the bundle.** A Pyth Pro API key or a subgraph key in browser code is public, and
+  the SDK refuses a Pyth Pro key in a web page. Leave prices to a relayer, or point `prices` at a proxy
+  of your own that adds the key (see [Connecting](../sdk/connecting.md#prices)).
 - **Only Pyth's signature counts.** Prices are read from the signed update itself, and a connection
   refuses updates not signed by a signer the deployment's Pyth verifier trusts.
 - **Keys are masked.** Every error and display string built from an RPC, price or subgraph URL masks

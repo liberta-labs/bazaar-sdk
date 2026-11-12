@@ -9,7 +9,7 @@ const MY_FRONTEND: Address = "0x0000000000000000000000000000000000000001";
 const bz = await Bazaar.connect({
   transport: window.ethereum,
   factory: FACTORY,
-  prices: { token: pythToken },
+  prices: PRICES,
   integrator: MY_FRONTEND, // every order built through bz names it, and it earns the referral fee
 });
 // ANCHOR_END: integrator

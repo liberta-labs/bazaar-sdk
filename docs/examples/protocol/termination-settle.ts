@@ -6,7 +6,7 @@ import type { Address } from "viem";
 const bz = await Bazaar.connect({
   transport: window.ethereum,
   factory: "0x0000000000000000000000000000000000000000", // the deployment's factory
-  prices: { token: pythToken }, // Pyth Pro also serves the archived one-second updates settlement needs
+  prices: PRICES, // Pyth Pro also serves the archived one-second updates settlement needs
   subgraph: "https://subgraph.example.com", // optional: finds open proposals and open positions
 });
 const [user] = (await window.ethereum.request({ method: "eth_requestAccounts" })) as Address[];

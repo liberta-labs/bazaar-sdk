@@ -5,7 +5,7 @@ import type { Address } from "viem";
 const bz = await Bazaar.connect({
   transport: window.ethereum,
   factory: "0x0000000000000000000000000000000000000000", // the deployment's factory
-  prices: { token: pythToken }, // both execute calls carry a fresh Pyth Pro price
+  prices: PRICES, // both execute calls carry a fresh Pyth Pro price
 });
 const [user] = (await window.ethereum.request({ method: "eth_requestAccounts" })) as Address[];
 const eth = await bz.markets.getMarket("ETH/USD");

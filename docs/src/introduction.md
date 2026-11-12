@@ -58,9 +58,10 @@ simulated before the wallet is asked to sign:
 ```
 
 `FACTORY` is the deployment's factory address, from Bazaar's
-[deployments page](https://docs.bazaar.finance/reference/networks.html), and `pythToken` a function
-of your page that returns a short-lived Pyth Pro token from your backend (see
-[Connecting](sdk/connecting.md#prices)). Amounts are 18-decimal `bigint`s:
+[deployments page](https://docs.bazaar.finance/reference/networks.html), and `PRICES` where the
+order's signed Pyth Pro price comes from: the API key on a server, or a proxy of your own that adds it,
+since a page must not hold the key (see [Connecting](sdk/connecting.md#prices)). A page without one
+sends its orders through a relayer ([Gasless Trading](sdk/gasless.md)). Amounts are 18-decimal `bigint`s:
 `parseUnits18("0.5")` is half a unit, `parseUnits18("2400")` is $2,400.
 
 ## A Map of These Docs

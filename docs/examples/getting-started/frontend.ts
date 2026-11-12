@@ -8,20 +8,22 @@ import {
   OrderType,
   type PreparedCall,
   UnitError,
-  cachedToken,
   errorMessage,
   formatUnits18,
   type markets,
   orders,
   parseUnits18,
+  relay,
 } from "@liberta-labs/bazaar-sdk";
-import { type Address, getAddress, toHex } from "viem";
+import { type Address, type Hex, getAddress, toHex } from "viem";
 
 // ANCHOR: config
 const FACTORY: Address = "0x0000000000000000000000000000000000000000"; // from Bazaar's deployments page
 const CHAIN_ID = 421614; // Arbitrum Sepolia
-const TOKEN_URL = "/api/pyth-token"; // your backend mints short-lived Pyth Pro tokens: never a Pyth key in a bundle
-const pythToken = cachedToken(() => fetch(TOKEN_URL).then((r) => r.json())); // answers { token, expiresAt }
+// The relayer that sends orders: it attaches the fresh signed Pyth price an order carries, which only
+// a server holding the Pyth Pro key can fetch. The page holds no key and never builds a priced call.
+const RELAYER_URL = "https://relayer.example.com/relay";
+const RELAYER_FEE = parseUnits18("0.05"); // what the relayer charges per order, in USDC (at most $1)
 // ANCHOR_END: config
 
 // ANCHOR: helpers
@@ -49,7 +51,7 @@ async function connect(): Promise<void> {
   user = getAddress(accounts[0]!);
   // Ask the wallet for the right network first: connect() refuses any other chain.
   await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: toHex(CHAIN_ID) }] });
-  bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, chainId: CHAIN_ID, prices: { token: pythToken } });
+  bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, chainId: CHAIN_ID });
   status(`Connected as ${user}`);
 }
 // ANCHOR_END: connect
@@ -133,15 +135,19 @@ async function placeLimitOrder(side: string, sizeText: string, priceText: string
     limitPrice: parseUnits18(priceText),
     expirationBlock: (await bz.ctx.chain.blockNumber()) + orders.blocksIn(24 * 3600), // a day of L2 blocks
   };
-  // createOrder checks the order as the pair will, and attaches a Pyth print the pair accepts for
-  // 3 s: build it right before the wallet prompt, and rebuild it if simulating took too long.
-  let call = await bz.trade.createOrder(market.address, user, order);
-  const sim = await bz.simulate(call);
-  if (!sim.ok) throw new CallError(sim.error!.message, sim.error);
-  if (Date.now() / 1000 - (call.priceTime ?? 0) > 2) call = await bz.trade.createOrder(market.address, user, order);
-  status(`Confirm in your wallet: ${call.summary}`);
-  await bz.waitForReceipt(await bz.send(window.ethereum, call));
-  status(`Placed: ${call.summary}`);
+  // The user signs the order as a request, and a USDC permit for the relayer's fee; the relayer
+  // attaches the price and sends it. A signed request lives at most 10 seconds: post it at once.
+  status("Sign the order in your wallet");
+  const req = await bz.relay.signRelayed(
+    { action: "createOrder", order },
+    { wallet: window.ethereum, signer: user, pair: market.address, relayerFee: RELAYER_FEE, permit: true },
+  );
+  const res = await fetch(RELAYER_URL, { method: "POST", headers: { "content-type": "application/json" }, body: relay.serializeRelayed(req) });
+  const answer = (await res.json()) as { hash?: Hex; error?: string };
+  if (!res.ok || !answer.hash) return status(answer.error ?? `The relayer answered ${res.status}.`);
+  status(`Waiting for ${answer.hash}...`);
+  await bz.waitForReceipt(answer.hash); // throws CallError if it reverted
+  status(`Placed: ${relay.describeRelayed(req)}`);
 }
 // ANCHOR_END: order
 

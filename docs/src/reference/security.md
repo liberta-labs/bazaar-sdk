@@ -143,10 +143,9 @@ factory's own rule, as decoration; treat it as such.
 Anything in a browser bundle is public. A Pyth Pro API key, a subgraph gateway key or a keyed RPC
 URL in frontend code is a key you have published.
 
-- **Prices.** Give `prices` short-lived tokens your backend mints from the API key
-  ([Connecting](../sdk/connecting.md#tokens-for-a-browser) has the endpoint and the page's side), or
-  leave prices out and send orders through a relayer that attaches the update. A token expires within
-  15 minutes; the key never leaves your server.
+- **Prices.** Leave prices out and send orders through a relayer that attaches the update, or point
+  `prices` at a proxy of your own that adds the key ([Connecting](../sdk/connecting.md#prices)). The
+  SDK refuses a Pyth Pro key in a web page; the key never leaves your server.
 - **Whose prices.** Every price is read from Pyth's signed update, and a connection refuses updates
   not signed by a signer the deployment's Pyth verifier trusts, so a compromised endpoint or proxy can
   withhold prices but cannot make the page show, or a call carry, one Pyth did not sign.

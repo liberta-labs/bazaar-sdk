@@ -14,9 +14,9 @@
  * is also a PriceUpdateSource that reuses the stream's updates for a call when they are fresh enough,
  * so building a trade needs no extra request.
  *
- * Pyth Pro needs a token. An API key must stay on a server, so a browser is given short-lived tokens
- * its backend mints from the key (prices/pro.ts `mintProToken`, `cachedToken`), or leaves prices to a
- * relayer that attaches the update to the orders it submits.
+ * Pyth Pro serves only the holder of an API key, which must stay on a server. A web page instead
+ * reads prices from a server that holds the key, and sends its trades through a relayer that attaches
+ * the update to them.
  */
 
 import type { Address, Hex } from "viem";

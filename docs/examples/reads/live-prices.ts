@@ -12,7 +12,7 @@ import {
 import type { Address } from "viem";
 
 const FACTORY: Address = "0x0000000000000000000000000000000000000000";
-const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: { token: pythToken } });
+const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: PRICES });
 const eth = await bz.markets.getMarket("ETH/USD");
 const render = (text: string) => console.log(text);
 
@@ -48,7 +48,7 @@ const tuned = await bz.livePrices({
 });
 
 // Some markets only, with a Pyth Pro client of their own, without a connection:
-const some = await livePrices([eth], { pro: { token: pythToken, channel: "fixed_rate@1000ms" } });
+const some = await livePrices([eth], { pro: { ...PRICES, channel: "fixed_rate@1000ms" } });
 // ANCHOR_END: options
 
 // ANCHOR: for-calls
@@ -60,11 +60,11 @@ const trading = Bazaar.from({ ...bz.ctx, prices: tuned });
 
 // ANCHOR: pro
 // Pyth Pro directly: prints read from the signed update itself, never from the JSON beside it.
-const source = proPriceSource({ token: pythToken });
+const source = proPriceSource(PRICES);
 const [print] = await source.prints(eth.legs); // feedId, price, conf, expo, publishTime, generatedUs, blob
 const update = await source.latest(eth.legs); // { update: Hex[], publishTime }: what a call attaches
 
-const client = new ProClient({ token: pythToken, timeout: 5 });
+const client = new ProClient({ ...PRICES, timeout: 5 });
 const ctl = new AbortController();
 // One set of feeds: every update carries exactly the market's legs, from whichever endpoint is first.
 for await (const batch of client.stream(eth.legs, ctl.signal, { idleTimeout: 10 })) {

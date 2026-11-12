@@ -2,15 +2,16 @@
 
 This walkthrough builds a working trading page with no framework: it connects the user's wallet,
 lists Bazaar's markets with their prices and status, shows the user's position on one, deposits
-collateral, and places a limit order, simulating every transaction before the wallet is asked to sign.
-At the end the page follows the account live. It is one TypeScript file and one HTML file, about 200
+collateral, simulating the transactions before the wallet is asked to sign, and places a limit order
+through a relayer. At the end the page follows the account live. It is one TypeScript file and one HTML file, about 200
 lines in all.
 
 You need a browser wallet (MetaMask, Rabby, ...) on Arbitrum Sepolia with a little ETH for gas and
 some of the deployment's USDC, the deployment's factory address (Bazaar's
-[deployments page](https://docs.bazaar.finance/reference/networks.html)), and a way for your page to
-get Pyth Pro prices without holding the API key: an endpoint of your backend that mints short-lived
-tokens from it (see [Connecting](../sdk/connecting.md#tokens-for-a-browser)).
+[deployments page](https://docs.bazaar.finance/reference/networks.html)), and a relayer to send
+orders through. An order carries a fresh signed Pyth Pro price, and only a server may hold the Pyth Pro
+API key, so the page never builds an order itself: the user signs it, and the relayer attaches the
+price and sends it (see [Gasless Trading & Relayers](../sdk/gasless.md)).
 
 ## 1. Create the Page
 
@@ -65,9 +66,8 @@ complete file is `docs/examples/getting-started/frontend.ts` in the SDK's reposi
 ```
 
 The SDK reads everything else (the lens, the terminator, the oracle, USDC, the markets and their
-feeds) from the factory. The price endpoint serves the signed Pyth updates that order calls carry and
-the feed symbols the market list labels markets with; never put a Pyth API key in code a browser
-downloads.
+feeds) from the factory, and the market labels from Pyth's symbols registry, which needs no key. Never
+put a Pyth Pro API key in code a browser downloads: the SDK refuses one in a web page.
 
 ## 3. Two Helpers
 
@@ -157,19 +157,15 @@ carry a USDC permit, a signature in place of the approval transaction: see
 {{#include ../../examples/getting-started/frontend.ts:order}}
 ```
 
-`createOrder` checks the order exactly as the pair will (a size and price, a limit within 50% of the
-market price, at least $5 of notional, an expiry at least about a minute away, the per-user order
-caps) and throws an `InputError` naming the field otherwise. It then finds the order's place in the
-book and attaches a fresh signed Pyth price, which every order call carries.
-
-That price is the catch: the pair accepts a print at most 3 seconds from the block's time. The page
-builds the call right before the wallet prompt and rebuilds it if simulating took long enough that the
-print is more than 2 seconds old (`call.priceTime` is its publish time). A user who takes longer than
-that to approve in the wallet can still see the transaction revert on a quiet market; on an active
-one, another trade has usually refreshed the pair's price within the window. Production apps either
-offer a retry with a freshly built call or trade gasless, where the relayer attaches the price when it
-submits ([Gasless Trading & Relayers](../sdk/gasless.md)). The details are in
-[The 3-Second Price Window](../sdk/sending.md#the-3-second-price-window).
+Every order carries a fresh signed Pyth price, which the pair accepts at most 3 seconds from the
+block's time ([The 3-Second Price Window](../sdk/sending.md#the-3-second-price-window)). The page has
+no price source, so it sends the order gasless. `signRelayed` checks the order as the pair will (a size
+and price, at least $5 of notional, an expiry at least about a minute away, the per-user order caps)
+and throws an `InputError` naming the field otherwise. It then asks the wallet for two signatures:
+a USDC permit covering the relayer's fee, and the order itself. The relayer attaches the price and the
+order's place in the book, simulates it, and sends it, answering with the transaction hash. The user
+needs no ETH for it. A signed request is valid for at most 10 seconds, so the page posts it at once;
+the relayer's own checks are on [Gasless Trading & Relayers](../sdk/gasless.md).
 
 `expirationBlock` counts Arbitrum blocks, about four a second: `orders.blocksIn(seconds)` converts.
 Every option of every order type is on [Placing Orders](../sdk/orders.md).
@@ -208,15 +204,16 @@ appears in the position view as soon as the transaction lands.
 | "You rejected the request in your wallet." | The user declined a prompt (EIP-1193 error 4001). |
 | "This network has not been added to your wallet yet. Add it and try again." | `wallet_switchEthereumChain` failed with 4902. |
 | "Something went wrong. Please try again." on connect | A `ConnectError`: the wallet is on another chain, or `FACTORY` is not a Bazaar factory on this chain. Log `e.message` for which. |
-| "Something went wrong..." on the first market list | The price endpoint or the RPC could not be reached (labels fall back to short addresses when only the feed metadata fails). |
+| "Something went wrong..." on the first market list | The RPC could not be reached (labels fall back to short addresses when only Pyth's symbols registry fails). |
 | A sentence naming a field, such as "limitPrice: A limit price must be within 50% of the market price: ..." | An `InputError`: the SDK refused the order before building it. |
 | "This order needs $... of collateral ..." | The simulation reverted: not enough collateral for the order's margin. Deposit first. |
-| The order's transaction reverts on chain | The attached price was more than 3 seconds old when it landed (a slow wallet confirmation on a quiet market). Build and send it again. |
+| The relayer's sentence, such as one asking for a higher fee | The relayer refused the request and sent nothing: sign it again as it says. |
 
 ## Next
 
 - [Core Concepts](concepts.md): what is behind each step above.
-- [Live Prices](../sdk/live-prices.md), to show a streaming price next to each market.
+- [Live Prices](../sdk/live-prices.md), for a server of yours that streams prices to show next to
+  each market.
 - [Previews](../sdk/previews.md), to show the fees, margin and liquidation price of an order before
   it is placed.
 - [Managing Orders](../sdk/managing-orders.md), to amend and cancel.

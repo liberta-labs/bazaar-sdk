@@ -4,9 +4,9 @@
  *     import { Bazaar } from "@liberta-labs/bazaar-sdk";
  *
  *     const bz = await Bazaar.connect({
- *       transport: window.ethereum,               // or a viem client, or an RPC URL
+ *       transport: "https://arb1.example/rpc",    // or an EIP-1193 provider, or a viem client
  *       factory: "0x...",
- *       prices: { token: () => pythToken() },     // Pyth Pro: a short-lived token from your backend; or any PriceUpdateSource
+ *       prices: { token: process.env.PYTH_PRO_TOKEN }, // Pyth Pro, on a server; or any PriceUpdateSource
  *       subgraph: "https://subgraph.example/...", // optional: history
  *       integrator: "0xYourFrontend",             // optional: your referral fee address
  *     });
@@ -15,7 +15,10 @@
  *     const me = await bz.account.accountSnapshot(eth, user);
  *     const call = await bz.trade.createOrder(eth.address, user, { orderType: OrderType.Limit, isLong: true, ... });
  *     const sim = await bz.simulate(call);        // explained before anything is signed
- *     if (sim.ok) await bz.send(window.ethereum, call);
+ *     if (sim.ok) await bz.send(wallet, call);    // wallet: an EIP-1193 provider that signs for `user`
+ *
+ * A web page holds no Pyth Pro key: it connects without `prices`, and its trades go through a relayer
+ * that attaches the price (`bz.relay.signRelayed`).
  *
  * Every context-first function of each area is here with the context already bound
  * (`bz.trade.createOrder(...)` is `trade.createOrder(bz.ctx, ...)`). The pure helpers (packing,
@@ -65,10 +68,10 @@ function bind<NS extends object>(ctx: BazaarContext, ns: NS, names: readonly str
 export interface BazaarOptions extends Omit<ConnectOptions, "prices" | "subgraph"> {
   /**
    * Where signed Pyth Pro updates come from: options for a client of the SDK's own (`{ token }`, the
-   * token a string or a function that returns short-lived ones), a {@link ProClient}, or any
-   * PriceUpdateSource. A browser must not hold the API key: give it tokens its backend mints. A client
-   * for Pyth's own endpoints, the default ones, needs the token: options without one throw an
-   * InputError on `prices.token`.
+   * API key), a {@link ProClient}, or any PriceUpdateSource. A client for Pyth's own endpoints, the
+   * default ones, needs the key: options without it throw an InputError on `prices.token`, and so do
+   * options with it in a web page, where it would be public. A page leaves `prices` out and sends its
+   * priced calls through a relayer, or points `restUrl` and `streamUrls` at a proxy of its own.
    */
   prices?: PriceUpdateSource | ProClient | ProClientOptions | null;
   /** Bazaar's subgraph (URL, or { url, apiKey }), or any SubgraphSource. Needed only for history. */

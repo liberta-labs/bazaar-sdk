@@ -10,8 +10,9 @@ the pair's oracle would compose it. Every on-chain price check uses the print a 
 [The 3-Second Price Window](sending.md#the-3-second-price-window)).
 
 The samples assume `bz` connected as in [Connecting](connecting.md) with a Pyth Pro price source, and
-`eth` a market. `pythToken` is the page's source of short-lived tokens
-([Tokens for a Browser](connecting.md#tokens-for-a-browser)).
+`eth` a market. `PRICES` are the client options: the API key on a server, or a proxy of your own that
+adds it. A web page holds no key: it shows the prices a server of yours publishes from a stream like
+this one.
 
 ## LivePrices
 

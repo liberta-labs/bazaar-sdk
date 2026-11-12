@@ -4,7 +4,6 @@ import {
   ConnectError,
   JsonRpc,
   ProClient,
-  cachedToken,
   connect,
   errorMessage,
   history,
@@ -17,18 +16,12 @@ import { arbitrum } from "viem/chains";
 const FACTORY: Address = "0x0000000000000000000000000000000000000000";
 const MY_FEE_ADDRESS: Address = "0x0000000000000000000000000000000000000001";
 
-// ANCHOR: token
-// In a browser: short-lived Pyth Pro tokens from your own backend, which holds the API key. The
-// endpoint answers { token, expiresAt }; a new one is fetched a minute before the held one expires.
-const pythToken = cachedToken(() => fetch("/api/pyth-token").then((r) => r.json()));
-// ANCHOR_END: token
-
 // ANCHOR: options
 const bz = await Bazaar.connect({
   transport: window.ethereum, // an EIP-1193 provider, a viem client, a JsonRpc, or a JSON-RPC URL
   factory: FACTORY, // the deployment: everything else is read from it
   chainId: 42161, // optional: refuse any other chain
-  prices: { token: pythToken }, // optional: Pyth Pro client options, a ProClient, or any source
+  prices: PRICES, // optional: Pyth Pro client options, a ProClient, or any source
   subgraph: "https://subgraph.example.com/bazaar", // optional: a URL, { url, apiKey }, or a source
   integrator: MY_FEE_ADDRESS, // optional: named on every order this connection creates
 });
@@ -71,13 +64,13 @@ const prices = proPriceSource({
 const withPrices = await Bazaar.connect({ transport: rpc, factory: FACTORY, prices });
 
 // One ProClient can serve both the calls' updates and a live stream.
-const pro = new ProClient({ token: pythToken });
+const pro = new ProClient(PRICES);
 const shared = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: pro });
 const live = await shared.livePrices(); // streams through the same client
 
 // Connecting has the source refuse any update not signed by a signer the deployment's Pyth verifier
 // trusts (one cached read per signer). The chain checks every update a call carries either way.
-const unchecked = await Bazaar.connect({ transport: rpc, factory: FACTORY, prices: { token: pythToken }, checkSigners: false });
+const unchecked = await Bazaar.connect({ transport: rpc, factory: FACTORY, prices: PRICES, checkSigners: false });
 // ANCHOR_END: prices
 
 // ANCHOR: subgraph
@@ -97,7 +90,7 @@ const ctx = await connect({
   transport: rpc,
   factory: FACTORY,
   chainId: 42161,
-  prices: proPriceSource({ token: pythToken }),
+  prices: proPriceSource(PRICES),
   subgraph: history.httpSubgraph("https://subgraph.example.com/bazaar"),
   integrator: null, // zero address: no integrator fee on this connection's orders
 });

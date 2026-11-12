@@ -21,7 +21,7 @@ const bz = await Bazaar.connect({
   transport: window.ethereum,     // any EIP-1193 provider (a wallet, a viem client) or an RPC URL
   factory: "0x...",               // the deployment, from the Bazaar docs' deployments page
   chainId: 42161,                 // optional: refuse any other chain
-  prices: { token: pythToken },   // signed Pyth Pro updates for calls that need one: short-lived tokens from your backend
+  prices: PRICES,                 // signed Pyth Pro updates for calls that need one: the API key on a server, or your proxy
   subgraph: "https://...",        // optional: history
   integrator: "0xYourFrontend",   // optional: your referral fee address, set on every order you create
 });
@@ -32,9 +32,10 @@ with the connection bound (`bz.trade.createOrder(...)`); the same functions are 
 use without the facade (`import { trade } from "@liberta-labs/bazaar-sdk"; trade.createOrder(ctx, ...)`),
 along with the pure helpers (packing, formatting, type strings) that need no connection.
 
-Do not put a Pyth Pro API key in a browser bundle: give `prices` a function returning short-lived tokens
-your backend mints from the key (`mintProToken`), or point it at a proxy you control. Pyth's own
-endpoints need one or the other: a client for them without a token is refused when it is made.
+Do not put a Pyth Pro API key in a browser bundle: the SDK refuses one in a web page. A page leaves
+`prices` out and sends its orders through a relayer that attaches the price (`bz.relay.signRelayed`),
+or points `prices` at a proxy you control that adds the key (`{ restUrl, streamUrls }`). A client for
+Pyth's own endpoints without the key is refused when it is made.
 
 ## Read
 
@@ -76,7 +77,7 @@ if (!sim.ok) showError(sim.error!.message);
 else await bz.waitForReceipt(await bz.send(window.ethereum, order));
 ```
 
-Also: `amendOrders` (reprice/resize up to 32 resting limits, best-effort flag), `cancelOrders` (up to 200),
+Also: `amendOrders` (reprice/resize up to 32 resting limits, best-effort flag), `cancelOrders` (up to 34),
 `withdrawCollateral`, `claimFees`, and `executeTriggeredOrders` for a user's own zero-bounty stops.
 `orders.buildOrderSpec` validates an order exactly as the contract does, so a UI can show errors as the
 user types; `orders.checkOrderCaps` checks the per-user caps (32 active limits, one TP and one SL per

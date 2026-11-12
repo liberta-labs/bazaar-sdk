@@ -13,11 +13,12 @@
  * the request API refuses a whole request naming one (HTTP 403), which the price service answers by
  * asking again in parts (prices/service.ts).
  *
- * Browser-safe: requests go through `fetch` and the stream through a WebSocket. A browser cannot set
- * a WebSocket's request headers, so there the token travels in the subprotocol list; elsewhere it is
- * sent as an Authorization header. An API key must stay on a server: a browser is given short-lived
- * tokens minted from it ({@link mintProToken}). Pyth's own endpoints serve only a client presenting
- * one or the other, so a client for them without a token is refused when it is made.
+ * Runs in a browser as on a server: requests go through `fetch` and the stream through a WebSocket. A
+ * browser cannot set a WebSocket's request headers, so there a token travels in the subprotocol list;
+ * elsewhere it is sent as an Authorization header. Pyth's own endpoints serve only the holder of a
+ * Pyth Pro API key, which must stay on a server: a client for them is refused when it is made without
+ * the key, and in a web page with it. A page reaches Pyth only through a custom endpoint, such as a
+ * proxy that adds the key.
  *
  * Credentials stay out of sight: the client holds the token, the headers and the configured URLs in
  * private fields, so printing or serializing it shows none of them; every message it produces has
@@ -29,7 +30,7 @@
 import type { Address, Hex } from "viem";
 import { InputError } from "../client/calls.js";
 import { BAZAAR_EXPONENT } from "../constants.js";
-import { PYTH_PRO, PYTH_PRO_TOKEN_URL, isPythProPriceEndpoint } from "../networks.js";
+import { PYTH_PRO, isPythProPriceEndpoint } from "../networks.js";
 import { isUrl, redactUrl, redactUrls, urlCredential, urlSecrets } from "../urls.js";
 import {
   CHANNEL_FIXED_RATE_1000,
@@ -121,9 +122,6 @@ class UnconfirmedSigner extends ProError {}
 /** Says whether updates signed by `signer` may be used. */
 export type SignerCheck = (signer: Address) => boolean | Promise<boolean>;
 
-/** Returns the token to present: a Pyth Pro API key (servers only) or a short-lived token minted from one. */
-export type TokenProvider = () => string | Promise<string>;
-
 /** @internal */
 export function monotonic(): number {
   return performance.now() / 1000;
@@ -138,9 +136,13 @@ export const DEFAULT_CHANNEL: Channel = "fixed_rate@200ms";
 /** The subprotocol that marks the next entry of a WebSocket's subprotocol list as the token. */
 export const AUTH_SUBPROTOCOL = "pyth-lazer-auth";
 
+/** What a web page that gives Pyth's own price endpoints a token is told. */
+const PRO_KEY_IN_PAGE =
+  "Anything a web page holds is public, so a page must not hold a Pyth Pro API key: keep the key on a server, and have the page read prices from that server and send its trades through a relayer that attaches them, or point restUrl and streamUrls at a proxy that adds the key.";
+
 /** What a client for Pyth's own price endpoints is told when it is given no token. */
 const PRO_KEY_REQUIRED =
-  "Pyth's own price endpoints serve only the holder of a Pyth Pro API key. On a server, give the key as the token (an Authorization header among the headers does not count); in a browser, give a function returning short-lived tokens your backend mints from the key (mintProToken), never the key itself. Without a token, the request API (restUrl) and every stream endpoint (streamUrls) must be custom ones, such as a proxy that adds the key or a local mock: both default to Pyth's.";
+  "Pyth's own price endpoints serve only the holder of a Pyth Pro API key. On a server, give the key as the token (an Authorization header among the headers does not count); never give it to a web page. Without a token, the request API (restUrl) and every stream endpoint (streamUrls) must be custom ones, such as a proxy that adds the key or a local mock: both default to Pyth's.";
 
 const INT256_MAX = (1n << 255n) - 1n;
 const INT256_MIN = -(1n << 255n);
@@ -252,8 +254,6 @@ export const MAX_STRAY_MESSAGES = 64;
 /** Seconds before a dropped stream endpoint is reconnected the first time; doubles per failure up to RECONNECT_MAX. */
 const RECONNECT_BASE = 0.5;
 const RECONNECT_MAX = 30;
-/** How many of the latest tokens stay masked in messages. */
-const RECENT_TOKENS = 8;
 /** How many distinct notices one stream passes to its `onNotice` before it drops the rest. */
 export const MAX_STREAM_NOTICES = 64;
 /** The longest piece of endpoint text (a response body, a close reason, an error) a message quotes. */
@@ -296,13 +296,12 @@ export type WebSocketConstructor = new (url: string, protocolsOrOptions?: any) =
 
 export interface ProClientOptions {
   /**
-   * The token every request and connection presents: a Pyth Pro API key (on a server), or a function
-   * called for each request and each connection attempt, so it can hand over short-lived tokens minted
-   * from the key (cache inside it, for example with {@link cachedToken}). Required whenever the request
-   * API or a stream endpoint is one of Pyth's own, as by default; omit it only for an endpoint that
-   * needs none, such as a proxy that adds it or a local mock.
+   * The token every request and connection presents: the Pyth Pro API key. Required whenever the
+   * request API or a stream endpoint is one of Pyth's own, as by default; omit it only for an endpoint
+   * that needs none, such as a proxy that adds it or a local mock. Refused in a web page for Pyth's own
+   * endpoints, since anything a page holds is public.
    */
-  token?: string | TokenProvider | null;
+  token?: string | null;
   /** WebSocket stream endpoints; the stream connects to all of them. Default Pyth's three. */
   streamUrls?: readonly string[];
   /** Base URL of the request API, without a query or a fragment. Default Pyth's. */
@@ -400,6 +399,17 @@ function noop(): void {}
 
 const longestFirst = (a: string, b: string) => b.length - a.length;
 
+/**
+ * What a subscription's `ignoredInvalidFeedIds` left out, as text: its lists that name a feed, or null
+ * when none does. An answer whose every list is empty left nothing out, so it is not worth a notice.
+ */
+function leftOut(ignored: unknown): string | null {
+  if (ignored === undefined || ignored === null) return null;
+  if (typeof ignored !== "object" || Array.isArray(ignored)) return shown(ignored);
+  const named = Object.entries(ignored).filter(([, v]) => !(Array.isArray(v) && v.length === 0));
+  return named.length === 0 ? null : shown(Object.fromEntries(named));
+}
+
 /** A value from the endpoint, short enough to quote in a message. */
 function shown(v: unknown): string {
   let s: string;
@@ -483,6 +493,20 @@ function evmData(body: unknown): Hex | null {
   return hex;
 }
 
+/** Refuses a token no request could carry, without quoting it. */
+function checkToken(token: unknown): void {
+  if (typeof token !== "string") throw new ProError("the price token (prices.token) must be the Pyth Pro API key, as a string");
+  if (token.trim() === "") throw new ProError("the price token is empty: set it (prices.token)");
+  if (BAD_HEADER_VALUE.test(token)) {
+    throw new ProError("the price token (prices.token) holds a line break or another character a request header cannot carry: re-enter it");
+  }
+}
+
+/** Whether this code runs in a web page, where everything it holds is public. */
+function inPage(): boolean {
+  return typeof (globalThis as { document?: unknown }).document !== "undefined";
+}
+
 function defaultStreamAuth(): "header" | "subprotocol" {
   const g = globalThis as { document?: unknown; WorkerGlobalScope?: unknown };
   return typeof g.document !== "undefined" || typeof g.WorkerGlobalScope !== "undefined" ? "subprotocol" : "header";
@@ -564,14 +588,10 @@ export class ProClient {
   readonly #streamUrls: readonly string[];
   readonly #restUrl: string;
   readonly #symbolsUrl: string;
-  readonly #tokenSource: string | TokenProvider | null;
+  readonly #apiToken: string | null;
   readonly #headers: Readonly<Record<string, string>>;
-  /** header values and the parts of the configured URLs that may hold a key */
-  readonly #fixedSecrets: readonly string[];
-  /** the tokens presented most recently: a provider hands over a new one every few minutes */
-  readonly #tokens: string[] = [];
-  /** everything masked in a message: the two lists above, longest first so a secret containing another is masked whole */
-  #secrets: readonly string[];
+  /** everything masked in a message: the token, header values and the parts of the configured URLs that may hold a key, longest first so a secret containing another is masked whole */
+  readonly #secrets: readonly string[];
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   readonly #ws: WebSocketConstructor | null;
@@ -615,15 +635,17 @@ export class ProClient {
     }
     for (const u of [this.#restUrl, this.#symbolsUrl, ...this.#streamUrls]) for (const part of urlSecrets(u)) if (part.length >= MIN_SECRET) fixed.add(part);
     this.#headers = Object.freeze(h);
-    this.#fixedSecrets = [...fixed];
-    this.#secrets = [...fixed].sort(longestFirst);
-    this.#tokenSource = opts.token ?? null;
-    if (typeof this.#tokenSource === "string") this.#checkToken(this.#tokenSource);
+    this.#apiToken = opts.token ?? null;
+    if (this.#apiToken !== null) {
+      checkToken(this.#apiToken);
+      fixed.add(this.#apiToken.trim());
+    }
+    this.#secrets = [...fixed].filter((s) => s.length > 0).sort(longestFirst);
     if (opts.allowInsecure !== true) {
       // The token and the headers go to the request API and the stream; a URL's own user name,
       // password or query goes wherever that URL is used, the symbols registry included. No message
       // quotes the URL.
-      const carries = this.#tokenSource !== null || Object.keys(h).length > 0;
+      const carries = this.#apiToken !== null || Object.keys(h).length > 0;
       const endpoints: [string, string, boolean][] = [
         [this.#restUrl, "the price request URL", carries],
         [this.#symbolsUrl, "the symbols registry URL", false],
@@ -652,9 +674,9 @@ export class ProClient {
     if (typeof ahead !== "number" || !Number.isFinite(ahead) || ahead < 0) throw new ProError("maxUpdateAhead is not a number of seconds");
     this.#maxAheadUs = BigInt(Math.round(ahead * 1_000_000));
     // Checked after every other setting, so a malformed or insecure endpoint is reported as such first.
-    if (this.#tokenSource === null && [this.#restUrl, ...this.#streamUrls].some(isPythProPriceEndpoint)) {
-      throw new InputError("prices.token", PRO_KEY_REQUIRED);
-    }
+    const pyths = [this.#restUrl, ...this.#streamUrls].some(isPythProPriceEndpoint);
+    if (this.#apiToken === null && pyths) throw new InputError("prices.token", PRO_KEY_REQUIRED);
+    if (this.#apiToken !== null && pyths && inPage()) throw new InputError("prices.token", PRO_KEY_IN_PAGE);
   }
 
   /** The WebSocket stream endpoints, as configured. They may hold a key: print them through `redactUrl`. */
@@ -685,35 +707,9 @@ export class ProClient {
 
   // ---- tokens and messages ----
 
-  #remember(token: string): void {
-    if (!token || this.#tokens.includes(token)) return;
-    this.#tokens.push(token);
-    if (this.#tokens.length > RECENT_TOKENS) this.#tokens.shift();
-    this.#secrets = [...this.#fixedSecrets, ...this.#tokens].sort(longestFirst);
-  }
-
-  /** Refuses a token no request could carry, without quoting it, and records it for masking. */
-  #checkToken(token: string): string {
-    if (typeof token !== "string" || token.trim() === "") throw new ProError("the price token is empty: set it (prices.token)");
-    this.#remember(token.trim());
-    if (BAD_HEADER_VALUE.test(token)) {
-      throw new ProError("the price token (prices.token) holds a line break or another character a request header cannot carry: re-enter it");
-    }
-    return token;
-  }
-
-  /** The token to present now, or null when the client has none. */
-  async #token(): Promise<string | null> {
-    const src = this.#tokenSource;
-    if (src === null) return null;
-    if (typeof src === "string") return src;
-    let token: string;
-    try {
-      token = await src();
-    } catch (e) {
-      throw new ProError(`the price token provider failed: ${this.#quote(reason(e))}`);
-    }
-    return this.#checkToken(token);
+  /** The token every request and connection presents, or null when the client has none. */
+  #token(): string | null {
+    return this.#apiToken;
   }
 
   /**
@@ -1179,7 +1175,8 @@ export class ProClient {
         return;
       }
       if (msg.type === "subscribedWithInvalidFeedIdsIgnored") {
-        notice(`price stream left out feeds it does not serve on ${this.channel}: ${this.#quote(shown(msg.ignoredInvalidFeedIds))}`);
+        const left = leftOut(msg.ignoredInvalidFeedIds);
+        if (left !== null) notice(`price stream left out feeds it does not serve on ${this.channel}: ${this.#quote(left)}`);
         return;
       }
       if (msg.type === "subscribed") return;
@@ -1200,7 +1197,7 @@ export class ProClient {
         } else if (token === null) socket = new ctor(ep.url);
         else {
           if (!SUBPROTOCOL.test(token)) {
-            throw new ProError("the price token holds a character a WebSocket subprotocol cannot carry: a browser connects with a short-lived token minted from the API key, not with the key");
+            throw new ProError('the price token holds a character a WebSocket subprotocol cannot carry: use streamAuth "header" where the runtime lets a WebSocket set request headers');
           }
           socket = new ctor(ep.url, [AUTH_SUBPROTOCOL, token]);
         }
@@ -1277,110 +1274,4 @@ export class ProClient {
       ctl.abort();
     }
   }
-}
-
-// ---- tokens ----
-
-/** A short-lived token minted from an API key. */
-export interface MintedToken {
-  /** The token to present in place of the key. */
-  readonly token: string;
-  /** When it expires, in unix seconds; null when the answer does not say in a form the SDK reads. */
-  readonly expiresAt: number | null;
-  readonly tokenType: string;
-}
-
-function expiry(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v) && v > 0) return v > 1e12 ? Math.floor(v / 1000) : Math.floor(v);
-  if (typeof v !== "string" || v.trim() === "") return null;
-  if (/^\d{1,16}$/.test(v.trim())) return expiry(Number(v.trim()));
-  const ms = Date.parse(v);
-  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
-}
-
-/**
- * Exchange a Pyth Pro API key for a short-lived token, for a client that must not hold the key (a
- * browser): call this on a server and hand the token over. The key is sent only to `opts.url`
- * (default Pyth's token endpoint): never over plain http to another machine unless
- * `opts.allowInsecure` says so, and never on to a host a redirect names. It appears in no error.
- */
-export async function mintProToken(
-  apiKey: string,
-  opts: { url?: string; fetch?: typeof fetch; timeout?: number; allowInsecure?: boolean } = {},
-): Promise<MintedToken> {
-  if (typeof apiKey !== "string" || apiKey.trim() === "") throw new ProError("no Pyth Pro API key was given to mint a token from");
-  if (BAD_HEADER_VALUE.test(apiKey)) throw new ProError("the Pyth Pro API key holds a line break or another character a request header cannot carry: re-enter it");
-  const url = opts.url ?? PYTH_PRO_TOKEN_URL;
-  if (typeof url !== "string" || !isUrl(url)) throw new ProError("the token endpoint URL is not an http(s) URL");
-  const scheme = cleartext(url);
-  if (scheme !== null && opts.allowInsecure !== true) {
-    throw new ProError(`the token endpoint uses ${scheme}://, which would send the API key unencrypted to another machine: use https://, or set allowInsecure for an endpoint on a network you trust`);
-  }
-  const fetchFn = opts.fetch ?? ((input, init) => globalThis.fetch(input, init));
-  const secrets = [apiKey, apiKey.trim(), ...urlSecrets(url)].filter((s) => s.length >= MIN_SECRET).sort(longestFirst);
-  const clean = (s: string) => {
-    let out = s.slice(0, MAX_QUOTED + 4096).split(url).join(redactUrl(url));
-    for (const x of secrets) out = out.split(x).join("***");
-    return printable(redactUrls(out));
-  };
-  let r: Response;
-  let answer: string;
-  try {
-    r = await fetchFn(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: "{}",
-      redirect: "error",
-      signal: AbortSignal.timeout((opts.timeout ?? 10) * 1000),
-    });
-    answer = await bodyText(r);
-  } catch (e) {
-    if (e instanceof ProError) throw e;
-    throw new ProError(`the token endpoint is unreachable: ${clean(reason(e))}`);
-  }
-  if (r.status === 401 || r.status === 403) throw new ProError(`the token endpoint refused the API key (HTTP ${r.status})`, r.status);
-  if (r.status >= 400) throw new ProError(`the token endpoint returned HTTP ${r.status}: ${clean(answer)}`, r.status);
-  let body: { access_token?: unknown; expires_at?: unknown; token_type?: unknown };
-  try {
-    body = JSON.parse(answer);
-  } catch {
-    throw new ProError("the token endpoint returned a body that is not JSON");
-  }
-  if (body === null || typeof body !== "object" || typeof body.access_token !== "string" || body.access_token === "") {
-    throw new ProError("the token endpoint's answer holds no access_token");
-  }
-  return { token: body.access_token, expiresAt: expiry(body.expires_at), tokenType: typeof body.token_type === "string" ? body.token_type : "Bearer" };
-}
-
-/** Seconds a token whose expiry is unknown is reused for by {@link cachedToken}. */
-export const UNKNOWN_EXPIRY_LIFETIME = 300;
-
-/**
- * A {@link TokenProvider} that calls `mint` only when it holds no token or the one it holds expires
- * within `margin` seconds (default 60), and shares one call among concurrent requests. `mint` is
- * whatever obtains a token: {@link mintProToken} on a server, a request to the app's own backend in a
- * browser. A token is reused for {@link UNKNOWN_EXPIRY_LIFETIME} seconds when its expiry is unknown,
- * and also when the expiry given is already past or nearer than `margin`: that says the clocks
- * disagree or the answer is wrong rather than that the token lives seconds, and believing it would
- * mint a token for every request.
- */
-export function cachedToken(mint: () => Promise<{ token: string; expiresAt?: number | null }>, opts: { margin?: number; clock?: () => number } = {}): TokenProvider {
-  const margin = opts.margin ?? 60;
-  const clock = opts.clock ?? (() => Date.now() / 1000);
-  let held: { token: string; until: number } | null = null;
-  let minting: Promise<string> | null = null;
-  return () => {
-    if (held !== null && clock() < held.until) return held.token;
-    minting ??= mint()
-      .then((m) => {
-        const now = clock();
-        const expiresAt = typeof m.expiresAt === "number" && Number.isFinite(m.expiresAt) ? m.expiresAt : null;
-        held = { token: m.token, until: expiresAt !== null && expiresAt - margin > now ? expiresAt - margin : now + UNKNOWN_EXPIRY_LIFETIME };
-        return m.token;
-      })
-      .finally(() => {
-        minting = null;
-      });
-    return minting;
-  };
 }

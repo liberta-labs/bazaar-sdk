@@ -4,7 +4,7 @@ import type { Address } from "viem";
 
 const FACTORY: Address = "0x0000000000000000000000000000000000000000";
 const user: Address = "0x0000000000000000000000000000000000000001";
-const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: { token: pythToken } });
+const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: PRICES });
 const eth = await bz.markets.getMarket("ETH/USD");
 
 // ANCHOR: snapshot

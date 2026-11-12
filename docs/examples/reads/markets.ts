@@ -3,7 +3,7 @@ import { Bazaar, Status, formatUnits18, markets } from "@liberta-labs/bazaar-sdk
 import type { Address } from "viem";
 
 const FACTORY: Address = "0x0000000000000000000000000000000000000000";
-const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: { token: pythToken } });
+const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: PRICES });
 
 // ANCHOR: list
 const list = await bz.markets.listMarkets(); // cached per connection after the first call

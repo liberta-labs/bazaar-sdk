@@ -63,7 +63,6 @@ regenerated.
 | [`ProEndpoints`](../sdk/connecting.md) | interface | Where Pyth Pro is served: its stream endpoints, its request API, and its symbols registry. |
 | [`PYTH_PRO`](../sdk/connecting.md) | const | Pyth's own Pyth Pro endpoints: their request API and stream serve only the holder of a Pyth Pro API key. |
 | [`isPythProPriceEndpoint`](../sdk/connecting.md) | function | Whether a URL is one of Pyth's own price endpoints (the host of `PYTH_PRO`'s request API or of one of its stream endpoints), which a `ProClient` serves only with a token. |
-| [`PYTH_PRO_TOKEN_URL`](../sdk/connecting.md) | const | Where a Pyth Pro API key is exchanged for a short-lived token. |
 | [`connect`](../sdk/connecting.md) | function | Read the deployment's wiring from its factory and return a context bound to it. |
 | [`requirePrices`](../sdk/connecting.md) | function | The context's price source; throws `ConnectError` when the context was connected without one. |
 | [`requireSubgraph`](../sdk/connecting.md) | function | The context's subgraph source; throws `ConnectError` when the context was connected without one. |
@@ -1153,11 +1152,6 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`ProSymbol`](../sdk/low-level.md) | interface | One entry of Pyth Pro's symbols registry. |
 | [`Print`](../sdk/low-level.md) | interface | One feed's price and the signed update that carries it. |
 | [`SignerCheck`](../sdk/low-level.md) | type | Says whether updates signed by a signer may be used. |
-| [`TokenProvider`](../sdk/low-level.md) | type | Returns the token to present: an API key (servers only) or a short-lived token minted from one. |
-| [`MintedToken`](../sdk/low-level.md) | interface | A short-lived token minted from an API key: the token, when it expires, its type. |
-| [`mintProToken`](../sdk/low-level.md) | function | Exchange a Pyth Pro API key for a short-lived token (server side). |
-| [`cachedToken`](../sdk/low-level.md) | function | A token provider that mints only when the token it holds is about to expire. |
-| [`UNKNOWN_EXPIRY_LIFETIME`](../sdk/low-level.md) | const | Seconds a token whose expiry is unknown is reused for by `cachedToken`. |
 | [`WebSocketConstructor`](../sdk/low-level.md) | type | A WebSocket constructor: the global one, or a package's. |
 | [`WebSocketLike`](../sdk/low-level.md) | interface | The parts of a WebSocket the client uses. |
 | [`AUTH_SUBPROTOCOL`](../sdk/low-level.md) | const | The subprotocol that marks the next entry of a WebSocket's subprotocol list as the token. |

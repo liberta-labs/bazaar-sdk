@@ -389,11 +389,8 @@ each answer for a minute (`ttl`); a "trusted" answer is then refreshed in the ba
 meanwhile for up to `maxAge` (10 minutes). A failed check's error is reduced to a short summary with
 every URL redacted, since the transport behind it may quote its own.
 
-**Tokens.** `mintProToken(apiKey)` exchanges an API key for a short-lived token (server side): over
-https only, unless `allowInsecure`, and never following a redirect. `cachedToken(mint)` turns any such
-call into a token provider that mints only when the held token is about to expire; an expiry already
-past or nearer than the margin is treated as unknown (the token is reused for 5 minutes) rather than
-minting a token for every request.
+**The key.** A `ProClient` for Pyth's own endpoints takes the API key as `token`, and is refused in a
+web page, where the key would be public.
 
 ```ts
 {{#include ../../examples/advanced/low-level-prices.ts:pro}}

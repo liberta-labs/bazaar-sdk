@@ -15,7 +15,7 @@ const bz = await Bazaar.connect({
   transport: window.ethereum,
   factory: "0x0000000000000000000000000000000000000000",
   chainId: 42161, // refuse to run against any other chain
-  prices: { token: pythToken }, // short-lived tokens from your backend: the Pyth Pro key stays on its server
+  prices: PRICES, // the Pyth Pro key stays on a server: see Connecting
 });
 const [user] = (await window.ethereum.request({ method: "eth_requestAccounts" })) as Address[];
 

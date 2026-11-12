@@ -196,9 +196,11 @@ client, and `prices/service.ts` keeps the live state.
   build on a continuously traded one (`NoFreshPriceError`).
 - **A Pyth Pro API key.** Pyth's own endpoints serve prices only to the holder of a Pyth Pro API key,
   so a `ProClient` for them without a token is refused when it is made (an `InputError` on
-  `prices.token`); in a browser the token is a short-lived one the app's backend mints from the key.
-  Without a token both the request API and every stream endpoint must be custom ones (a proxy that adds
-  the key, a local mock), and the symbols registry needs none.
+  `prices.token`), and so is one in a web page given the key, since anything a page holds is public. A
+  page reaches prices through a server: a relayer attaches them to its orders, or a proxy of its own
+  adds the key. Without a token both the request API and every stream endpoint must be custom ones (a
+  proxy that adds the key, a local mock), and the symbols registry needs none. In a browser a token for
+  a custom endpoint is presented on the stream through the `pyth-lazer-auth` subprotocol.
 - **The keeper's client.** The keeper builds one `ProClient` from `prices` (the endpoint's three places,
   the token, the channel); `prices.endpoint` defaults to `pyth`, and config validation refuses Pyth's
   own endpoints without `prices.token` (a `ConfigError` naming it, which the keeper also raises in

@@ -5,7 +5,7 @@ import type { Address, Hex } from "viem";
 const FACTORY: Address = "0x0000000000000000000000000000000000000000";
 const RELAYER_URL = "https://relayer.example.com/relay";
 
-const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: { token: pythToken } });
+const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY }); // no price source: the relayer attaches the price
 const [user] = (await window.ethereum.request({ method: "eth_requestAccounts" })) as Address[];
 const eth = await bz.markets.getMarket("ETH/USD");
 const show = (text: string) => console.log(text);

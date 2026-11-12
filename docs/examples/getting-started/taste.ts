@@ -6,7 +6,7 @@ const FACTORY: Address = "0x0000000000000000000000000000000000000000"; // the de
 
 // ANCHOR: taste
 const [user] = (await window.ethereum.request({ method: "eth_requestAccounts" })) as Address[];
-const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: { token: pythToken } }); // tokens from your backend
+const bz = await Bazaar.connect({ transport: window.ethereum, factory: FACTORY, prices: PRICES }); // signed Pyth Pro prices, for the order
 
 const eth = await bz.markets.getMarket("ETH/USD");
 const me = await bz.account.accountSnapshot(eth, user!);
