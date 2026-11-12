@@ -54,10 +54,19 @@ export interface CliDeps {
   opportunities(): Promise<OpportunitiesApi>;
   /** where Ctrl-C (SIGINT) and SIGTERM arrive */
   signals: SignalSource;
-  /** leave at once (a second Ctrl-C while stopping) */
+  /** leave at once (a second Ctrl-C while stopping, or a stop past its deadline) */
   exit(code: number): never;
+  /** seconds a stop may take before `keeper start` leaves without finishing it */
+  stopDeadlineSeconds: number;
   handlers: Handlers;
 }
+
+/**
+ * How long `keeper start` gives a stop. A supervisor allows a stopping process a fixed time before it
+ * kills it (fly.toml's kill_timeout allows the keeper 60 s); leaving first, with a line saying the
+ * stop was cut short, beats being killed in the middle of a write.
+ */
+export const STOP_DEADLINE_SECONDS = 50;
 
 export interface ConfigArgs {
   config: string;
@@ -423,13 +432,21 @@ async function cmdStart(a: StartArgs, d: CliDeps): Promise<number> {
   const k = await Keeper.create(cfg);
   const st: { stopping: Promise<void> | null; signalled: () => void } = { stopping: null, signalled: () => {} };
   const stopRequested = new Promise<void>((resolve) => (st.signalled = resolve));
+  let cutShort: ReturnType<typeof setTimeout> | undefined;
   const onSignal = (): void => {
     if (st.stopping) {
       d.out.err(c.yellow("stopping now, without waiting for in-flight transactions"));
       d.exit(130);
     }
     d.out.out("stopping: waiting for in-flight transactions…");
-    st.stopping = k.stop();
+    // The engine waits for the loop and the sends in flight for most of the deadline, leaving the
+    // rest for the shutdown claims and the snapshot; past the deadline the process leaves anyway.
+    const seconds = d.stopDeadlineSeconds;
+    st.stopping = k.stop({ timeout: Math.max(1, Math.floor(seconds * 0.7)) });
+    cutShort = setTimeout(() => {
+      d.out.err(c.yellow(`the stop did not finish within ${seconds} s: leaving without it`));
+      d.exit(1);
+    }, seconds * 1000);
     st.signalled();
   };
   d.signals.on("SIGINT", onSignal);
@@ -448,6 +465,7 @@ async function cmdStart(a: StartArgs, d: CliDeps): Promise<number> {
     d.signals.off("SIGINT", onSignal);
     d.signals.off("SIGTERM", onSignal);
     await k.close();
+    clearTimeout(cutShort); // after close(), which the deadline covers too
   }
   return 0;
 }
@@ -739,7 +757,8 @@ export function buildProgram(d: CliDeps, setCode: (code: number) => void): Comma
     .summary("run the enabled jobs until Ctrl-C")
     .description(
       "Run the enabled jobs until Ctrl-C. The first Ctrl-C (or SIGTERM) stops cleanly: in-flight transactions\n" +
-        "finish, collect runs if its onShutdown is set, and the snapshot is saved. A second one leaves at once.",
+        "finish, collect runs if its onShutdown is set, and the snapshot is saved. A second one leaves at once,\n" +
+        "and a stop still running after 50 s is cut short.",
     )
     .addOption(configOption())
     .option("--dry-run", "simulate and log, never send")
@@ -906,6 +925,7 @@ function defaultDeps(): CliDeps {
     opportunities: () => import("../keeper/ops/opportunities.js"),
     signals: process,
     exit: (code) => process.exit(code),
+    stopDeadlineSeconds: STOP_DEADLINE_SECONDS,
     handlers: DEFAULT_HANDLERS,
   };
 }

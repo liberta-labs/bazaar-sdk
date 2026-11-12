@@ -317,7 +317,7 @@ logged as it would be sent. `--only liquidation,triggers` runs just those jobs.
 
 The first Ctrl-C (or SIGTERM) stops cleanly: in-flight transactions get their receipts, `collect`
 claims your balances if its `onShutdown` is on (the default), and the snapshot is saved. A second
-Ctrl-C leaves at once. The next start resumes from the snapshot, replaying only the blocks it missed.
+Ctrl-C leaves at once, and a stop still running after 50 s is cut short. The next start resumes from the snapshot, replaying only the blocks it missed.
 
 ## 6. Read the Status
 

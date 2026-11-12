@@ -8,7 +8,7 @@
  */
 
 import { type Address, type Hex, getAddress } from "viem";
-import { ResponseTooLargeError, readTextCapped } from "../chain/rpc.js";
+import { ResponseTooLargeError, deadline, readTextCapped } from "../chain/rpc.js";
 import { redactUrl } from "../urls.js";
 
 /** Rows per page: the most a hosted graph-node returns for one `first:`. */
@@ -79,27 +79,34 @@ export class SubgraphClient {
 
   /** One GraphQL query; its `data`. HTTP failures, GraphQL errors and unreadable answers throw SubgraphError. */
   async query<T = Record<string, unknown>>(q: string, variables: Record<string, unknown> = {}): Promise<T> {
-    let r: Response;
-    try {
-      r = await this.fetchFn(this.#url, {
-        method: "POST",
-        headers: this.#headers,
-        body: JSON.stringify({ query: q, variables }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-    } catch (e) {
-      throw new SubgraphError(`subgraph unreachable: ${this.scrub(errorText(e))}`);
-    }
-    if (r.status >= 400) {
-      const text = await readTextCapped(r, 65_536, "the subgraph").catch(() => "");
-      throw new SubgraphError(`subgraph returned HTTP ${r.status}: ${this.scrub(text.slice(0, 200))}`);
-    }
+    const limit = deadline(this.timeoutMs);
     let out: unknown;
     try {
-      out = JSON.parse(await readTextCapped(r, this.maxResponseBytes, "the subgraph"));
-    } catch (e) {
-      if (e instanceof ResponseTooLargeError) throw new SubgraphError(e.message);
-      throw new SubgraphError(`subgraph returned an unreadable answer: ${this.scrub(errorText(e))}`);
+      let r: Response;
+      try {
+        r = await limit.race(
+          this.fetchFn(this.#url, {
+            method: "POST",
+            headers: this.#headers,
+            body: JSON.stringify({ query: q, variables }),
+            signal: limit.signal,
+          }),
+        );
+      } catch (e) {
+        throw new SubgraphError(`subgraph unreachable: ${this.scrub(errorText(e))}`);
+      }
+      if (r.status >= 400) {
+        const text = await limit.race(readTextCapped(r, 65_536, "the subgraph")).catch(() => "");
+        throw new SubgraphError(`subgraph returned HTTP ${r.status}: ${this.scrub(text.slice(0, 200))}`);
+      }
+      try {
+        out = JSON.parse(await limit.race(readTextCapped(r, this.maxResponseBytes, "the subgraph")));
+      } catch (e) {
+        if (e instanceof ResponseTooLargeError) throw new SubgraphError(e.message);
+        throw new SubgraphError(`subgraph returned an unreadable answer: ${this.scrub(errorText(e))}`);
+      }
+    } finally {
+      limit.clear();
     }
     if (!out || typeof out !== "object") throw new SubgraphError("subgraph returned an unreadable answer");
     const o = out as { data?: unknown; errors?: unknown };

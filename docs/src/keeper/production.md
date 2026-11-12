@@ -32,9 +32,10 @@ Deleting the snapshot forces that too. While the replay is 64 or more blocks beh
 price-driven planners wait for it to finish.
 
 **Stopping.** SIGINT or SIGTERM stops cleanly: no new call is dispatched, in-flight sends get their
-receipts (up to 60 s), `collect` claims every balance that covers its gas if `onShutdown` is on, and
-the snapshot is saved. A second signal leaves at once (exit code 130). Give your process manager at
-least 90 seconds before it kills the process.
+receipts (up to 35 s), `collect` claims every balance that covers its gas if `onShutdown` is on, and
+the snapshot is saved. A stop still running after 50 s is cut short: the keeper says so and exits
+with code 1. A second signal leaves at once (exit code 130). Give your process manager at least 60
+seconds before it kills the process.
 
 **Exit codes.** `bazaar keeper start` exits 0 after a clean stop, 2 for a configuration or wallet
 problem (fix the config; restarting will not help), and 1 for anything else (an RPC that cannot be
@@ -77,7 +78,7 @@ docker run -d --name keeper --restart unless-stopped --user "$(id -u):$(id -g)" 
 - **Store the keystore password in `.env`** when `init` asks. A detached container has no terminal to
   ask for it, and stops with `wallet default (default.json) needs a password: …`.
 - `docker stop keeper` sends SIGTERM, which stops the keeper cleanly. Docker waits 10 seconds by
-  default before killing; give it longer: `docker stop -t 90 keeper` (or `--stop-timeout 90` on
+  default before killing; give it longer: `docker stop -t 60 keeper` (or `--stop-timeout 60` on
   `docker run`).
 - Other commands run the same way: `docker exec keeper node /app/packages/keeper/dist/cli/main.js
   keeper status`, or `docker run --rm --user … -v … bazaar-keeper keeper earnings --since 7d`.
@@ -102,7 +103,7 @@ WorkingDirectory=/srv/keeper
 ExecStart=/usr/bin/node /opt/bazaar-sdk/packages/keeper/dist/cli/main.js keeper start -c /srv/keeper/bazaar-keeper.yaml
 # SIGTERM stops cleanly; give in-flight sends and the shutdown collect time to finish.
 KillSignal=SIGTERM
-TimeoutStopSec=90
+TimeoutStopSec=60
 Restart=on-failure
 RestartSec=10
 # A config or wallet error exits 2: restarting will not fix it.

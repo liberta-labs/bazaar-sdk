@@ -5,6 +5,7 @@
  * delivery is logged with the channel's name only.
  */
 
+import { deadline } from "@liberta-labs/bazaar-sdk";
 import type { AlertsConfig } from "../config/index.js";
 import { getLogger, printable } from "./logs.js";
 
@@ -92,16 +93,21 @@ export class Alerter {
   }
 
   private async post(channel: string, url: string, body: unknown, secrets: readonly string[]): Promise<void> {
+    const limit = deadline(this.#timeoutMs);
     try {
-      const r = await this.#fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(this.#timeoutMs),
-      });
+      const r = await limit.race(
+        this.#fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: limit.signal,
+        }),
+      );
       if (!r.ok) log.warning("could not deliver an alert to %s: HTTP %s", channel, r.status);
     } catch (e) {
       log.warning("could not deliver an alert to %s: %s", channel, describe(e, secrets));
+    } finally {
+      limit.clear();
     }
   }
 

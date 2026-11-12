@@ -902,6 +902,33 @@ describe("commands against the keeper", () => {
     expect(await done).toBe(0); // start() never returned (still connecting): the CLI does not wait for it
   }, 10_000);
 
+  it("start: a stop that runs past its deadline is cut short, exit 1", async () => {
+    const stops: unknown[] = [];
+    const k = {
+      start: () => new Promise<void>(() => {}),
+      stop: (opts: unknown) => {
+        stops.push(opts);
+        return new Promise<void>(() => {}); // the loop it waits for never ends
+      },
+      close: async () => {},
+    };
+    const signals = new EventEmitter();
+    const exits: number[] = [];
+    const cap = capture();
+    void main(["keeper", "start", "-c", cfgPath], {
+      out: cap.io,
+      signals,
+      exit: ((code: number) => void exits.push(code)) as never,
+      stopDeadlineSeconds: 0.1,
+      engine: engine({ Keeper: { create: async () => k } }),
+    });
+    await vi.waitFor(() => expect(signals.listenerCount("SIGTERM")).toBe(1));
+    signals.emit("SIGTERM");
+    expect(stops).toEqual([{ timeout: 1 }]);
+    await vi.waitFor(() => expect(exits).toEqual([1]));
+    expect(cap.err).toContain("the stop did not finish within 0.1 s: leaving without it");
+  });
+
   it("start: a keeper that cannot start is one line, exit 2", async () => {
     const k = { start: async () => Promise.reject(new ConfigError("refusing to start: the lens belongs to another factory")), close: async () => {} };
     const cap = capture();

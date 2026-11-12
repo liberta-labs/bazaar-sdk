@@ -377,6 +377,10 @@ describe("httpSubgraph", () => {
 
     const gql = H.httpSubgraph(KEYED, null, { fetch: fakeFetch(() => new Response(JSON.stringify({ errors: [{ message: "Type `Query` has no field `nope`" }] }))).f });
     await expect(gql.query("{ nope }")).rejects.toThrow(/refused the query: Type `Query` has no field `nope`/);
+
+    // A request that never settles and ignores its abort ends at the client's own deadline.
+    const stalled = H.httpSubgraph(KEYED, null, { fetch: (() => new Promise<Response>(() => {})) as typeof fetch, timeoutMs: 50 });
+    await expect(stalled.query("{ x }")).rejects.toThrow(/unreachable: The operation was aborted due to timeout/);
   });
 });
 

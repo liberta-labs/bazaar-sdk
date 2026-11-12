@@ -29,7 +29,7 @@ Errors print one readable line, with URLs and keys masked. Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | done |
-| 1 | the command failed (an unreachable RPC, a failed `doctor` check), or setup was cancelled |
+| 1 | the command failed (an unreachable RPC, a failed `doctor` check), setup was cancelled, or a stop ran past its 50 s deadline |
 | 2 | a usage, config or wallet problem: an unknown option, a missing `--market`, an invalid config, a wrong keystore password |
 | 130 | cancelled at a prompt, or stopped by a second Ctrl-C |
 
@@ -83,7 +83,8 @@ bazaar keeper start [-c bazaar-keeper.yaml] [--dry-run] [--only <jobs>]
 | `--only <jobs>` | comma-separated jobs to run, out of those the config enables; the rest are switched off for this run. Names in any style: `liquidation,triggers`, `terminal-settlement`, `sweep_expired` |
 
 Runs until Ctrl-C or SIGTERM. The first signal stops cleanly (in-flight transactions finish, collect
-runs if its `onShutdown` is set, the snapshot is saved); a second leaves at once.
+runs if its `onShutdown` is set, the snapshot is saved); a second leaves at once, and a stop still
+running after 50 s is cut short.
 
 ```bash
 bazaar keeper start --dry-run --only liquidation,triggers

@@ -14,7 +14,7 @@ import { webcrypto, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import { redactUrl } from "@liberta-labs/bazaar-sdk";
+import { deadline, redactUrl } from "@liberta-labs/bazaar-sdk";
 import { ctr } from "@noble/ciphers/aes.js";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2.js";
 import { scryptAsync } from "@noble/hashes/scrypt.js";
@@ -179,18 +179,23 @@ export class RemoteSigner implements Signer {
       from: this.address,
     };
     let out: { result?: unknown; error?: { message?: unknown } };
+    const limit = deadline(this.#timeoutMs);
     try {
-      const r = await this.#fetch(this.#url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_signTransaction", params: [params] }),
-        signal: AbortSignal.timeout(this.#timeoutMs),
-      });
+      const r = await limit.race(
+        this.#fetch(this.#url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_signTransaction", params: [params] }),
+          signal: limit.signal,
+        }),
+      );
       if (!r.ok) throw new WalletError(`remote signer ${this.displayUrl} answered HTTP ${r.status}`);
-      out = (await r.json()) as typeof out;
+      out = (await limit.race(r.json())) as typeof out;
     } catch (e) {
       if (e instanceof WalletError) throw e;
       throw new WalletError(`remote signer ${this.displayUrl} did not answer: ${this.#scrub(errorText(e))}`);
+    } finally {
+      limit.clear();
     }
     if (out && out.error) throw new WalletError(`remote signer refused: ${this.#scrub(String(out.error.message ?? "no reason given"))}`);
     const res = out?.result;

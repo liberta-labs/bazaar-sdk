@@ -1,7 +1,7 @@
 import { type Address, type Hex, encodeAbiParameters, keccak256 } from "viem";
 import { describe, expect, it } from "vitest";
 import { Chain, SendError } from "../src/chain/client.js";
-import { HttpError, JsonRpc, NEVER_RETRIED, type RequestArgs, RpcError, type Transport } from "../src/chain/rpc.js";
+import { HttpError, JsonRpc, NEVER_RETRIED, type RequestArgs, RpcError, type Transport, deadline } from "../src/chain/rpc.js";
 import { PROBE_ADDRESS, probeCodec } from "../src/probe/index.js";
 
 // Not a real transaction: sendRaw only hashes the bytes, so any type-2 envelope shape will do.
@@ -239,5 +239,48 @@ describe("JsonRpc", () => {
     await expect(new Chain(node(() => "hello")).call(A, "0x12345678")).rejects.toThrow(/not hex/);
     expect(await new Chain(node(() => "0xABCD")).call(A, "0x12345678")).toBe("0xabcd");
     expect(await new Chain(node(() => null)).call(A, "0x12345678")).toBe("0x");
+  });
+});
+
+describe("a request's deadline", () => {
+  // A fetch that neither settles nor acts on its abort signal: what a connection that went quiet looks like.
+  const stalled = (seen: AbortSignal[]) =>
+    ((_url: string, init?: RequestInit) => {
+      seen.push(init!.signal!);
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+
+  it("ends an exchange whose fetch never settles, tells the fetch to stop, and retries", async () => {
+    const seen: AbortSignal[] = [];
+    const rpc = new JsonRpc("https://rpc.example/rpc", { fetch: stalled(seen), timeoutMs: 50, retries: 1 });
+    const err = await rpc.request({ method: "eth_blockNumber" }).catch((e: unknown) => e);
+    expect((err as Error).name).toBe("TimeoutError");
+    expect(seen).toHaveLength(2); // the first attempt and its retry
+    expect(seen.every((s) => s.aborted)).toBe(true);
+  });
+
+  it("ends a body that stops halfway and never acts on the cancel", async () => {
+    const half = new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"result":');
+    const fetchHalf = (async () =>
+      new Response(
+        new ReadableStream({
+          start: (c) => c.enqueue(half),
+          cancel: () => new Promise<void>(() => {}),
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    const rpc = new JsonRpc("https://rpc.example/rpc", { fetch: fetchHalf, timeoutMs: 50, retries: 0 });
+    await expect(rpc.request({ method: "eth_blockNumber" })).rejects.toThrow(/aborted due to timeout/);
+  });
+
+  it("passes on what settles in time, and stops its timer when cleared", async () => {
+    const limit = deadline(50);
+    expect(await limit.race(Promise.resolve(7))).toBe(7);
+    limit.clear();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(limit.signal.aborted).toBe(false);
+    const late = deadline(10);
+    await expect(late.race(new Promise(() => {}))).rejects.toThrow(/aborted due to timeout/);
+    expect(late.signal.aborted).toBe(true);
   });
 });

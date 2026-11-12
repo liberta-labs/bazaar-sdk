@@ -61,6 +61,42 @@ export class ResponseTooLargeError extends Error {
 
 const size = (n: number) => (n % 1_048_576 === 0 ? `${n / 1_048_576} MiB` : `${n} bytes`);
 
+/** A time limit on one HTTP exchange; see {@link deadline}. */
+export interface Deadline {
+  /** Aborted once the time is up: pass it to fetch, so the request itself is cancelled. */
+  readonly signal: AbortSignal;
+  /** `p`, or a TimeoutError once the time is up, whichever comes first. */
+  race<T>(p: Promise<T>): Promise<T>;
+  /** Stop the timer. Call it once the exchange is over, however it ended. */
+  clear(): void;
+}
+
+/**
+ * A time limit of `ms` on one HTTP exchange: connecting, the headers and the body. The timer is held
+ * here rather than left to AbortSignal.timeout, and every await of the exchange races it, so the
+ * exchange ends by its deadline even when the fetch implementation never acts on the abort: a
+ * connection that goes quiet could otherwise leave a caller waiting indefinitely, and with it a loop
+ * that awaits the caller. The error is a DOMException named TimeoutError, as fetch's own abort is.
+ */
+export function deadline(ms: number): Deadline {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      controller.abort(e);
+      reject(e);
+    }, ms);
+  });
+  // An exchange that never raced the deadline must not report its expiry as an unhandled rejection.
+  expired.catch(() => {});
+  return {
+    signal: controller.signal,
+    race: <T>(p: Promise<T>) => Promise.race([p, expired]),
+    clear: () => clearTimeout(timer),
+  };
+}
+
 /**
  * A response's body as text, holding at most `maxBytes` of it: counted as the body arrives, after any
  * content-encoding is undone (so a compressed bomb is refused too), and refused at once when the
@@ -280,6 +316,27 @@ export class JsonRpc implements Transport {
     return err;
   }
 
+  /** One HTTP round trip of a request, ended by {@link deadline} at timeoutMs: its parsed answer. */
+  private async exchange(body: string): Promise<JsonRpcAnswer> {
+    const limit = deadline(this.timeoutMs);
+    try {
+      const r = await limit.race(this.#fetch(this.#url, { method: "POST", headers: this.#headers, body, signal: limit.signal }));
+      if (!r.ok) {
+        if (r.body) await limit.race(r.body.cancel()).catch(() => {});
+        // Never the raw URL: it often holds the provider's key.
+        const hint = r.status === 401 || r.status === 403 ? ": the provider refused the request; check the key in the URL" : "";
+        throw new HttpError(r.status, `HTTP ${r.status} from ${this.displayUrl}${hint}`);
+      }
+      const parsed: unknown = JSON.parse(await limit.race(readTextCapped(r, this.maxResponseBytes, this.displayUrl)));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`${this.displayUrl} answered with something that is not a JSON-RPC response`);
+      }
+      return parsed as JsonRpcAnswer;
+    } finally {
+      limit.clear();
+    }
+  }
+
   /**
    * One JSON-RPC call; its `result`. A JSON-RPC error throws {@link RpcError}, a non-2xx answer
    * {@link HttpError}, an answer over the byte limit {@link ResponseTooLargeError}; anything else that
@@ -293,23 +350,7 @@ export class JsonRpc implements Transport {
       await this.limiter.wait();
       let out: JsonRpcAnswer;
       try {
-        const r = await this.#fetch(this.#url, {
-          method: "POST",
-          headers: this.#headers,
-          body,
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
-        if (!r.ok) {
-          await r.body?.cancel().catch(() => {});
-          // Never the raw URL: it often holds the provider's key.
-          const hint = r.status === 401 || r.status === 403 ? ": the provider refused the request; check the key in the URL" : "";
-          throw new HttpError(r.status, `HTTP ${r.status} from ${this.displayUrl}${hint}`);
-        }
-        const parsed: unknown = JSON.parse(await readTextCapped(r, this.maxResponseBytes, this.displayUrl));
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error(`${this.displayUrl} answered with something that is not a JSON-RPC response`);
-        }
-        out = parsed as JsonRpcAnswer;
+        out = await this.exchange(body);
       } catch (e) {
         if (e instanceof ResponseTooLargeError || attempt >= retries) throw this.scrub(e);
         await sleep(delay);

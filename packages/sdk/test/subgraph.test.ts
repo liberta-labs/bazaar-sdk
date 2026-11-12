@@ -73,6 +73,11 @@ describe("subgraph client", () => {
       expect((err as Error).message).toMatch(expected);
       expect((err as Error).message).not.toContain(KEY);
     }
+    // A request that never settles and ignores its abort ends at the client's own deadline.
+    const stalled = (() => new Promise<Response>(() => {})) as typeof globalThis.fetch;
+    const late = await new SubgraphClient(URL_WITH_KEY, KEY, { fetch: stalled, timeoutMs: 50 }).query("{ x }").catch((e: unknown) => e);
+    expect(late).toBeInstanceOf(SubgraphError);
+    expect((late as Error).message).toMatch(/unreachable: The operation was aborted due to timeout/);
     const { fetch } = fakeFetch(() => json({ data: {} }));
     await expect(new SubgraphClient("https://sg.example/q", null, { fetch }).pages("positions", "", "", 1)).rejects.toThrow(SubgraphError);
     await expect(new SubgraphClient("https://sg.example/q", null, { fetch }).meta()).rejects.toThrow(SubgraphError);

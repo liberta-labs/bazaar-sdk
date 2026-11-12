@@ -28,6 +28,7 @@
  */
 
 import type { Address, Hex } from "viem";
+import { deadline } from "../chain/rpc.js";
 import { InputError } from "../client/calls.js";
 import { BAZAAR_EXPONENT } from "../constants.js";
 import { PYTH_PRO, isPythProPriceEndpoint } from "../networks.js";
@@ -755,8 +756,13 @@ export class ProClient {
       // whatever host the answer names.
       const redirect: RequestRedirect = Object.keys(headers).length > 0 ? "error" : "follow";
       if (body !== null) headers["Content-Type"] = "application/json";
-      r = await this.#fetch(url, { method: body === null ? "GET" : "POST", headers, body: body ?? undefined, redirect, signal: AbortSignal.timeout(this.#timeoutMs) });
-      answer = await bodyText(r);
+      const limit = deadline(this.#timeoutMs);
+      try {
+        r = await limit.race(this.#fetch(url, { method: body === null ? "GET" : "POST", headers, body: body ?? undefined, redirect, signal: limit.signal }));
+        answer = await limit.race(bodyText(r));
+      } finally {
+        limit.clear();
+      }
     } catch (e) {
       if (e instanceof ProError) throw e;
       throw new ProError(`price endpoint unreachable: ${this.#quote(reason(e), url)}`);

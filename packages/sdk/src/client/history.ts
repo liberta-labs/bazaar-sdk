@@ -23,6 +23,7 @@
  */
 
 import { type Address, type Hex, getAddress } from "viem";
+import { deadline } from "../chain/rpc.js";
 import { TRIGGER_PRICE_MASK } from "../constants.js";
 import { redactUrl } from "../urls.js";
 import { InputError } from "./calls.js";
@@ -67,27 +68,34 @@ export function httpSubgraph(url: string, apiKey?: string | null, opts: HttpSubg
   const scrub = (s: string) => (url ? s.split(url).join(display) : s);
   return {
     async query<T = unknown>(query: string, variables?: Record<string, unknown>): Promise<T> {
+      const limit = deadline(timeoutMs);
       let r: Response;
-      try {
-        r = await fetchFn(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ query, variables: variables ?? {} }),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        throw new SubgraphError(`the subgraph at ${display} is unreachable: ${scrub(msg)}`);
-      }
-      if (!r.ok) {
-        const hint = r.status === 401 || r.status === 403 ? ": the endpoint refused the request; check the API key" : "";
-        throw new SubgraphError(`HTTP ${r.status} from the subgraph at ${display}${hint}`, r.status);
-      }
       let out: { data?: T; errors?: { message?: string }[] };
       try {
-        out = (await r.json()) as typeof out;
-      } catch {
-        throw new SubgraphError(`the subgraph at ${display} did not answer with JSON`, r.status);
+        try {
+          r = await limit.race(
+            fetchFn(url, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ query, variables: variables ?? {} }),
+              signal: limit.signal,
+            }),
+          );
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          throw new SubgraphError(`the subgraph at ${display} is unreachable: ${scrub(msg)}`);
+        }
+        if (!r.ok) {
+          const hint = r.status === 401 || r.status === 403 ? ": the endpoint refused the request; check the API key" : "";
+          throw new SubgraphError(`HTTP ${r.status} from the subgraph at ${display}${hint}`, r.status);
+        }
+        try {
+          out = (await limit.race(r.json())) as typeof out;
+        } catch {
+          throw new SubgraphError(`the subgraph at ${display} did not answer with JSON`, r.status);
+        }
+      } finally {
+        limit.clear();
       }
       if (out.errors && out.errors.length) {
         const msg = out.errors.map((e) => e.message ?? "").join("; ").slice(0, 500);
