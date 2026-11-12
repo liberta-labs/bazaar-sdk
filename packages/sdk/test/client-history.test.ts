@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { type Address, type Hex, getAddress, toHex } from "viem";
 import { describe, expect, it } from "vitest";
 import { Chain } from "../src/chain/client.js";
@@ -380,12 +381,15 @@ describe("httpSubgraph", () => {
 });
 
 // The selections must name fields Bazaar's schema has. Checked against the schema when the Bazaar
-// checkout is next to this one (it is not shipped with the SDK).
-const SCHEMA = "C:/projects/bazaar/subgraph/schema.graphql";
+// checkout sits next to this one (../bazaar); the schema is not shipped with the SDK, so elsewhere the
+// check is skipped. The file is read only when present, since a skipped describe still runs its body
+// to collect the tests inside it.
+const SCHEMA = fileURLToPath(new URL("../../../../bazaar/subgraph/schema.graphql", import.meta.url));
+const SCHEMA_TEXT = existsSync(SCHEMA) ? readFileSync(SCHEMA, "utf8") : null;
 
-describe.skipIf(!existsSync(SCHEMA))("selections match schema.graphql", () => {
+describe.skipIf(SCHEMA_TEXT === null)("selections match schema.graphql", () => {
   const types = new Map<string, Map<string, string>>();
-  for (const m of readFileSync(SCHEMA, "utf8").matchAll(/type (\w+) @entity[^{]*\{([^}]*)\}/g)) {
+  for (const m of (SCHEMA_TEXT ?? "").matchAll(/type (\w+) @entity[^{]*\{([^}]*)\}/g)) {
     const fields = new Map<string, string>();
     for (const line of m[2]!.split("\n")) {
       const f = /^\s*(\w+):\s*\[?(\w+)/.exec(line);
