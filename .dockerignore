@@ -1,0 +1,14 @@
+# Only what the Dockerfile copies goes into the build context, so .env, keystores, node_modules and
+# local state never leave this machine (a remote builder such as Fly's receives the whole context).
+*
+!package.json
+!package-lock.json
+!tsconfig.base.json
+!LICENSE
+!README.md
+!packages/sdk/package.json
+!packages/sdk/tsconfig.json
+!packages/sdk/src
+!packages/keeper/package.json
+!packages/keeper/tsconfig.json
+!packages/keeper/src

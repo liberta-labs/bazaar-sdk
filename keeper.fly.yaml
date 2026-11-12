@@ -1,0 +1,58 @@
+# The keeper's config on Fly.io (see fly.toml). Secrets come from `fly secrets set`, referenced as ${NAME}.
+# state lives on the machine's own disk, so each deploy starts it empty: the keeper re-reads the markets
+# from the chain, and the earnings ledger begins again.
+
+network: arbitrum-sepolia
+factory: "0x9f077B7D49EE7B451ae0858e391dC6960F144612"   # the official Arbitrum Sepolia factory
+
+rpc:
+  http: ${RPC_HTTP_URL}             # https://sepolia-rollup.arbitrum.io/rpc: Arbitrum's public endpoint,
+                                    # which serves the default 2,000-block log ranges
+
+# How often the head and new logs are read; liquidations and triggers also plan on every new Pyth
+# print, so a slower tick delays noticing new orders and positions, not reacting to prices.
+engine:
+  tickSeconds: 1
+
+subgraph:
+  url: default
+
+prices:
+  endpoint: pyth
+  token: ${PYTH_PRO_TOKEN}
+
+wallets:
+  default:
+    type: privateKey
+    key: ${KEEPER_PRIVATE_KEY}
+
+jobs:
+  liquidation:
+    markets: all
+  triggers:
+    markets: all
+    minBountyUsd: 0.01
+  unload:
+    markets: all
+  adl:
+    markets: all
+  refresh:
+    markets: all
+  terminalSettlement:
+    markets: all
+    finalize: true
+  collect:
+    thresholdUsd: 5
+
+profit:
+  minProfitUsd: 0.001
+  gasSafetyMultiplier: 1.25
+  enforce: true            # false: send calls whatever they earn, held only by the budget's spend caps
+                           # (a job's own enforceProfit: false switches it off for that job alone)
+budget:
+  maxSpendUsdPerDay: 1000
+  maxLossUsdPerDay: 1000
+  minEthBalance: 0.001
+
+state:
+  dir: /config/state

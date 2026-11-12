@@ -1,0 +1,92 @@
+# Deploys the keeper to Fly.io (the app named in fly.toml) when its code or its deployment files change
+# on main.
+#
+# The SDK and keeper are type-checked and tested, and keeper.fly.yaml is loaded with the keeper's own
+# config loader, before anything is deployed: a config the keeper refuses would leave the machine
+# restarting forever. Fly builds the image from the Dockerfile on its own builders, and fly.toml places
+# keeper.fly.yaml as the machine's /config/bazaar-keeper.yaml.
+#
+# The keeper's secrets (RPC_HTTP_URL, PYTH_PRO_TOKEN, KEEPER_PRIVATE_KEY) live in Fly, never here. The
+# repository needs one secret:
+#   FLY_API_TOKEN_KEEPER  a deploy token for the keeper's app alone:
+#                         fly tokens create deploy -a bazaar-keeper-sepolia
+
+name: Deploy keeper
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/sdk/src/**"
+      - "packages/keeper/src/**"
+      - "packages/*/package.json"
+      - "packages/*/tsconfig.json"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.base.json"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "fly.toml"
+      - "keeper.fly.yaml"
+      - ".github/workflows/deploy-keeper.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time, and none cancelled halfway: a cancelled deploy can leave the machine mid-update.
+concurrency:
+  group: fly-keeper
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require the Fly deploy token
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_KEEPER }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::error::The repository secret FLY_API_TOKEN_KEEPER is not set. Create one with 'fly tokens create deploy -a bazaar-keeper-sepolia' and add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Build and type-check
+        run: |
+          npm run build
+          npm run typecheck:check
+
+      - name: Test
+        run: npm test
+
+      - name: Load keeper.fly.yaml with the keeper's own loader
+        # The secrets are placeholders: this checks the file's shape and settings, not the live values.
+        env:
+          RPC_HTTP_URL: https://sepolia-rollup.arbitrum.io/rpc
+          PYTH_PRO_TOKEN: placeholder-for-the-config-check
+          KEEPER_PRIVATE_KEY: "0x1111111111111111111111111111111111111111111111111111111111111111"
+        run: >-
+          node --input-type=module -e
+          'import { loadConfig } from "./packages/keeper/dist/config/index.js";
+          const c = loadConfig("keeper.fly.yaml");
+          console.log(`keeper.fly.yaml loads: ${c.network}, jobs ${Object.keys(c.jobs).filter((j) => c.jobs[j]).join(", ")}`);'
+
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # v1.6
+
+      - name: Deploy to Fly.io
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_KEEPER }}
+        # One machine only: two keepers on one key would collide on nonces.
+        run: flyctl deploy --remote-only --ha=false

@@ -1,0 +1,24 @@
+# The keeper on Fly.io: one always-on machine, no public address. Secrets (RPC_HTTP_URL,
+# PYTH_PRO_TOKEN, KEEPER_PRIVATE_KEY) are set with `fly secrets set`; keeper.fly.yaml becomes the
+# machine's /config/bazaar-keeper.yaml. Run exactly one machine: two keepers on one key collide on nonces.
+
+app = "bazaar-keeper-sepolia"
+primary_region = "iad"
+
+# SIGTERM stops the keeper cleanly: in-flight transactions finish and the snapshot is saved.
+kill_signal = "SIGTERM"
+kill_timeout = 60
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[files]]
+  guest_path = "/config/bazaar-keeper.yaml"
+  local_path = "keeper.fly.yaml"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
