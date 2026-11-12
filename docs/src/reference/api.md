@@ -457,6 +457,7 @@ USDC balance, allowance and approvals.
 | [`allowance.UsdcFunding`](../sdk/collateral.md) | interface | What `usdcFunding` returns: the USDC a call needs, the balance and allowance, and what to approve. |
 | [`allowance.faucetStatus`](../sdk/collateral.md#the-testnet-faucet) | function, bz | Whether `owner` can claim from the testnet USDC faucet now, and when it can next. |
 | [`allowance.claimFaucet`](../sdk/collateral.md#the-testnet-faucet) | function, bz | Claim test USDC from the deployment's testnet faucet (a `PreparedCall` sent from the wallet). |
+| `allowance.transferUsdc` | function, bz | A plain ERC-20 transfer of the deployment's USDC from one address to another (a `PreparedCall`); a testnet faucet service sends test USDC with it. |
 | [`allowance.FaucetStatus`](../sdk/collateral.md#the-testnet-faucet) | interface | What `faucetStatus` returns. |
 | [`allowance.FAUCET_ABI`](../sdk/collateral.md#the-testnet-faucet) | const | The testnet USDC's faucet functions. |
 

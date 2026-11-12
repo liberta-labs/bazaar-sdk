@@ -1,7 +1,7 @@
 import { type Abi, type Address, type Hex, decodeFunctionData, getAddress, keccak256, toBytes } from "viem";
 import { describe, expect, it } from "vitest";
 import { bazaarPairAbi } from "../src/abi/index.js";
-import { ERC20_ABI, FAUCET_ABI, approveUsdc, claimFaucet, faucetStatus, usdcFunding } from "../src/client/allowance.js";
+import { ERC20_ABI, FAUCET_ABI, approveUsdc, claimFaucet, faucetStatus, transferUsdc, usdcFunding } from "../src/client/allowance.js";
 import {
   TRADING_ACCOUNT_ABI,
   decodeTradingAccountResults,
@@ -583,6 +583,28 @@ describe("the testnet USDC faucet", () => {
     expect(s.canClaimNow).toBe(false);
     const e = await rejectsInput(claimFaucet(ctx, alice.address));
     expect(e.message).toMatch(/no faucet/);
+  });
+});
+
+describe("transferUsdc", () => {
+  it("builds a plain ERC-20 transfer of USDC from one address to another", async () => {
+    const { ctx } = fakeContext();
+    const call = await transferUsdc(ctx, alice.address, bob.address, 10_000_000000n);
+    expect(call.to).toBe(USDC);
+    expect(call.from).toBe(alice.address);
+    expect(call.action).toBe("transfer");
+    const d = decodeFunctionData({ abi: ERC20_ABI, data: call.data });
+    expect(d.functionName).toBe("transfer");
+    expect(d.args).toEqual([bob.address, 10_000_000000n]);
+    expect(call.summary).toBe(`Send 10000 USDC to ${bob.address}`);
+    expect(call.value).toBe(0n);
+    expect(call.pullsUsdc).toBe(0n);
+  });
+
+  it("refuses a zero amount and the zero address", async () => {
+    const { ctx } = fakeContext();
+    expect((await rejectsInput(transferUsdc(ctx, alice.address, bob.address, 0n))).field).toBe("amount");
+    expect((await rejectsInput(transferUsdc(ctx, alice.address, "0x0000000000000000000000000000000000000000", 1n))).field).toBe("to");
   });
 });
 

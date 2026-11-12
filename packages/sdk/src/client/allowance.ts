@@ -41,6 +41,16 @@ export const ERC20_ABI = [
     ],
     outputs: [{ name: "", type: "bool" }],
   },
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "value", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
   { type: "function", name: "name", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "string" }] },
   { type: "function", name: "version", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "string" }] },
   { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
@@ -137,6 +147,26 @@ export interface FaucetStatus {
   readonly canClaimNow: boolean;
   /** The latest block's time, which the token compares against. */
   readonly now: number;
+}
+
+/**
+ * Send `amountUsdc` (USDC units) of the deployment's USDC from `from` to `to`: a plain ERC-20 transfer.
+ * A service that hands out test USDC from its own stock uses it, as the testnet faucet does for users
+ * with no ETH. Refuses a zero or negative amount and a transfer to the zero address.
+ */
+export async function transferUsdc(ctx: BazaarContext, from: Address, to: Address, amountUsdc: bigint): Promise<PreparedCall> {
+  if (amountUsdc <= 0n || amountUsdc > MAX_UINT256) throw new InputError("amount", "That amount is out of range.");
+  const recipient = getAddress(to);
+  if (BigInt(recipient) === 0n) throw new InputError("to", "That is the zero address.");
+  return {
+    action: "transfer",
+    to: ctx.usdc,
+    data: erc20Data("transfer", recipient, amountUsdc),
+    value: 0n,
+    from: getAddress(from),
+    summary: `Send ${formatUsdcUnits(amountUsdc)} USDC to ${recipient}`,
+    pullsUsdc: 0n,
+  };
 }
 
 /**

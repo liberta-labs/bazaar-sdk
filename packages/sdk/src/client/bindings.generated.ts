@@ -9,7 +9,7 @@ export const CTX_FUNCTIONS = {
   insurance: ["depositToInsurance", "executeInsuranceWithdrawal", "getInsuranceDepositValue", "getInsuranceSharePrice", "getInsuranceWithdrawalBudget", "getInsuranceWithdrawalConstants", "getInsuranceWithdrawalLock", "insuranceExitPlan", "insuranceShares", "quoteInsuranceDeposit", "quoteInsuranceWithdrawal", "requestInsuranceWithdrawal"],
   signing: ["chainDeadline", "chainTime", "eip712Limits", "readMetaTxNonce", "verifyTypehashes"],
   permits: ["checkPermit", "permitNonce", "signPermit", "usdcPermitDomain"],
-  allowance: ["approveUsdc", "claimFaucet", "faucetStatus", "usdcAllowance", "usdcBalance", "usdcFunding"],
+  allowance: ["approveUsdc", "claimFaucet", "faucetStatus", "transferUsdc", "usdcAllowance", "usdcBalance", "usdcFunding"],
   relay: ["encodeRelayed", "relayedPull", "signRelayed", "verifyRelayed"],
   batching: ["readTradingAccountOwner", "walletSendCallsRequest"],
   history: ["accountDayData", "accountStats", "adlBatches", "adlFills", "adlWindows", "bookLevels", "candles", "collateralTransfers", "feeAccruals", "feeBalances", "feeClaims", "identifierUpgradeProposals", "insuranceEvents", "insuranceProviders", "insurerLevies", "insurerProposals", "insurerVotes", "integratorStats", "liquidations", "listingProposals", "metaTransactions", "order", "orderEvents", "orders", "pairDayData", "pairTerminations", "permitFailures", "positionChanges", "positionSnapshots", "positions", "protocolDayData", "subgraphLag", "terminalRatioUpdates", "terminationProposals", "trades"],
