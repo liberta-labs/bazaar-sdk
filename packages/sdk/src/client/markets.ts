@@ -534,6 +534,52 @@ export interface MarginView {
   readonly withdrawalFloorBp: bigint;
 }
 
+/**
+ * A new market's leverage cap (RiskParamsLib's warmup floor). Until the market is
+ * {@link WARMUP_SECONDS} old AND has stored {@link WARMUP_PRICES} prices, its initial margin is
+ * floored at {@link WARMUP_MIN_IMR_BP} (5x) on a 24/7 market and twice that (2.5x) on a trading-hours
+ * one. It is a floor: a margin curve that asks for more keeps its own number.
+ */
+export interface WarmupView {
+  /** The floor applies now: the market is younger than WARMUP_SECONDS or has stored fewer than WARMUP_PRICES prices. */
+  readonly active: boolean;
+  /** When the market was created (unix seconds). */
+  readonly createdTs: number;
+  /** When its age stops holding the floor (createdTs + WARMUP_SECONDS). */
+  readonly ageClearsAt: number;
+  /** Prices it has stored since it was created. */
+  readonly pricesStored: number;
+  /** The stored prices that clear the floor. */
+  readonly pricesNeeded: number;
+  /** The initial-margin floor while it applies, in basis points. */
+  readonly floorImrBp: bigint;
+  /** The most leverage the floor allows (10,000 / floorImrBp). */
+  readonly maxLeverage: number;
+}
+
+/** How long a new market's leverage cap lasts at least (RiskParamsLib.WARMUP_DURATION: 15 days). */
+export const WARMUP_SECONDS = 15 * 86_400;
+/** The prices a new market must store before its leverage cap lifts (RiskParamsLib.WARMUP_PRICE_UPDATE_THRESHOLD). */
+export const WARMUP_PRICES = 25_000;
+/** The cap's initial-margin floor on a 24/7 market (RiskParamsLib.WARMUP_MIN_IMR_BP: 20%, 5x). */
+export const WARMUP_MIN_IMR_BP = 2_000n;
+/** The floor on a trading-hours market: WARMUP_MIN_IMR_BP times NON_CONTINUOUSLY_TRADED_IMR_MULTIPLIER_BP (2x), 40%, 2.5x. */
+export const WARMUP_MIN_IMR_BP_SESSION = 4_000n;
+
+/** The warmup view from the pair's creation time and stored prices, judged at `now`. */
+export function warmupOf(continuous: boolean, createdTs: number, pricesStored: number, now: number): WarmupView {
+  const floorImrBp = continuous ? WARMUP_MIN_IMR_BP : WARMUP_MIN_IMR_BP_SESSION;
+  return {
+    active: now - createdTs < WARMUP_SECONDS || pricesStored < WARMUP_PRICES,
+    createdTs,
+    ageClearsAt: createdTs + WARMUP_SECONDS,
+    pricesStored,
+    pricesNeeded: WARMUP_PRICES,
+    floorImrBp,
+    maxLeverage: Number(BP_SCALE) / Number(floorImrBp),
+  };
+}
+
 export interface OpenInterestView {
   /** Sizes, BAZAAR precision (1e18 = one unit). */
   readonly long: bigint;
@@ -624,6 +670,8 @@ export interface MarketSnapshot extends MarketFlags {
   readonly markPrice: bigint;
   readonly funding: FundingView;
   readonly margin: MarginView;
+  /** The new-market leverage cap and how far the market is through it; null when the pair's state could not be read. */
+  readonly warmup: WarmupView | null;
   readonly openInterest: OpenInterestView;
   readonly insurance: InsuranceView;
   /** Realized bad debt beyond the insurance fund: non-zero means the pair is insolvent and settles. */
@@ -787,6 +835,7 @@ function buildSnapshot(
       maxLeverage: leverageFor(s.imrBp),
       withdrawalFloorBp: market.continuous ? s.mmrBp : s.imrBp,
     },
+    warmup: aux ? warmupOf(market.continuous, Number(aux.pairCreatedTs), Number(aux.priceUpdateCount), now) : null,
     openInterest: {
       long: s.longOi,
       short: s.shortOi,

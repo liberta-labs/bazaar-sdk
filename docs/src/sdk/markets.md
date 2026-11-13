@@ -87,6 +87,7 @@ re-derived without a read (see [Status](#status)).
 | `markPrice` | The mark at this block (the lens's `markPrice`); 0 before any qualifying print formed one. |
 | `funding` | Funding rates and the index. See [Funding](#funding). |
 | `margin` | The margin rates. |
+| `warmup` | The new-market leverage cap and how far the market is through it (null when the pair's state could not be read). |
 | `openInterest` | Open interest and the vault's inventory. |
 | `insurance` | The insurance fund and the vault's ledger. |
 | `deficit` | Realized bad debt beyond the insurance fund: non-zero means the pair is insolvent and settles. |
@@ -118,6 +119,20 @@ re-derived without a read (see [Status](#status)).
 | `withdrawalFloorBp` | The rate a position must keep as cash collateral when withdrawing: `mmrBp` on 24/7 markets, `imrBp` on trading-hours ones. |
 
 How these rates are set is in [Margin](https://docs.bazaar.finance/protocol/margin.html).
+
+`warmup` (`WarmupView`): a new market's initial margin is floored at 20% (5x) on a 24/7 market and 40%
+(2.5x) on a trading-hours one until it is 15 days old **and** has stored 25,000 prices
+(`WARMUP_SECONDS`, `WARMUP_PRICES`). The floor never lowers a margin the curve sets higher.
+
+| Field | Meaning |
+|---|---|
+| `active` | The floor applies now. |
+| `createdTs` | When the market was created (Unix seconds). |
+| `ageClearsAt` | When its age stops holding the floor: `createdTs` plus 15 days. |
+| `pricesStored`, `pricesNeeded` | Prices stored so far, and the 25,000 that clear the floor. A price is stored when a trade, a liquidation or a keeper refresh brings one in. |
+| `floorImrBp`, `maxLeverage` | The floor (`WARMUP_MIN_IMR_BP` or `WARMUP_MIN_IMR_BP_SESSION`) and the leverage it allows. |
+
+`markets.warmupOf(continuous, createdTs, pricesStored, now)` judges it at another time.
 
 `openInterest` (`OpenInterestView`): `long` and `short` (sizes), `longNotional` and `shortNotional`
 (at the stored spot), and `longInventory` and `shortInventory` (liquidated positions the vault holds,

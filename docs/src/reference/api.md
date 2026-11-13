@@ -178,6 +178,12 @@ One namespace per area of `@liberta-labs/bazaar-sdk`. Context-first functions ta
 | [`markets.StoredPrice`](../sdk/markets.md) | interface | The pair's stored oracle price (lastPairPrice): what its next call falls back to without a fresh one. |
 | [`markets.FundingView`](../sdk/markets.md) | interface | A snapshot's funding: the current and accruing rates per hour (1e18 = 100%), the index and projected index, the last accrual and the cap. |
 | [`markets.MarginView`](../sdk/markets.md) | interface | A snapshot's margin rates in basis points: initial, maintenance, and the 24 h lagged maintenance rate. |
+| [`markets.WarmupView`](../sdk/markets.md) | interface | A new market's leverage cap: whether it applies, when the market's age clears it, prices stored against the 25,000 needed, and the margin floor. |
+| [`markets.warmupOf`](../sdk/markets.md) | function | The warmup view from the pair's creation time and stored prices, judged at `now`. |
+| [`markets.WARMUP_SECONDS`](../sdk/markets.md) | const | How long a new market's leverage cap lasts at least (15 days). |
+| [`markets.WARMUP_PRICES`](../sdk/markets.md) | const | The prices a new market must store before its leverage cap lifts (25,000). |
+| [`markets.WARMUP_MIN_IMR_BP`](../sdk/markets.md) | const | The cap's initial-margin floor on a 24/7 market (20%, 5x). |
+| [`markets.WARMUP_MIN_IMR_BP_SESSION`](../sdk/markets.md) | const | The cap's floor on a trading-hours market (40%, 2.5x). |
 | [`markets.OpenInterestView`](../sdk/markets.md) | interface | A snapshot's open interest: long and short sizes and notionals, and the liquidated inventory the vault holds. |
 | [`markets.InsuranceView`](../sdk/markets.md) | interface | A snapshot's insurance fund: its balance, free capital, the seizure earmarked against inventory, its target ratio and its ledgers. |
 | [`markets.AdlView`](../sdk/markets.md) | interface | A snapshot's ADL state: whether a window is pending, its epoch, when it opened, and the auction's score threshold. |

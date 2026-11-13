@@ -15,6 +15,7 @@ import {
   marketSnapshot,
   marketSnapshots,
   marketStatusAt,
+  warmupOf,
 } from "../src/client/markets.js";
 import { ADL_MAX_SCORE, LIMBO_LEAD, MAX_UINT256 } from "../src/constants.js";
 import type { MarketState } from "../src/models.js";
@@ -195,6 +196,16 @@ describe("getMarket", () => {
   });
 });
 
+describe("warmupOf", () => {
+  it("holds the cap until the market is 15 days old and has stored 25,000 prices, both", () => {
+    const D = 86_400;
+    expect(warmupOf(true, 0, 25_000, 15 * D)).toMatchObject({ active: false, floorImrBp: 2_000n, maxLeverage: 5 });
+    expect(warmupOf(true, 0, 25_000, 15 * D - 1)).toMatchObject({ active: true });
+    expect(warmupOf(true, 0, 24_999, 100 * D)).toMatchObject({ active: true });
+    expect(warmupOf(false, 0, 0, 0)).toMatchObject({ active: true, ageClearsAt: 15 * D, pricesNeeded: 25_000, floorImrBp: 4_000n, maxLeverage: 2.5 });
+  });
+});
+
 describe("marketSnapshot", () => {
   it("reads a market's live state at one block in two batched calls", async () => {
     const { t, ctx } = setup({ a: { fundingIndex: 5n, projectedFundingIndex: 9n, longOi: 10n * E18, shortOi: 8n * E18 } });
@@ -229,6 +240,8 @@ describe("marketSnapshot", () => {
       maxRatePerHour: E18 / 1000n,
     });
     expect(s.margin).toEqual({ imrBp: 400n, mmrBp: 200n, laggedMmrBp: 150n, effectiveMmrBp: 150n, maxLeverage: 25, withdrawalFloorBp: 200n });
+    // Created long ago, but 1,234 stored prices are short of the 25,000 that lift the cap.
+    expect(s.warmup).toEqual({ active: true, createdTs: 1_690_000_000, ageClearsAt: 1_690_000_000 + 15 * 86_400, pricesStored: 1234, pricesNeeded: 25_000, floorImrBp: 2_000n, maxLeverage: 5 });
     expect(s.openInterest).toEqual({
       long: 10n * E18,
       short: 8n * E18,
