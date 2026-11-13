@@ -369,7 +369,7 @@ describe("ProClient requests", () => {
 
   it("lists the symbols registry without credentials", async () => {
     const entries = [
-      { pyth_lazer_id: 1, symbol: "Crypto.BTC/USD", name: "BTCUSD", description: "BITCOIN / US DOLLAR", asset_type: "crypto", min_channel: "real_time", state: "stable", schedule: "America/New_York;O,O,O,O,O,O,O;", exponent: -8, hermes_id: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
+      { pyth_lazer_id: 1, symbol: "Crypto.BTC/USD", name: "BTCUSD", description: "BITCOIN / US DOLLAR", asset_type: "crypto", min_channel: "real_time", state: "stable", schedule: "America/New_York;O,O,O,O,O,O,O;", market_sessions: { regular: { min_pub: 3, schedule: "America/New_York;O,O,O,O,O,O,O;", state: "stable" }, "bad name": { schedule: "x" }, empty: {} }, exponent: -8, hermes_id: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
       { pyth_lazer_id: "1304", symbol: "Equity.US.NFLX/USD", asset_type: "equity", min_channel: "fixed_rate@200ms", state: "stable" },
       { pyth_lazer_id: 0, symbol: "zero" },
       { pyth_lazer_id: 4_294_967_296, symbol: "too big" },
@@ -383,8 +383,8 @@ describe("ProClient requests", () => {
     expect(calls[0]!.method).toBe("GET");
     expect([...calls[0]!.headers.keys()]).toEqual([]); // no token, no proxy header: another host, public data
     expect(list).toEqual([
-      { id: 1, feedId: F1, symbol: "Crypto.BTC/USD", name: "BTCUSD", description: "BITCOIN / US DOLLAR", assetType: "crypto", minChannel: "real_time", state: "stable", schedule: "America/New_York;O,O,O,O,O,O,O;", exponent: -8, hermesId: "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
-      { id: 1304, feedId: fid(1304), symbol: "Equity.US.NFLX/USD", name: "", description: "", assetType: "equity", minChannel: "fixed_rate@200ms", state: "stable", schedule: "", exponent: null, hermesId: null },
+      { id: 1, feedId: F1, symbol: "Crypto.BTC/USD", name: "BTCUSD", description: "BITCOIN / US DOLLAR", assetType: "crypto", minChannel: "real_time", state: "stable", schedule: "America/New_York;O,O,O,O,O,O,O;", sessions: { regular: "America/New_York;O,O,O,O,O,O,O;" }, exponent: -8, hermesId: "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
+      { id: 1304, feedId: fid(1304), symbol: "Equity.US.NFLX/USD", name: "", description: "", assetType: "equity", minChannel: "fixed_rate@200ms", state: "stable", schedule: "", sessions: {}, exponent: null, hermesId: null },
     ]);
     await c.symbols();
     expect(calls[1]!.url.href).toBe("https://symbols.test/v1/symbols");
@@ -392,6 +392,22 @@ describe("ProClient requests", () => {
     await expect(new ProClient({ token: TOKEN, fetch: fakeFetch(() => json({ error: "?" })).fetch }).symbols()).rejects.toThrow(
       new ProError("the symbols registry answered with something that is not a list of feeds"),
     );
+  });
+
+  it("keeps every session the registry lists for a feed, schedules whole", async () => {
+    const holidays = Array.from({ length: 40 }, (_, i) => `${String((i % 12) + 1).padStart(2, "0")}${String((i % 28) + 1).padStart(2, "0")}/C`).join(",");
+    const regular = `America/New_York;0930-1600,0930-1600,0930-1600,0930-1600,0930-1600,C,C;${holidays}`;
+    const night = "America/New_York;0000-0400&2000-2400,0000-0400&2000-2400,0000-0400&2000-2400,0000-0400&2000-2400,0000-0400,C,2000-2400;";
+    const post = "America/New_York;1600-2000,1600-2000,1600-2000,1600-2000,1600-2000,C,C;";
+    const entries = [
+      { pyth_lazer_id: 922, symbol: "Equity.US.AAPL/USD", schedule: regular, market_sessions: { regular: { min_pub: 3, schedule: regular }, over_night: { schedule: night }, "pre market": { schedule: post }, empty: { schedule: "" } } },
+      { pyth_lazer_id: 923, symbol: "Equity.US.KMX/USD", market_session_schedule: { regular, post_market: post } },
+      { pyth_lazer_id: 924, symbol: "Equity.US.ODD/USD", market_sessions: ["regular"] },
+    ];
+    const list = await new ProClient({ token: TOKEN, symbolsUrl: "https://symbols.test", fetch: fakeFetch(() => json(entries)).fetch }).symbols();
+    expect(regular.length).toBeGreaterThan(256);
+    expect(list.map((e) => e.sessions)).toEqual([{ regular, over_night: night }, { regular, post_market: post }, {}]);
+    expect(list[0]!.schedule).toBe(regular);
   });
 
   it("makes the registry's text printable and bounded", async () => {

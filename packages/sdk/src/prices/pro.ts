@@ -283,6 +283,10 @@ export const MAX_STREAM_NOTICES = 64;
 const MAX_QUOTED = 200;
 /** The longest piece of text a ProSymbol field keeps from the registry. */
 const MAX_SYMBOL_TEXT = 256;
+/** The longest schedule a ProSymbol keeps: room for a week of sessions and a year of holidays. */
+const MAX_SCHEDULE_TEXT = 1024;
+/** The most sessions a ProSymbol keeps from one registry entry. */
+const MAX_SESSIONS = 8;
 /**
  * The shortest header value or URL part masked in messages: nothing shorter can hold a credential,
  * and masking a value of a character or two would garble every message.
@@ -406,8 +410,20 @@ export interface ProSymbol {
   readonly minChannel: string;
   /** The feed's lifecycle state, as the registry words it. */
   readonly state: string;
-  /** The feed's trading schedule, as the registry words it. */
+  /**
+   * The feed's regular trading schedule, as the registry words it:
+   * "<time zone>;<seven daily sessions, Monday first>;<holiday overrides>", each day "O" (open all
+   * day), "C" (closed) or "HHMM-HHMM" ranges joined by "&".
+   */
   readonly schedule: string;
+  /**
+   * Every session Pyth publishes the feed in, by the registry's name for it ("regular",
+   * "pre_market", "post_market", "over_night"), each worded as `schedule` is. A US stock with
+   * extended hours has all four, which together run from Sunday evening to Friday evening in New
+   * York; one with the regular session alone is priced during its exchange's hours only. Empty when
+   * the registry lists none.
+   */
+  readonly sessions: Readonly<Record<string, string>>;
   readonly exponent: number | null;
   /** The feed's Pyth Core id, when it has one. */
   readonly hermesId: Hex | null;
@@ -587,7 +603,24 @@ function cleartext(url: string): string | null {
 }
 
 /** A registry field as text fit to show: printable, and bounded. */
-const text = (v: unknown): string => (typeof v === "string" ? printable(v, MAX_SYMBOL_TEXT) : "");
+const text = (v: unknown, max = MAX_SYMBOL_TEXT): string => (typeof v === "string" ? printable(v, max) : "");
+
+/**
+ * The sessions of a registry entry: `market_sessions` ({ name: { schedule } }), else
+ * `market_session_schedule` ({ name: schedule }). A name other than letters, digits and underscores,
+ * or a session without a schedule, is left out.
+ */
+function sessionsOf(o: Record<string, unknown>): Readonly<Record<string, string>> {
+  const raw = o.market_sessions ?? o.market_session_schedule;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return Object.freeze({});
+  const kept: [string, string][] = [];
+  for (const [name, v] of Object.entries(raw)) {
+    if (kept.length === MAX_SESSIONS) break;
+    const schedule = text(v !== null && typeof v === "object" ? (v as Record<string, unknown>).schedule : v, MAX_SCHEDULE_TEXT);
+    if (/^[A-Za-z0-9_]{1,32}$/.test(name) && schedule) kept.push([name, schedule]);
+  }
+  return Object.freeze(Object.fromEntries(kept));
+}
 
 function toSymbol(item: unknown): ProSymbol | null {
   if (item === null || typeof item !== "object") return null;
@@ -606,7 +639,8 @@ function toSymbol(item: unknown): ProSymbol | null {
     assetType: text(o.asset_type),
     minChannel: text(o.min_channel),
     state: text(o.state),
-    schedule: text(o.schedule),
+    schedule: text(o.schedule, MAX_SCHEDULE_TEXT),
+    sessions: sessionsOf(o),
     exponent: expo,
     hermesId: hermes !== null && hermes.length === 66 ? hermes : null,
   };

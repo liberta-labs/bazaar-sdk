@@ -39,6 +39,7 @@ const entry = (id: number, symbol: string, assetType: string, minChannel: string
   minChannel,
   state: "stable",
   schedule: "",
+  sessions: {},
   exponent: -8,
   hermesId: null,
 });

@@ -153,7 +153,7 @@ price without a stream. `ProClient` is the client underneath:
 | `latest(ids)` | The latest prints for these feeds, all from one signed update (a feed without a usable live price is left out). |
 | `latestUpdate(ids)` | The same update whole, as a `ProUpdate`: `blob`, `signer`, `timestampUs`, `channel`, every feed's entry (`feeds`), and its `prints`. |
 | `atTick(ids, second)` | The one-second channel's update stamped exactly `second`, or `null` when there is none: what settlement proofs are made of. |
-| `symbols({ query?, assetType? })` | Pyth Pro's symbols registry: each feed's number, symbol, asset type, fastest channel, state and schedule. Needs no token. |
+| `symbols({ query?, assetType? })` | Pyth Pro's symbols registry: each feed's number, symbol, asset type, fastest channel, state, schedule and the sessions Pyth publishes it in. Needs no token. |
 | `stream(feeds, signal?, { idleTimeout?, onNotice? })` | An async iterator of print batches from every stream endpoint, each update yielded once. `feeds` is one set of feeds or a list of sets; each set is its own subscription. Aborting `signal`, `break`ing out of the loop or `close()` ends it. It throws a `ProError` when no endpoint can be reached, and when no new update arrives for `idleTimeout` seconds (default 10). |
 | `close()` | Ends every open stream. |
 | `displayUrl` | The request API's base URL with any key masked. |

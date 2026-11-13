@@ -33,7 +33,7 @@ Each entry is a `MarketInfo`:
 | `baseFeedId` | `Hex` | The pair's price id: a Pyth feed id, or a composite's id. |
 | `legs` | `Hex[]` | The raw Pyth feeds: one, or base then quote for a composite. |
 | `legSymbols` | `string[]` | Each leg's Pyth symbol ("Crypto.BTC/USD", "Equity.US.AAPL/USD"); `""` where the registry has none. |
-| `legFeeds` | `(ProSymbol \| null)[]` | Each leg's entry in Pyth Pro's symbols registry: `id`, `symbol`, `assetType`, `minChannel` (the fastest channel it is served on), `state`, `schedule`. `null` where the registry has none or was not read. |
+| `legFeeds` | `(ProSymbol \| null)[]` | Each leg's entry in Pyth Pro's symbols registry: `id`, `symbol`, `assetType`, `minChannel` (the fastest channel it is served on), `state`, `schedule` (the regular session's), `sessions` (every session Pyth publishes the feed in: a US stock with extended hours has `regular`, `pre_market`, `post_market` and `over_night`, which together run Sunday evening to Friday evening in New York). `null` where the registry has none or was not read. |
 | `composite` | `boolean` | Priced from two feeds composed by the oracle. |
 | `invertQuote` | `boolean` | A composite's quote leg is inverted. |
 | `continuous` | `boolean` | Traded 24/7. |

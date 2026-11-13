@@ -259,7 +259,7 @@ describe("proposePairDeployment", () => {
   });
 
   it("checks the feed against Pyth Pro's symbols registry when one is at hand", async () => {
-    const btc: ProSymbol = { id: 0xaaa1, feedId: FEED, symbol: "Crypto.BTC/USD", name: "BTCUSD", description: "", assetType: "crypto", minChannel: "real_time", state: "stable", schedule: "", exponent: -8, hermesId: null };
+    const btc: ProSymbol = { id: 0xaaa1, feedId: FEED, symbol: "Crypto.BTC/USD", name: "BTCUSD", description: "", assetType: "crypto", minChannel: "real_time", state: "stable", schedule: "", sessions: {}, exponent: -8, hermesId: null };
     const fx: ProSymbol = { ...btc, id: 0xf0f0, feedId: FX, symbol: "FX.GBP/USD", assetType: "fx", minChannel: "fixed_rate@200ms", schedule: "America/New_York;O,O,O,O,O,C,C;" };
     const symbols = vi.fn(async () => [btc, fx]);
     const c = await proposePairDeployment(s.ctx, args({ registry: { symbols } }));
@@ -303,6 +303,7 @@ describe("proposePairDeployment", () => {
       minChannel: "real_time",
       state: "stable\u202e",
       schedule: "",
+      sessions: {},
       exponent: -8,
       hermesId: null,
     };
@@ -465,7 +466,7 @@ describe("listing reads and the settle / release / refund calls", () => {
 });
 
 describe("the symbols registry", () => {
-  const entry = (id: number): ProSymbol => ({ id, feedId: b32(id), symbol: `Crypto.T${id}/USD`, name: "", description: "", assetType: "crypto", minChannel: "real_time", state: "stable", schedule: "", exponent: -8, hermesId: null });
+  const entry = (id: number): ProSymbol => ({ id, feedId: b32(id), symbol: `Crypto.T${id}/USD`, name: "", description: "", assetType: "crypto", minChannel: "real_time", state: "stable", schedule: "", sessions: {}, exponent: -8, hermesId: null });
 
   it("keeps a listing for its time to live, and never an empty or failed one", async () => {
     let now = 0;

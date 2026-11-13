@@ -481,6 +481,7 @@ describe("labels", () => {
     minChannel: "real_time",
     state: "stable",
     schedule: "",
+    sessions: {},
     exponent: -8,
     hermesId: null,
     ...over,
