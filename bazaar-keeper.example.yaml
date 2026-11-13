@@ -15,6 +15,7 @@ rpc:
 
 subgraph:
   url: default                      # default (the preset's subgraph, falling back to chain logs) | none | a GraphQL URL
+  # apiKey: ${SUBGRAPH_API_KEY}     # a key for a gateway that asks for one (The Graph's), sent as Authorization: Bearer
 
 prices:
   endpoint: pyth                    # pyth (Pyth Pro, the default) | the URL of a Pyth Pro compatible service

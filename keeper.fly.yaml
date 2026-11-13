@@ -15,7 +15,8 @@ engine:
   tickSeconds: 1
 
 subgraph:
-  url: default
+  url: ${SUBGRAPH_URL:-default}
+  apiKey: ${SUBGRAPH_API_KEY:-}
 
 prices:
   endpoint: pyth
