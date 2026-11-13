@@ -159,6 +159,7 @@ registry needs no token either way.
 | `WebSocket` | the global one | The WebSocket constructor to stream with. Node before 22 has none: pass a package's, such as `ws`. |
 | `streamAuth` | by runtime | `"header"` or `"subprotocol"`: how a stream connection presents the token. Defaults to the subprotocol in a browser or a web worker, the header elsewhere. |
 | `isTrustedSigner` | none | `(signer) => boolean`: when set, the signer of each update the client takes is recovered and an update it refuses is never used. `connect` sets it for you (below). |
+| `signerCheckInterval` | 0 | How a stream spends its signer checks. 0 checks every update the stream takes. A positive value takes an update carrying exactly its subscription's feeds unchecked (its prints' `signer` is null) once an endpoint at another URL delivers the same bytes, since Pyth's endpoints send identical signed updates. An update no other endpoint confirms within `CORROBORATION_WINDOW` (0.5) seconds is checked, and so is every update while fewer than two endpoints are open, or one carrying other feeds than its subscription's. Two endpoints sending different updates of the same feeds for one instant have both checked, and an endpoint whose update fails is dropped. A random sample of the confirmed updates is checked too, about one per this many seconds. While every endpoint is up and serves every feed, the checking costs the same however many feeds are streamed. Corroboration needs independent endpoints: leave it at 0 behind one proxy. Updates from requests are always checked. Check the update a decision rests on with `verifySigner` before acting on it. |
 | `allowInsecure` | `false` | Send credentials over plain `http://` or `ws://` to an endpoint that is not this machine: the token and headers, and a user name, password or query inside an endpoint's URL. Refused otherwise. Only a host that is exactly `localhost`, an address in `127.0.0.0/8` or `[::1]` counts as this machine (a name under `.localhost` does not: it may be resolved through DNS). |
 | `clock` | the system clock | Unix seconds a streamed update's own timestamp is judged against (a keeper passes the chain's). |
 | `maxUpdateAhead` | 60 (`MAX_UPDATE_AHEAD`) | Seconds a streamed update may be stamped ahead of `clock`; an endpoint sending one further ahead is dropped and reconnected later. |
@@ -180,7 +181,8 @@ a token or headers never follows a redirect.
 verifier contract trusts. `connect` gives the source the same test: it reads the verifier from the
 deployment's oracle (`pythLazer()`) and asks it `isValidSigner(signer)` for each new signer, keeping
 the answer for a minute. An update signed by anyone else is refused before it becomes a price your
-page shows or a call carries. Checking costs one signature recovery per update; pass
+page shows or a call carries. Checking costs one signature recovery per update (a stream with a
+`signerCheckInterval` checks only the updates two endpoints do not agree on, and a sample); pass
 `checkSigners: false` to leave the source as you gave it. The chain verifies every update a call
 carries either way.
 

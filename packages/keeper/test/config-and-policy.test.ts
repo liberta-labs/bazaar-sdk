@@ -75,7 +75,7 @@ describe("config", () => {
 
   it("prices: Pyth Pro's endpoints, a base URL's, and each one overridden", () => {
     const pyth = parseConfig(base({ prices: { endpoint: "pyth", token: "made-up-token" } })).prices;
-    expect(pyth).toMatchObject({ channel: "fixed_rate@200ms", stream: true, checkSigners: true, streamIdleTimeoutSeconds: 10, token: "made-up-token" });
+    expect(pyth).toMatchObject({ channel: "fixed_rate@200ms", stream: true, checkSigners: true, signerCheckIntervalSeconds: 10, streamIdleTimeoutSeconds: 10, token: "made-up-token" });
     expect(priceEndpoints(pyth)).toEqual(PYTH_PRO);
     // A base URL names all three: the request API and the registry there, the stream at its /v1/stream.
     expect(priceEndpoints(parseConfig(base({ prices: { endpoint: "http://127.0.0.1:8787/" } })).prices)).toEqual({
@@ -99,6 +99,7 @@ describe("config", () => {
   it("prices: what the config refuses", () => {
     expect(() => parseConfig(base({ prices: { endpoint: "pyth", channel: "fixed_rate@1ms" } }))).toThrow(/prices\.channel: Invalid enum value/);
     expect(() => parseConfig(base({ prices: { endpoint: "pyth", streamUrls: [] } }))).toThrow(/prices\.streamUrls/);
+    expect(() => parseConfig(base({ prices: { endpoint: "pyth", signerCheckIntervalSeconds: -1 } }))).toThrow(/prices\.signerCheckIntervalSeconds/);
     // The setting that holds the token is named, and where it belongs.
     expect(() => parseConfig(base({ prices: { endpoint: "pyth", apiKey: "made-up-token" } }))).toThrow(
       "prices: Unrecognized key(s) in object: 'apiKey' (prices.apiKey is not a setting: the Pyth Pro API key goes in prices.token " +
@@ -153,6 +154,9 @@ describe("config", () => {
     expect(err).toBeInstanceOf(ConfigError);
     expect((err as Error).message).toBe(`prices.token: ${PRO_KEY_REQUIRED}`);
     expect(new Keeper(cfg, { loadWallets: false }).pro.restUrl).toBe(PYTH_PRO.restUrl);
+    // The client samples its signer checks at the configured interval; 0 checks every update.
+    expect(new Keeper(cfg, { loadWallets: false }).pro.signerCheckInterval).toBe(10);
+    expect(new Keeper({ ...cfg, prices: { ...cfg.prices, signerCheckIntervalSeconds: 0 } }, { loadWallets: false }).pro.signerCheckInterval).toBe(0);
   });
 
   it("prices: a file whose key reference fills in empty is told about the key", () => {

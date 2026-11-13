@@ -20,10 +20,11 @@ subgraph:
 prices:
   endpoint: pyth
   token: ${PYTH_PRO_TOKEN}
-  # The keeper recovers the signer of every update it takes, one per market per interval, in pure
-  # JavaScript. On a shared-cpu-1x machine the 200 ms default outruns the CPU it is allowed once its
-  # burst is spent, and the keeper stalls; one update a second per market stays well inside it, and a
-  # print at most a second old is still fresh enough to act on. Each market listed adds to the load.
+  # The stream brings one update per market per interval, and reading each costs CPU; an update two
+  # endpoints deliver alike needs no signer check (signerCheckIntervalSeconds), so while Pyth's
+  # endpoints are up the checks cost the same whatever the number of markets. One update a second per
+  # market keeps a shared-cpu-1x machine well inside the CPU it is allowed once its burst is spent, and
+  # a print at most a second old is fresh enough to act on.
   channel: fixed_rate@1000ms
 
 wallets:

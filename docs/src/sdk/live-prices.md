@@ -149,7 +149,7 @@ price without a stream. `ProClient` is the client underneath:
 
 | Member | What it does |
 |---|---|
-| `new ProClient(options)` | The options of [Connecting](connecting.md#prices): `token`, `channel`, the URLs, `WebSocket`, `isTrustedSigner`. A token or header with a line break is refused at once. |
+| `new ProClient(options)` | The options of [Connecting](connecting.md#prices): `token`, `channel`, the URLs, `WebSocket`, `isTrustedSigner`, `signerCheckInterval`. A token or header with a line break is refused at once. |
 | `latest(ids)` | The latest prints for these feeds, all from one signed update (a feed without a usable live price is left out). |
 | `latestUpdate(ids)` | The same update whole, as a `ProUpdate`: `blob`, `signer`, `timestampUs`, `channel`, every feed's entry (`feeds`), and its `prints`. |
 | `atTick(ids, second)` | The one-second channel's update stamped exactly `second`, or `null` when there is none: what settlement proofs are made of. |
@@ -198,7 +198,7 @@ little (custom freshness margins).
 | `printsFor(feeds)` | The prints a call reading these feeds together would attach. |
 | `latestFor(market)` | The prints of the most recently issued update the service holds for the market's legs, however old their prices (each print's `timestampUs` is when its update was issued), or `null`. |
 | `liquidationUpdate(market, now?, margin?)` | What a liquidation on the market attaches now: a fresh price's update (`kind: "fresh"`), else on a market with trading hours Pyth's latest one when it was issued within `3 − margin` seconds of `now` and its price at most 57 seconds before that (`kind: "latest"`), else nothing (`kind: null`) and `reason`. See [Low-Level Building Blocks](low-level.md#priceservice). |
-| `ethUsd(now?)` | USD per ETH from the newest ETH/USD print, or `null` when stale or out of bounds. |
+| `ethUsd(now?)` | USD per ETH from the newest ETH/USD print (whose signer is confirmed, when the source checks signers), or `null` when stale or out of bounds. |
 | `missing()` | Watched feeds with no print yet. |
 | `healthy`, `lastError`, `lastUpdate`, `latest` | State, readable. |
 | `stop()` | Ends `run` and its stream. |

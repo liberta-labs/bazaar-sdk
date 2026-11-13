@@ -51,6 +51,7 @@ import {
   feedIdHex,
   isRawFeedId,
   normalizeHex,
+  peekTimestamp,
   proFeedId,
   readUpdate,
   recoverSigner,
@@ -78,7 +79,11 @@ export interface Print {
   readonly timestampUs: bigint;
   /** The channel number the update was produced on (lazer.ts CHANNEL_IDS). */
   readonly channel: number;
-  /** The address that signed the update, when the source checks signers; null when it does not. */
+  /**
+   * The address that signed the update, when the source checked it; null when it did not: a source
+   * without a signer check, or a stream update taken unchecked because a second endpoint delivered the
+   * same bytes (see {@link ProClientOptions.signerCheckInterval}).
+   */
   readonly signer: Address | null;
   /** The signed update to attach to a call. */
   readonly blob: Hex;
@@ -116,6 +121,23 @@ export class ProError extends Error {
 export class NoLivePriceError extends ProError {
   override readonly name: string = "NoLivePriceError";
 }
+
+/** How many updates {@link ProClient.verifySigner} remembers having confirmed. */
+export const MAX_CONFIRMED_UPDATES = 256;
+
+/**
+ * Seconds an update one stream endpoint brought waits for another endpoint's copy before its signer
+ * is checked instead (see {@link ProClientOptions.signerCheckInterval}). Pyth's endpoints deliver the
+ * copies of an instant within a small fraction of this of one another.
+ */
+export const CORROBORATION_WINDOW = 0.5;
+
+/**
+ * Seconds between a subscription's updates on each channel, for sizing the random sample of signer
+ * checks. real_time has no fixed period and counts as the fastest fixed rate, which can only make the
+ * sample larger.
+ */
+const CHANNEL_PERIOD: Readonly<Record<Channel, number>> = { real_time: 0.05, "fixed_rate@50ms": 0.05, "fixed_rate@200ms": 0.2, "fixed_rate@1000ms": 1 };
 
 /** The signer check itself failed, so nothing is known about the update's signer. */
 class UnconfirmedSigner extends ProError {}
@@ -336,6 +358,23 @@ export interface ProClientOptions {
    * update a call carries).
    */
   isTrustedSigner?: SignerCheck | null;
+  /**
+   * With `isTrustedSigner` set, how the stream spends its signer checks. 0 (the default) checks every
+   * update the stream takes. A positive value takes an update carrying exactly its subscription's
+   * feeds without a check once an endpoint at another URL delivers the same bytes: Pyth's endpoints
+   * send identical signed updates, so a forged one is taken unchecked only if two endpoints agree on
+   * it. An update no other endpoint confirms within {@link CORROBORATION_WINDOW} seconds is checked,
+   * and so is every update while fewer than two endpoints are open, or one carrying other feeds than
+   * its subscription's. When two endpoints send different updates of the same feeds for one instant,
+   * both are checked and an endpoint whose update fails is dropped. A random sample of the confirmed
+   * updates is checked too, about one per this many seconds, in case several endpoints are
+   * compromised at once. Corroboration needs independent endpoints: one proxy in front of them all
+   * would confirm its own updates. Prints taken unchecked carry no signer. While every endpoint is up
+   * and serves every feed, the checking costs the same however many feeds are streamed. Where a
+   * decision does not go through the chain, check the update it rests on with
+   * {@link ProClient.verifySigner} first. Updates from requests are always checked.
+   */
+  signerCheckInterval?: number | null;
   /**
    * Send credentials over plain http or ws to an endpoint that is not this machine: the token and the
    * headers, and a user name, password or query string inside an endpoint's URL (a proxy may read a key
@@ -583,6 +622,8 @@ export class ProClient {
   readonly streamAuth: "header" | "subprotocol";
   /** See {@link ProClientOptions.isTrustedSigner}. May be set after construction, before the first request. */
   isTrustedSigner: SignerCheck | null;
+  /** See {@link ProClientOptions.signerCheckInterval}; 0 checks every streamed update. */
+  readonly signerCheckInterval: number;
 
   // Everything that may hold a credential is a private field, which neither util.inspect nor
   // JSON.stringify shows.
@@ -599,6 +640,8 @@ export class ProClient {
   readonly #clock: () => number;
   readonly #maxAheadUs: bigint;
   readonly #streams = new Set<AbortController>();
+  /** Updates {@link verifySigner} confirmed (or is confirming), oldest first, with their signers. */
+  readonly #confirmed = new Map<Hex, Promise<Address | null>>();
 
   /**
    * Throws a ProError naming the setting at fault, and never quoting a token, a header's value or a
@@ -674,6 +717,9 @@ export class ProClient {
     const ahead = opts.maxUpdateAhead ?? MAX_UPDATE_AHEAD;
     if (typeof ahead !== "number" || !Number.isFinite(ahead) || ahead < 0) throw new ProError("maxUpdateAhead is not a number of seconds");
     this.#maxAheadUs = BigInt(Math.round(ahead * 1_000_000));
+    const every = opts.signerCheckInterval ?? 0;
+    if (typeof every !== "number" || !Number.isFinite(every) || every < 0) throw new ProError("signerCheckInterval is not a number of seconds");
+    this.signerCheckInterval = every;
     // Checked after every other setting, so a malformed or insecure endpoint is reported as such first.
     const pyths = [this.#restUrl, ...this.#streamUrls].some(isPythProPriceEndpoint);
     if (this.#apiToken === null && pyths) throw new InputError("prices.token", PRO_KEY_REQUIRED);
@@ -843,6 +889,35 @@ export class ProClient {
     return signer;
   }
 
+  /**
+   * The signer of `update` when `isTrustedSigner` accepts it; null when the client checks no signers.
+   * Throws a ProError when the signer is not trusted, the update cannot be read, or the check itself
+   * fails. A confirmed update is remembered (the last {@link MAX_CONFIRMED_UPDATES}), so checking it
+   * again costs nothing: check the update a decision rests on just before acting on it, as a stream
+   * with a `signerCheckInterval` takes most updates unchecked.
+   */
+  async verifySigner(update: Hex): Promise<Address | null> {
+    if (!this.isTrustedSigner) return null;
+    let blob: Hex;
+    try {
+      blob = canonicalUpdate(update);
+    } catch (e) {
+      if (e instanceof LazerError) throw new ProError(`price update cannot be read (${e.message}): refusing it`);
+      throw e;
+    }
+    const known = this.#confirmed.get(blob);
+    if (known !== undefined) return known;
+    const check = this.#signerOf(blob).catch((e: unknown) => {
+      // Neither a refusal nor a failed check is remembered: the next call checks again.
+      this.#confirmed.delete(blob);
+      if (e instanceof LazerError) throw new ProError(`price update cannot be read (${e.message}): refusing it`);
+      throw e;
+    });
+    this.#confirmed.set(blob, check);
+    if (this.#confirmed.size > MAX_CONFIRMED_UPDATES) this.#confirmed.delete(this.#confirmed.keys().next().value!);
+    return check;
+  }
+
   /** Reads a signed update: cut to what the verifier reads, its payload, its signer when signers are checked, its prints for `want`. */
   async #read(raw: Hex, received: number, want: ReadonlySet<Hex> | null): Promise<ProUpdate> {
     let blob: Hex;
@@ -967,7 +1042,10 @@ export class ProClient {
    * take turns: however slow the checks, every set's newest update is checked in its turn, and an
    * update superseded while it waits is never checked. Nothing counts as taken before its check passes,
    * so an update that fails it holds back neither another endpoint's copy of the same instant nor any
-   * later one.
+   * later one. With a `signerCheckInterval`, an update of a subscription's own feeds is taken
+   * unchecked once a second endpoint brings the same bytes; one no other endpoint confirms in time,
+   * two that disagree, every update while fewer than two endpoints are open, and a random sample of
+   * the confirmed ones are checked.
    *
    * An endpoint that drops, sends an update it cannot read, one stamped more than `maxUpdateAhead`
    * seconds ahead of the client's clock, one from an untrusted signer (when signers are checked), or
@@ -1005,14 +1083,42 @@ export class ProClient {
       /** messages that were not price updates since its last price update */
       stray: number;
     }
-    /** An update an endpoint sent, read, waiting for its signer check. */
+    /** An update an endpoint sent, read, waiting for its signer check or for another endpoint's copy. */
     interface Candidate {
       readonly ep: Endpoint;
       readonly socket: WebSocketLike;
       readonly blob: Hex;
       readonly parsed: LazerPayload;
+      /** The subscription it came on, when the endpoint said. */
+      readonly sub: number | null;
+    }
+    /** An update of a subscription's own feeds one endpoint brought, waiting for another endpoint's copy. */
+    interface Unconfirmed {
+      readonly key: string;
+      readonly c: Candidate;
+      readonly timer: ReturnType<typeof setTimeout>;
+      /** Its endpoint's URL and its subscription: each holds at most one update waiting. */
+      readonly slot: string;
     }
     const endpoints: Endpoint[] = this.#streamUrls.map((url) => ({ url, socket: null, state: "connecting", failures: 0, failed: false, timer: undefined, stray: 0 }));
+    // The key each subscription's own updates carry: exactly its feeds, on the client's channel.
+    const ownKey = new Map(subscriptions.map((s) => [s.subscriptionId, `${CHANNEL_IDS[this.channel]}:${[...s.priceFeedIds].sort((a, b) => a - b).join(",")}`]));
+    // With a signerCheckInterval, an update of a subscription's own feeds is taken unchecked once a
+    // second endpoint brings the same bytes, unless drawn for the random sample: each is drawn at the
+    // chance that makes about one check per interval across the stream.
+    const every = this.signerCheckInterval;
+    const corroborated = () => every > 0 && this.isTrustedSigner !== null;
+    const sample = every > 0 ? Math.min(1, CHANNEL_PERIOD[this.channel] / (every * subscriptions.length)) : 1;
+    // By subscription and timestamp: the update one endpoint brought, waiting for another's copy.
+    const unconfirmed = new Map<string, Unconfirmed>();
+    // Per endpoint URL and subscription, the one update of its waiting: a newer one replaces it, so an
+    // endpoint cannot pile up updates to be checked.
+    const parkedBy = new Map<string, string>();
+    /** How many distinct endpoint URLs are open: an update waits for another's copy only while there is another. */
+    const openUrls = () => new Set(endpoints.filter((e) => e.state === "open").map((e) => e.url)).size;
+    // Per subscription, the timestamp of the newest update of its own set taken: a copy no newer is
+    // skipped before it is read in full.
+    const takenBySub = new Map<number, bigint>();
     // Per set of feeds a payload carries (its key): the timestamp of the newest update taken, the
     // newest update waiting for its check, and the prints taken that the consumer has not had yet.
     const taken = new Map<string, bigint>();
@@ -1063,6 +1169,8 @@ export class ProClient {
     const down = (ep: Endpoint, socket: WebSocketLike | null, why: string) => {
       if (ep.socket !== socket || over()) return; // an event of a socket already replaced
       sever(ep);
+      // Its updates waiting for another endpoint's copy go unchecked and untaken.
+      for (const [id, u] of unconfirmed) if (u.c.ep === ep) drop(id, u);
       ep.state = "waiting";
       ep.failed = true;
       ep.failures += 1;
@@ -1081,6 +1189,38 @@ export class ProClient {
         void connect(ep);
       }, delay * 1000);
     };
+    /** Take `c` as its set's newest update: its prints go to the consumer, signed by `signer` when checked. */
+    const take = (key: string, c: Candidate, signer: Address | null) => {
+      const ts = c.parsed.timestampUs;
+      taken.set(key, ts);
+      // Only an update of the subscription's own set moves its mark: the subscription an update came on
+      // is the endpoint's word, not part of what Pyth signs.
+      if (c.sub !== null && ownKey.get(c.sub) === key && ts > (takenBySub.get(c.sub) ?? -1n)) takenBySub.set(c.sub, ts);
+      if (c.ep.socket === c.socket) c.ep.failures = 0;
+      const prints = printsOf(c.parsed, c.blob, signer, monotonic(), want);
+      if (prints.length > 0) pending.set(key, prints);
+      // An update without a live print still shows the stream is alive.
+      notify();
+    };
+    /** Check `c`'s signer and take it if it passes and is still its set's newest; a refusal drops its endpoint. */
+    const checkOne = async (key: string, c: Candidate): Promise<void> => {
+      let signer: Address | null;
+      try {
+        signer = await this.#signerOf(c.blob);
+      } catch (e) {
+        const why = e instanceof Error ? e.message : String(e);
+        if (e instanceof UnconfirmedSigner) {
+          // The check failing says nothing against the endpoint: only its update is left unused.
+          lastRefusal = why;
+          notice(why);
+        } else down(c.ep, c.socket, why);
+        return;
+      }
+      if (over()) return;
+      const last = taken.get(key);
+      if (last !== undefined && c.parsed.timestampUs <= last) return; // another copy was taken meanwhile
+      take(key, c, signer);
+    };
     /** Check the waiting updates' signers, the sets in turn, and take each update whose check passes. */
     const check = async (): Promise<void> => {
       if (checking) return;
@@ -1092,29 +1232,34 @@ export class ProClient {
           waiting.delete(key);
           const last = taken.get(key);
           if (last !== undefined && c.parsed.timestampUs <= last) continue; // another endpoint's copy was taken meanwhile
-          let signer: Address | null;
-          try {
-            signer = await this.#signerOf(c.blob);
-          } catch (e) {
-            const why = e instanceof Error ? e.message : String(e);
-            if (e instanceof UnconfirmedSigner) {
-              // The check failing says nothing against the endpoint: only its update is left unused.
-              lastRefusal = why;
-              notice(why);
-            } else down(c.ep, c.socket, why);
-            continue;
-          }
-          if (over()) return;
-          taken.set(key, c.parsed.timestampUs);
-          if (c.ep.socket === c.socket) c.ep.failures = 0;
-          const prints = printsOf(c.parsed, c.blob, signer, monotonic(), want);
-          if (prints.length > 0) pending.set(key, prints);
-          // An update without a live print still shows the stream is alive.
-          notify();
+          await checkOne(key, c);
         }
       } finally {
         checking = false;
       }
+    };
+    const failed = (e: unknown) => fail(e instanceof ProError ? e : new ProError(`price stream failed: ${this.#quote(reason(e))}`));
+    /** Queue `c` for its signer check; each set keeps only its newest update waiting. */
+    const enqueue = (key: string, c: Candidate) => {
+      const held = waiting.get(key);
+      if (held !== undefined && c.parsed.timestampUs <= held.parsed.timestampUs) return; // this instant (or a later one) waits already
+      if (held === undefined) turns.push(key);
+      waiting.set(key, c); // replaces an older one, whose check never runs
+      void check().catch(failed);
+    };
+    /** End an update's wait: `copied` when another endpoint brought the same bytes, else it is checked. */
+    const settle = (id: string, u: Unconfirmed, copied: boolean) => {
+      drop(id, u);
+      const last = taken.get(u.key);
+      if (over() || (last !== undefined && u.c.parsed.timestampUs <= last)) return;
+      if (copied && Math.random() >= sample) take(u.key, u.c, null);
+      else enqueue(u.key, u.c);
+    };
+    /** Stop an update's wait without checking or taking it. */
+    const drop = (id: string, u: Unconfirmed) => {
+      unconfirmed.delete(id);
+      clearTimeout(u.timer);
+      if (parkedBy.get(u.slot) === id) parkedBy.delete(u.slot);
     };
     /** A message that is not a price update: one too many in a row drops the endpoint. */
     const stray = (ep: Endpoint, socket: WebSocketLike) => {
@@ -1139,12 +1284,36 @@ export class ProClient {
       }
       if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return stray(ep, socket);
       if (msg.type === "streamUpdated") {
-        let blob: Hex;
+        let blob: Hex | null = null;
         let parsed: LazerPayload;
+        const sub = typeof msg.subscriptionId === "number" ? msg.subscriptionId : null;
+        // The subscription and timestamp the update says it has: where another endpoint's copy waits.
+        let id: string | null = null;
         try {
           const got = evmData(msg);
           if (got === null) return down(ep, socket, "it sent an update without signed EVM data");
-          blob = canonicalUpdate(got);
+          // Every endpoint sends the same updates, so most messages are copies of one another endpoint
+          // brought first. Reading an update in full is most of the stream's work, so a copy no newer
+          // than the last update of its subscription's own set taken is dropped on its timestamp alone,
+          // and one of an update waiting for another endpoint's copy is compared with it byte for byte.
+          const at = sub === null ? null : peekTimestamp(got);
+          if (at !== null) {
+            const last = takenBySub.get(sub!);
+            if (last !== undefined && at <= last) {
+              ep.stray = 0;
+              return;
+            }
+            id = `${sub}@${at}`;
+            const u = unconfirmed.get(id);
+            if (u !== undefined && u.c.ep.url !== ep.url) {
+              blob = canonicalUpdate(got);
+              if (blob === u.c.blob) {
+                ep.stray = 0;
+                return settle(id, u, true);
+              }
+            }
+          }
+          blob ??= canonicalUpdate(got);
           parsed = readUpdate(blob);
         } catch (e) {
           return down(ep, socket, `it sent an update the SDK cannot read (${e instanceof Error ? e.message : String(e)})`);
@@ -1162,11 +1331,37 @@ export class ProClient {
         const key = `${parsed.channel}:${parsed.feeds.map((f) => f.id).sort((a, b) => a - b).join(",")}`;
         const last = taken.get(key);
         if (last !== undefined && ts <= last) return; // taken already, from whichever endpoint brought it first, or older
+        const c: Candidate = { ep, socket, blob, parsed, sub };
+        const u = id === null ? undefined : unconfirmed.get(id);
+        if (u !== undefined && u.key === key) {
+          if (u.c.ep.url === ep.url) return; // the same endpoint again confirms nothing
+          // Two endpoints sent different updates of the same feeds for one instant: both are checked,
+          // and an endpoint whose update fails is dropped.
+          settle(id!, u, false);
+          void checkOne(key, c).catch(failed);
+          return;
+        }
         const held = waiting.get(key);
         if (held !== undefined && ts <= held.parsed.timestampUs) return; // this instant (or a later one) waits for its check
-        if (held === undefined) turns.push(key);
-        waiting.set(key, { ep, socket, blob, parsed }); // replaces an older one, whose check never runs
-        void check().catch((e) => fail(e instanceof ProError ? e : new ProError(`price stream failed: ${this.#quote(reason(e))}`)));
+        if (corroborated() && id !== null && ownKey.get(sub!) === key && openUrls() >= 2) {
+          // Wait for another endpoint's copy; without one in time, the update is checked.
+          const slot = `${ep.url}#${sub}`;
+          const before = parkedBy.get(slot);
+          const prior = before === undefined ? undefined : unconfirmed.get(before);
+          if (prior !== undefined) {
+            if (prior.c.parsed.timestampUs >= ts) return; // its endpoint brought a newer one already
+            drop(before!, prior);
+          }
+          const wait = id;
+          const timer = setTimeout(() => {
+            const w = unconfirmed.get(wait);
+            if (w !== undefined) settle(wait, w, false);
+          }, CORROBORATION_WINDOW * 1000);
+          unconfirmed.set(wait, { key, c, timer, slot });
+          parkedBy.set(slot, wait);
+          return;
+        }
+        enqueue(key, c);
         return;
       }
       if (msg.type === "subscriptionError" || msg.type === "error") {
@@ -1271,6 +1466,9 @@ export class ProClient {
     } finally {
       ended = true;
       if (idleTimer !== undefined) clearTimeout(idleTimer);
+      for (const u of unconfirmed.values()) clearTimeout(u.timer);
+      unconfirmed.clear();
+      parkedBy.clear();
       for (const ep of endpoints) {
         if (ep.timer !== undefined) clearTimeout(ep.timer);
         sever(ep);

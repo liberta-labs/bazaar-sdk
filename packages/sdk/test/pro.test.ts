@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PRICE_ENDPOINTS, PYTH_PRO, isPythProPriceEndpoint } from "../src/networks.js";
 import { MAX_RESPONSE_BYTES, MAX_STREAM_MESSAGE, PRO_PROPERTIES, type Print, ProClient, ProError, STREAM_IDLE_TIMEOUT, isLivePrint, whyNotLive } from "../src/prices/index.js";
 import { FakeSocket, SIGNER, evm, fakeFetch, fid, json, settle, signed, streamUpdated, tick, unsigned } from "./pro-fakes.js";
-import { MAX_STRAY_MESSAGES, MAX_UPDATE_AHEAD, PriceService } from "../src/prices/index.js";
-import { MAX_UPDATE_BYTES } from "../src/prices/lazer.js";
+import { CORROBORATION_WINDOW, MAX_STRAY_MESSAGES, MAX_UPDATE_AHEAD, PriceService } from "../src/prices/index.js";
+import { MAX_UPDATE_BYTES, peekTimestamp, readUpdate } from "../src/prices/lazer.js";
 import { Chain } from "../src/chain/client.js";
 import type { JsonRpc } from "../src/chain/rpc.js";
 import { InputError } from "../src/client/calls.js";
@@ -1070,6 +1070,255 @@ describe("ProClient credentials inside URLs", () => {
     }
     for (const host of ["localhost", "LOCALHOST", "127.0.0.1", "127.255.0.9", "[::1]"]) {
       expect(() => new ProClient({ token: TOKEN, streamUrls: [`ws://${host}:8081/v1/stream`] }), host).not.toThrow();
+    }
+  });
+});
+
+describe("ProClient.stream with a signer check interval", () => {
+  const SIGNED_PRICE = 200_000_000_000n;
+  afterEach(() => vi.restoreAllMocks());
+
+  /** A client checking signers with a 10 s interval on A and B, counting its checks, and its stream of F1. */
+  function corroborating() {
+    const counter = { checks: 0 };
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B], clock: () => 1_000, signerCheckInterval: 10, isTrustedSigner: (s) => (counter.checks++, s === SIGNER) });
+    const it = c.stream([F1], undefined, { idleTimeout: null });
+    const next = () => it.next().then((r) => r.value!);
+    return { counter, it, next };
+  }
+
+  it("takes an update unchecked once a second endpoint delivers the same bytes, and checks a random sample", async () => {
+    // On the 200 ms channel, one subscription and a 10 s interval, each confirmed update is checked at a 2% chance.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.99);
+    const { counter, it, next } = corroborating();
+    let p = next();
+    await settle();
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    const u100 = await signed({ at: 100, feeds: [{ id: 1 }] });
+    a.message(streamUpdated(u100));
+    b.message(streamUpdated(u100));
+    expect((await p).map((x) => [x.timestampUs, x.signer])).toEqual([[100_000_000n, null]]);
+    expect(counter.checks).toBe(0);
+    random.mockReturnValue(0.01); // drawn for the sample
+    p = next();
+    const u101 = await signed({ at: 101, feeds: [{ id: 1 }] });
+    b.message(streamUpdated(u101));
+    a.message(streamUpdated(u101));
+    expect((await p).map((x) => [x.timestampUs, x.signer])).toEqual([[101_000_000n, SIGNER]]);
+    expect(counter.checks).toBe(1);
+    await it.return();
+  });
+
+  it("checks an update no other endpoint confirms in time; a second copy from the same endpoint confirms nothing", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(Math, "random").mockReturnValue(0.99);
+    const { counter, it, next } = corroborating();
+    let got: Print[] | null = null;
+    const p = next().then((v) => (got = v));
+    await vi.advanceTimersByTimeAsync(0);
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    const u100 = await signed({ at: 100, feeds: [{ id: 1 }] });
+    a.message(streamUpdated(u100));
+    a.message(streamUpdated(u100));
+    await vi.advanceTimersByTimeAsync(CORROBORATION_WINDOW * 1000 - 1);
+    expect([got, counter.checks]).toEqual([null, 0]);
+    await vi.advanceTimersByTimeAsync(2);
+    await p;
+    expect(got!.map((x) => [x.timestampUs, x.signer])).toEqual([[100_000_000n, SIGNER]]);
+    expect(counter.checks).toBe(1);
+    await it.return();
+  });
+
+  it("checks both of two different updates endpoints send for one instant, takes the genuine one and drops the forger", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.99);
+    for (const forgerFirst of [true, false]) {
+      FakeSocket.reset();
+      const { counter, it, next } = corroborating();
+      const p = next();
+      await settle();
+      const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+      a.open();
+      b.open();
+      const forged = streamUpdated(await signed({ at: 101, feeds: [{ id: 1, price: 999n }] }, OTHER_KEY));
+      const genuine = streamUpdated(await signed({ at: 101, feeds: [{ id: 1 }] }));
+      if (forgerFirst) {
+        a.message(forged);
+        b.message(genuine);
+      } else {
+        b.message(genuine);
+        a.message(forged);
+      }
+      expect((await p).map((x) => [x.price, x.signer]), `forger first: ${forgerFirst}`).toEqual([[SIGNED_PRICE, SIGNER]]);
+      await settle(20);
+      expect([a.closed, b.closed], `forger first: ${forgerFirst}`).toEqual([true, false]);
+      expect(counter.checks).toBe(2);
+      await it.return();
+    }
+  });
+
+  it("never takes a forged update no other endpoint sends: it is checked once the window passes, and its endpoint dropped", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(Math, "random").mockReturnValue(0.99);
+    const { counter, it, next } = corroborating();
+    const p = next();
+    await vi.advanceTimersByTimeAsync(0);
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    a.message(streamUpdated(await signed({ at: 105, feeds: [{ id: 1, price: 999n }] }, OTHER_KEY)));
+    await vi.advanceTimersByTimeAsync(CORROBORATION_WINDOW * 1000 + 1);
+    expect([a.closed, counter.checks]).toEqual([true, 1]);
+    const u106 = await signed({ at: 106, feeds: [{ id: 1 }] });
+    b.message(streamUpdated(u106));
+    await vi.advanceTimersByTimeAsync(CORROBORATION_WINDOW * 1000 + 1); // b alone: checked after the window
+    expect((await p).map((x) => [x.price, x.signer])).toEqual([[SIGNED_PRICE, SIGNER]]);
+    await it.return();
+  });
+
+  it("keeps one update per endpoint and subscription waiting, and drops a gone endpoint's unchecked", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(Math, "random").mockReturnValue(0.99);
+    let checks = 0;
+    let reachable = false;
+    const isTrustedSigner = (s: string) => {
+      checks++;
+      if (!reachable) throw new Error("verifier unreachable");
+      return s === SIGNER;
+    };
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B], clock: () => 1_000, signerCheckInterval: 10, isTrustedSigner });
+    const it = c.stream([F1], undefined, { idleTimeout: null });
+    const p = it.next().then((r) => r.value!);
+    await vi.advanceTimersByTimeAsync(0);
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    // While no check can conclude (so none drops the endpoint), a burst of updates stamped a
+    // microsecond apart: each replaces the one before, and one is checked.
+    for (let i = 0; i < 50; i++) a.message(streamUpdated(await signed({ at: 100, extraUs: BigInt(i), feeds: [{ id: 1 }] })));
+    await vi.advanceTimersByTimeAsync(CORROBORATION_WINDOW * 1000 + 1);
+    expect([checks, a.closed]).toEqual([1, false]);
+    reachable = true;
+    // An endpoint that goes down leaves nothing waiting to be checked.
+    const u101 = streamUpdated(await signed({ at: 101, feeds: [{ id: 1 }] }));
+    b.message(u101);
+    b.drop();
+    await vi.advanceTimersByTimeAsync(CORROBORATION_WINDOW * 1000 + 1);
+    expect(checks).toBe(1);
+    a.message(u101); // a alone open now: checked at once
+    expect((await p).map((x) => [x.timestampUs, x.signer])).toEqual([[101_000_000n, SIGNER]]);
+    expect(checks).toBe(2);
+    await it.return();
+  });
+
+  it("does not count an update of other feeds sent as a waiting update's subscription as a conflict", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.99);
+    const { counter, it, next } = corroborating();
+    let p = next();
+    await settle();
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    const own = streamUpdated(await signed({ at: 100, feeds: [{ id: 1 }] }));
+    a.message(own);
+    b.message(streamUpdated(await signed({ at: 100, feeds: [{ id: 1 }, { id: 2 }] })));
+    expect((await p).map((x) => x.signer)).toEqual([SIGNER]); // the other feeds' update, checked on its own
+    p = next();
+    b.message(own);
+    expect((await p).map((x) => x.signer)).toEqual([null]); // a's, confirmed by b's copy
+    await settle(20);
+    expect([counter.checks, a.closed, b.closed]).toEqual([1, false, false]);
+    await it.return();
+  });
+
+  it("checks at once while fewer than two endpoints are open, an endpoint listed twice counting once", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(Math, "random").mockReturnValue(0.99);
+    let checks = 0;
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, A], clock: () => 1_000, signerCheckInterval: 10, isTrustedSigner: (s) => (checks++, s === SIGNER) });
+    const it = c.stream([F1], undefined, { idleTimeout: null });
+    let got: Print[] | null = null;
+    const p = it.next().then((r) => (got = r.value!));
+    await vi.advanceTimersByTimeAsync(0);
+    const [a1, a2] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a1.open();
+    a2.open();
+    const u100 = streamUpdated(await signed({ at: 100, feeds: [{ id: 1 }] }));
+    a1.message(u100);
+    a2.message(u100);
+    await vi.advanceTimersByTimeAsync(0);
+    await p;
+    expect([got!.map((x) => x.signer), checks]).toEqual([[SIGNER], 1]);
+    await it.return();
+  });
+
+  it("holds a subscription's copies back only by an update of its own feeds", async () => {
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B], clock: () => 1_000 });
+    const it = c.stream([F1], undefined, { idleTimeout: null });
+    const p = it.next();
+    await settle();
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    // The subscription an update came on is the endpoint's word: another feed's update sent as
+    // subscription 1 does not count as subscription 1's update of that instant.
+    a.message(streamUpdated(unsigned({ at: 100, feeds: [{ id: 2 }] }), 1));
+    await settle(); // taken before the copy arrives
+    b.message(streamUpdated(unsigned({ at: 100, feeds: [{ id: 1 }] }), 1));
+    expect((await p).value!.map((x) => [x.feedId, x.timestampUs])).toEqual([[F1, 100_000_000n]]);
+    await it.return();
+  });
+
+  it("drops a copy of an update already taken on its timestamp alone, before reading it", async () => {
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A, B], clock: () => 1_000 });
+    const it = c.stream([F1], undefined, { idleTimeout: null });
+    let p = it.next();
+    await settle();
+    const [a, b] = FakeSocket.all as [FakeSocket, FakeSocket];
+    a.open();
+    b.open();
+    const blob = unsigned({ at: 100, feeds: [{ id: 1 }] });
+    a.message(streamUpdated(blob));
+    expect((await p).value!.length).toBe(1);
+    p = it.next();
+    // b's copy is cut short: read in full it would be refused, and b dropped with it
+    b.message(streamUpdated(blob.slice(0, -10) as Hex));
+    await settle(20);
+    expect(b.closed).toBe(false);
+    a.message(streamUpdated(unsigned({ at: 101, feeds: [{ id: 1 }] })));
+    expect((await p).value!.map((x) => x.timestampUs)).toEqual([101_000_000n]);
+    await it.return();
+  });
+
+  it("reads an update's timestamp from its payload header", () => {
+    const blob = unsigned({ at: 100, extraUs: 7n, feeds: [{ id: 1 }] });
+    expect(peekTimestamp(blob)).toBe(readUpdate(blob).timestampUs);
+    expect(peekTimestamp("0x1234")).toBeNull();
+  });
+});
+
+describe("ProClient.verifySigner", () => {
+  it("confirms an update's signer once and remembers it, refuses an untrusted one every time, and checks nothing without a check", async () => {
+    let checks = 0;
+    const c = new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A], isTrustedSigner: (s) => (checks++, s === SIGNER) });
+    const good = await signed({ at: 100, feeds: [{ id: 1 }] });
+    expect(await c.verifySigner(good)).toBe(SIGNER);
+    expect(await c.verifySigner(good)).toBe(SIGNER);
+    expect(checks).toBe(1);
+    const forged = await signed({ at: 100, feeds: [{ id: 1 }] }, OTHER_KEY);
+    await expect(c.verifySigner(forged)).rejects.toThrow("which is not a signer Pyth's verifier trusts");
+    await expect(c.verifySigner(forged)).rejects.toThrow("which is not a signer Pyth's verifier trusts");
+    expect(checks).toBe(3);
+    await expect(c.verifySigner("0x1234")).rejects.toThrow("price update cannot be read");
+    expect(await new ProClient({ restUrl: REST, WebSocket: FakeSocket, streamUrls: [A] }).verifySigner(good)).toBeNull();
+  });
+
+  it("refuses a signerCheckInterval that is not a number of seconds", () => {
+    for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new ProClient({ restUrl: REST, streamUrls: [A], signerCheckInterval: bad })).toThrow("signerCheckInterval is not a number of seconds");
     }
   });
 });

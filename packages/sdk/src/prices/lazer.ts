@@ -340,6 +340,19 @@ export async function recoverSigner(update: Hex): Promise<Address> {
   return recover(splitUpdate(update));
 }
 
+/**
+ * The timestamp an update's payload carries, read without checking the rest of the update: enough to
+ * recognize a copy of an update already taken, so it need not be read in full. Null when the update
+ * is not hex, is too short to hold the payload's magic and timestamp, or the payload does not start
+ * with Pyth Pro's magic.
+ */
+export function peekTimestamp(update: Hex): bigint | null {
+  const hex = digits(update);
+  const at = ENVELOPE_HEADER_BYTES * 2;
+  if (hex === null || hex.length < at + 24 || parseInt(hex.slice(at, at + 8), 16) !== PAYLOAD_MAGIC) return null;
+  return BigInt(`0x${hex.slice(at + 8, at + 24)}`);
+}
+
 /** Reads an update without recovering its signer: its payload, from the bytes the signature covers. */
 export function readUpdate(update: Hex): LazerPayload & { readonly payload: Hex } {
   const { payload } = splitUpdate(update);

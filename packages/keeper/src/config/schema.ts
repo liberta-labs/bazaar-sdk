@@ -77,11 +77,21 @@ export const PricesConfig = z
     /** extra request headers for the request API and the stream connections (a proxy's, say) */
     headers: z.record(z.string()).default({}),
     /**
-     * Use only updates signed by a signer the deployment's Pyth verifier trusts. It costs one signature
-     * recovery per update taken, which adds up with many markets on a fast channel; the chain verifies
-     * every update a call carries either way.
+     * Use only updates signed by a signer the deployment's Pyth verifier trusts, checked as
+     * signerCheckIntervalSeconds says; the chain verifies every update a call carries either way.
      */
     checkSigners: z.boolean().default(true),
+    /**
+     * With checkSigners, a market's streamed update is taken without its signer check once a second
+     * stream endpoint delivers the same bytes, so a forged one is taken only if two endpoints agree on
+     * it. An update no other endpoint confirms in time is checked, and so is every update while fewer
+     * than two endpoints are open; two that disagree are both checked, and an endpoint whose update
+     * fails is dropped; and a random sample of the confirmed ones is checked, about one per this many
+     * seconds. While every endpoint is up and serves every market, the checking costs the same however
+     * many markets are streamed. 0 checks every update. The ETH/USD print that prices gas is used only
+     * once its own signer is confirmed.
+     */
+    signerCheckIntervalSeconds: nonNegative(10),
     /**
      * Send the token and the headers over plain http or ws to an endpoint on another machine. Refused
      * by default, since anyone on the path could read them; an endpoint on this machine never needs it.

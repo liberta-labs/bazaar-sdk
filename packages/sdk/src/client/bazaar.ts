@@ -94,6 +94,7 @@ const PRO_CLIENT_OPTIONS = {
   WebSocket: true,
   streamAuth: true,
   isTrustedSigner: true,
+  signerCheckInterval: true,
   allowInsecure: true,
   clock: true,
   maxUpdateAhead: true,

@@ -336,6 +336,7 @@ export class Keeper {
         // Streamed updates are judged against the chain's clock, as their prices are: on a chain whose
         // clock was moved, this machine's would refuse every update as dated ahead.
         clock: () => this.chainTime(),
+        signerCheckInterval: cfg.prices.signerCheckIntervalSeconds,
       });
     } catch (e) {
       // The client names the setting at fault and never quotes a value.

@@ -120,6 +120,7 @@ you get from Pyth: a config that reads prices from them without one is refused w
 | `symbolsUrl` | string | the endpoint's | the symbols registry's base URL (`/v1/symbols`), in place of the endpoint's own |
 | `headers` | map of string | `{}` | extra request headers for the request API and the stream connections (a proxy's, say); each value a `${NAME}` reference, optionally after a scheme (`Bearer ${NAME}`) |
 | `checkSigners` | boolean | `true` | use only updates signed by a signer the deployment's Pyth verifier trusts |
+| `signerCheckIntervalSeconds` | number ≥ 0 | `10` | with `checkSigners`, take a streamed update unchecked once a second endpoint delivers the same bytes, and check a random sample of those, about one per this many seconds; `0` checks every update |
 | `allowInsecure` | boolean | `false` | send the token, the headers, and a user name, password or query a URL holds, over plain `http`/`ws` to an endpoint on another machine. Refused by default; an endpoint on this machine (exactly `localhost`, `127.0.0.0/8` or `[::1]`) never needs it |
 | `stream` | boolean | `true` | follow the WebSocket price stream; when off, poll the request API for the latest price |
 | `pollInterval` | number > 0 | `1.0` | seconds between polls when not streaming |
@@ -180,9 +181,22 @@ update signed by anyone else: a stream endpoint that sends one is dropped and re
 others keep delivering, and a request API response that carries one is refused whole. The chain
 verifies every update a call carries either way; the ETH/USD print that prices gas reaches no
 contract, so this is the only check on it, and with it off the keeper warns at start (`bazaar keeper
-doctor` says so too). It costs one signature recovery per update taken, which adds up with many
-markets on a fast channel: turn it off, or pick a slower channel, if the keeper falls behind the
-stream.
+doctor` says so too).
+
+Each check is a signature recovery, and the stream brings one update per market per interval of the
+channel from each of Pyth's endpoints, which all send the same signed bytes. So a market's update is
+taken without a check once a second endpoint delivers it byte for byte: a forged update is taken
+only if two endpoints agree on it. An update no other endpoint confirms within half a second is
+checked, so it reaches the keeper up to half a second late; while fewer than two endpoints are open,
+every update is checked at once. When two endpoints send different updates of a market for one
+instant, both are checked, and an endpoint whose update fails is dropped. A random sample of the
+confirmed updates is checked too, about one per `signerCheckIntervalSeconds`, in case several
+endpoints are compromised at once. While every endpoint is up and serves every market, the cost stays
+the same however many markets there are, and waiting for the second copy delays an update only by
+the time between the endpoints' copies. Corroboration needs independent endpoints: a proxy in front
+of all of them would confirm its own updates, so set `0` behind one. The ETH/USD print that prices gas reaches no contract, so the
+keeper uses it only once its own signer is confirmed: one recovery per ETH/USD update. Set `0` to
+check every update, which costs a recovery per market per interval.
 
 ## `wallets`
 

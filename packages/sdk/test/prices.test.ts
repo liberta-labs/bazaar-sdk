@@ -19,7 +19,7 @@ import {
 } from "../src/prices/index.js";
 import type { PriceSource, ProSymbol } from "../src/prices/index.js";
 import { readUpdate } from "../src/prices/lazer.js";
-import { type FeedSpec, FakeSocket, US, fid, print as pr, settle, streamUpdated, unsigned } from "./pro-fakes.js";
+import { type FeedSpec, FakeSocket, SIGNER, US, fid, print as pr, settle, signed, streamUpdated, unsigned } from "./pro-fakes.js";
 
 const [F1, F3, F4, F5] = [fid(1), fid(3), fid(4), fid(5)];
 
@@ -185,6 +185,24 @@ describe("PriceService", () => {
     custom.ingest([pr(ETH_USD_FEED, 10, { price: 5n, expo: 0 })]);
     expect(custom.ethUsd()).toBe(5);
     expect(custom.ethUsd(16)).toBeNull();
+  });
+
+  it("ethUsd prices gas only from a print whose signer is confirmed: one a stream took unchecked is checked first", async () => {
+    const client = new ProClient({ restUrl: "https://pro.test", streamUrls: ["wss://pro-0.test/v1/stream"], isTrustedSigner: (s) => s === SIGNER });
+    const notices: string[] = [];
+    const svc = new PriceService(client, { clock: () => 1_000, logger: { warn: (m) => notices.push(m) } });
+    // Prints as a stream takes them between sampled checks: no signer.
+    const unchecked = async (at: number, price: bigint, key?: Hex) => {
+      const blob = await signed({ at, feeds: [{ id: 2, price }] }, key);
+      return printsOf(readUpdate(blob), blob, null);
+    };
+    svc.ingest(await unchecked(1_000, 30_000_000_000_000n, `0x${"11".repeat(32)}`)); // $300,000, signed by another key
+    await settle();
+    expect(svc.latest.get(ETH_USD_FEED)!.price).toBe(30_000_000_000_000n);
+    expect(svc.ethUsd()).toBeNull();
+    expect(notices).toContainEqual(expect.stringMatching(/^an ETH\/USD print was not used to price gas: .*not a signer Pyth's verifier trusts/));
+    svc.ingest(await unchecked(1_001, 300_000_000_000n));
+    await vi.waitFor(() => expect(svc.ethUsd()).toBe(3000));
   });
 
   it("ignores a print dated in the future instead of letting it hold the feed", () => {

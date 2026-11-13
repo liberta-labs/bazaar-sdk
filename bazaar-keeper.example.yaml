@@ -21,6 +21,7 @@ prices:
   token: ${PYTH_PRO_TOKEN}          # your Pyth Pro API key: required for pyth, whose endpoints serve no one without it
   # channel: fixed_rate@200ms       # real_time | fixed_rate@50ms | fixed_rate@200ms | fixed_rate@1000ms
   # checkSigners: true              # use only updates signed by a signer the deployment's Pyth verifier trusts
+  # signerCheckIntervalSeconds: 10  # with checkSigners: updates two endpoints deliver alike are taken unchecked, about one per this many seconds checked (0: every update)
   # streamIdleTimeoutSeconds: 10    # a stream that brings no new update for this long is reconnected
   # To replace one of the endpoint's places (a proxy, a single region):
   # streamUrls: ["wss://pyth-lazer-0.dourolabs.app/v1/stream"]   # the keeper connects to every URL listed

@@ -1112,6 +1112,7 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 |---|---|---|
 | [`lazer.parseUpdate`](../sdk/low-level.md) | function | Reads a Pyth Pro update and recovers its signer: `{ signer, timestampUs, channel, feeds, payload }`. |
 | [`lazer.readUpdate`](../sdk/low-level.md) | function | Reads an update without recovering its signer. |
+| [`lazer.peekTimestamp`](../sdk/low-level.md) | function | An update's payload timestamp, in microseconds, read from its fixed place without reading the rest; null when the update is not hex, is too short, or its payload magic is wrong. |
 | [`lazer.canonicalUpdate`](../sdk/low-level.md) | function | An update exactly as the verifier reads it: the envelope's header and the payload its size field names, as lowercase hex, without any bytes after them. |
 | [`lazer.legEntries`](../sdk/low-level.md) | function | Each leg as BazaarOracle reads it out of a call's updates: the leg's entry in the update holding its most recently generated price (the earlier update on a tie); null for a leg no update carries. |
 | [`lazer.parsePayload`](../sdk/low-level.md) | function | Reads a signed payload as LazerPayloadLib.readFeeds does; throws where the contract reverts as malformed. |
@@ -1152,8 +1153,8 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`feedIdHex`](../sdk/low-level.md) | function | The bytes32 feed id that holds a Pyth Pro feed number (1 → `0x00…01`). |
 | [`proFeedId`](../sdk/low-level.md) | function | The Pyth Pro feed number a raw bytes32 feed id holds; throws on anything else. |
 | [`isRawFeedId`](../sdk/low-level.md) | function | Whether an id has the form of a raw Pyth Pro feed id (BazaarOracle.isRawFeedId). |
-| [`ProClient`](../sdk/low-level.md) | class | A client for Pyth Pro: `latest`, `latestUpdate`, `atTick`, `stream`, `symbols` and `close`. |
-| [`ProClientOptions`](../sdk/low-level.md) | interface | Options of `ProClient`: the token, the endpoints, the channel, headers, timeout, `fetch`, `WebSocket`, `streamAuth` and `isTrustedSigner`. |
+| [`ProClient`](../sdk/low-level.md) | class | A client for Pyth Pro: `latest`, `latestUpdate`, `atTick`, `stream`, `symbols`, `verifySigner` and `close`. |
+| [`ProClientOptions`](../sdk/low-level.md) | interface | Options of `ProClient`: the token, the endpoints, the channel, headers, timeout, `fetch`, `WebSocket`, `streamAuth`, `isTrustedSigner` and `signerCheckInterval`. |
 | [`ProError`](../sdk/low-level.md) | class | A Pyth Pro request or stream that failed; its message never shows a token. |
 | [`ProUpdate`](../sdk/low-level.md) | interface | A signed update as the client read it: the blob, the signer, the timestamp, the channel, every feed's entry, and the live prints. |
 | [`ProSymbol`](../sdk/low-level.md) | interface | One entry of Pyth Pro's symbols registry. |
@@ -1162,6 +1163,7 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`WebSocketConstructor`](../sdk/low-level.md) | type | A WebSocket constructor: the global one, or a package's. |
 | [`WebSocketLike`](../sdk/low-level.md) | interface | The parts of a WebSocket the client uses. |
 | [`AUTH_SUBPROTOCOL`](../sdk/low-level.md) | const | The subprotocol that marks the next entry of a WebSocket's subprotocol list as the token. |
+| [`CORROBORATION_WINDOW`](../sdk/low-level.md) | const | Seconds a streamed update one endpoint brought waits for another endpoint's identical copy before its signer is checked instead (0.5). |
 | [`DEFAULT_CHANNEL`](../sdk/low-level.md) | const | The channel a client streams and reads the latest price on unless told otherwise. |
 | [`PRO_PROPERTIES`](../sdk/low-level.md) | const | The properties every request asks for. |
 | [`MAX_RESPONSE_BYTES`](../sdk/low-level.md) | const | The largest response body a request may return, in bytes (16 MiB). |
@@ -1169,6 +1171,7 @@ The `lazer` namespace holds the whole update codec; its types, its error and the
 | [`MAX_STRAY_MESSAGES`](../sdk/low-level.md) | const | How many messages in a row that are not price updates drop the stream endpoint sending them; it is reconnected with a growing delay. |
 | [`MAX_UPDATE_AHEAD`](../sdk/low-level.md) | const | Seconds an update's own timestamp may lie ahead of the client's clock before the endpoint that sent it is dropped (60). |
 | [`MAX_STREAM_NOTICES`](../sdk/low-level.md) | const | How many distinct notices one stream passes to its `onNotice` before it drops the rest. |
+| [`MAX_CONFIRMED_UPDATES`](../sdk/low-level.md) | const | How many confirmed updates `ProClient.verifySigner` remembers (256). |
 | [`STREAM_IDLE_TIMEOUT`](../sdk/low-level.md) | const | Seconds a price stream may bring no new update before it is abandoned and reconnected. |
 | [`StreamOptions`](../sdk/low-level.md) | interface | Options of `ProClient.stream`: `idleTimeout` and `onNotice`. |
 | [`isLivePrint`](../sdk/low-level.md) | function | Whether a feed entry holds a price a live call could use. |

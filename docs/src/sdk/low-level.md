@@ -363,7 +363,8 @@ value or URL.
 | `latestUpdate(ids)` | That update as a `ProUpdate` (`blob`, `signer`, `timestampUs`, `channel`, `feeds`, `prints`), or null. More than 255 feeds (`lazer.MAX_FEEDS_PER_UPDATE`, all one update carries) throws. |
 | `atTick(ids, second)` | The `fixed_rate@1000ms` update stamped exactly `second` as a `ProUpdate`, or null when there is none (settlement proofs). Throws when the endpoint answers with another update. |
 | `symbols({ query?, assetType? })` | `ProSymbol[]` from the registry: `id`, `feedId`, `symbol`, `assetType`, `minChannel`, `state`, `schedule`, ..., every text field printable and at most 256 characters. No token is sent. An answer that is not a list throws `ProError`. |
-| `stream(feeds, signal?, { idleTimeout, onNotice })` | An async generator of `Print[]` batches. `feeds` is one set or a list of sets; each distinct set is one subscription, so its updates carry exactly its feeds. It connects to every stream endpoint, yields each update once, and reconnects a dropped endpoint with a growing delay: one that drops, sends an update it cannot read, one stamped more than `maxUpdateAhead` seconds ahead of `clock`, one from an untrusted signer, or `MAX_STRAY_MESSAGES` (64) messages in a row that are not price updates. With a signer check, each set keeps only its newest update waiting and the sets take turns, so slow checks never starve a set; nothing counts as taken before its check passes. No new update for `idleTimeout` seconds (default `STREAM_IDLE_TIMEOUT`, 10; null or 0 waits forever) throws `ProError`. |
+| `stream(feeds, signal?, { idleTimeout, onNotice })` | An async generator of `Print[]` batches. `feeds` is one set or a list of sets; each distinct set is one subscription, so its updates carry exactly its feeds. It connects to every stream endpoint, yields each update once, and reconnects a dropped endpoint with a growing delay: one that drops, sends an update it cannot read, one stamped more than `maxUpdateAhead` seconds ahead of `clock`, one from an untrusted signer, or `MAX_STRAY_MESSAGES` (64) messages in a row that are not price updates. With a signer check, each set keeps only its newest update waiting and the sets take turns, so slow checks never starve a set; nothing counts as taken before its check passes. With a `signerCheckInterval`, an update of a subscription's own feeds is taken unchecked (`signer` null) once an endpoint at another URL delivers the same bytes; one no other endpoint confirms within `CORROBORATION_WINDOW` seconds, two that disagree, every update while fewer than two endpoints are open, and a random sample of the confirmed ones are checked. Each endpoint keeps at most one update per subscription waiting for a copy. A copy no newer than the last update of its subscription's own feeds taken is dropped before it is read in full. No new update for `idleTimeout` seconds (default `STREAM_IDLE_TIMEOUT`, 10; null or 0 waits forever) throws `ProError`. |
+| `verifySigner(update)` | The update's signer when `isTrustedSigner` accepts it; null when the client checks no signers. Throws `ProError` for a signer it does not accept, an update it cannot read, or a check that fails. The last `MAX_CONFIRMED_UPDATES` (256) confirmed updates are remembered, so checking one again costs nothing: check the print a decision rests on just before acting on it. |
 | `close()` | Ends any open streams. |
 | `displayUrl` | The request API's base URL with any key masked. |
 
@@ -383,7 +384,8 @@ refused. Errors are `ProError`: unreachable, refused (401/403: "check the token"
 error, not JSON, an update that cannot be read, or one from a signer that is not trusted.
 
 **Signers.** With `isTrustedSigner` set, the signer of each update the client takes is recovered and
-an update it does not accept is never used. `verifierSignerCheck(chain, oracle)` is the check `connect`
+an update it does not accept is never used; a stream with a `signerCheckInterval` checks only the
+updates two endpoints do not agree on, and a sample, and `verifySigner` checks one on demand. `verifierSignerCheck(chain, oracle)` is the check `connect`
 installs: it asks the deployment's Pyth verifier (`oracle.pythLazer()`, then `isValidSigner`) and keeps
 each answer for a minute (`ttl`); a "trusted" answer is then refreshed in the background and used
 meanwhile for up to `maxAge` (10 minutes). A failed check's error is reduced to a short summary with
@@ -437,7 +439,7 @@ per-market prices and updates from them. It is what the keeper runs; frontends u
 | `printsFor(feeds)` | The prints a call reading these feeds together would attach. |
 | `latestFor(market)` | The prints of the most recently issued update the service holds for the market's legs, however old their prices: the market's own update, unless another carrying one of its legs was issued a second or more later. Each print's `timestampUs` is when its update was issued, `generatedUs` when its price was generated. |
 | `liquidationUpdate(market, now?, margin?)` | What a liquidation on the market attaches now, as a `LiquidationUpdate` (below). |
-| `ethUsd(now?)` | USD per ETH for pricing gas, or null when missing, too old or out of bounds. |
+| `ethUsd(now?)` | USD per ETH for pricing gas, or null when missing, too old or out of bounds. With a signer check on a `ProClient` source, only a print whose signer is confirmed is used: one the stream took unchecked is checked first. |
 | `missing()` | Watched feeds without a print yet. |
 | `latest`, `healthy`, `lastError`, `lastUpdate` | The prints by feed, and the endpoint's health. |
 

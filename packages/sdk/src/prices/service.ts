@@ -5,7 +5,7 @@ import { ETH_USD_FEED, MAX_LIQUIDATION_PRICE_AGE, MAX_PRICE_STALENESS } from "..
 import { type Leg, type PairPrice, pairPrice } from "../formulas/index.js";
 import type { Market } from "../models.js";
 import { type LegEntry, MAX_FEEDS_PER_UPDATE, MICROS_PER_SECOND, isRawFeedId, legEntries, proFeedId, readUpdate } from "./lazer.js";
-import { type Print, type ProClient, ProError, type ProSymbol, STREAM_IDLE_TIMEOUT, type StreamOptions, monotonic, whyNotLive } from "./pro.js";
+import { type Print, ProClient, ProError, type ProSymbol, STREAM_IDLE_TIMEOUT, type StreamOptions, monotonic, whyNotLive } from "./pro.js";
 
 /** 'Crypto.BTC/USD' -> 'BTC/USD', 'Equity.US.AAPL/USD' -> 'AAPL/USD'. */
 export function feedLabel(symbol: string | null | undefined): string {
@@ -347,6 +347,8 @@ export class PriceService {
   private readonly updates = new Map<string, readonly Print[]>();
   /** Each feed's print from the most recently issued update that carried a live print for it. */
   private readonly issued = new Map<Hex, Print>();
+  /** The newest ETH/USD print whose signer is confirmed, or that needs no check: what ethUsd() reads. */
+  private ethUsdPrint: Print | null = null;
   /** per watched set, the prints of the most recently issued update that carried a live print for each of its feeds */
   private readonly issuedUpdates = new Map<string, readonly Print[]>();
   private readonly notices = new Set<string>(); // stream notices already logged
@@ -449,6 +451,7 @@ export class PriceService {
         this.newFeeds.add(p.feedId);
         if (this.listeners.size > 0) (batch ??= new Set()).add(p.feedId);
         this.latest.set(p.feedId, p);
+        if (p.feedId === ETH_USD_FEED) this.confirmEthUsd(p);
       }
       const was = this.issued.get(p.feedId);
       if (was === undefined || p.timestampUs > was.timestampUs) this.issued.set(p.feedId, p);
@@ -957,14 +960,30 @@ export class PriceService {
   }
 
   /**
-   * USD per ETH from the newest ETH/USD print, for pricing gas; null when there is none, when it is
-   * older than {@link ethUsdMaxAge} seconds at `now` (default the clock), or when it is not a finite
-   * number within {@link ethUsdBounds}. The caller then uses its own fallback (the keeper's
-   * `gas.ethUsdFallback`). No contract checks this print: it prices gas, not a call.
+   * Make `p` the print {@link ethUsd} reads once its signer is confirmed. No contract checks this
+   * print, so one a stream took without its signer check (ProClientOptions.signerCheckInterval) is
+   * checked here first: one signature recovery per ETH/USD update, whatever the number of markets. A
+   * print refused, or whose check fails, is never read; the last confirmed one stands meanwhile.
+   */
+  private confirmEthUsd(p: Print): void {
+    const use = () => {
+      if (this.ethUsdPrint === null || p.generatedUs > this.ethUsdPrint.generatedUs) this.ethUsdPrint = p;
+    };
+    const client = this.client;
+    if (p.signer !== null || !(client instanceof ProClient) || client.isTrustedSigner === null) return use();
+    client.verifySigner(p.blob).then(use, (e: unknown) => this.onNotice(`an ETH/USD print was not used to price gas: ${message(e)}`));
+  }
+
+  /**
+   * USD per ETH from the newest ETH/USD print whose signer is confirmed (when the source checks
+   * signers), for pricing gas; null when there is none, when it is older than {@link ethUsdMaxAge}
+   * seconds at `now` (default the clock), or when it is not a finite number within
+   * {@link ethUsdBounds}. The caller then uses its own fallback (the keeper's `gas.ethUsdFallback`).
+   * No contract checks this print: it prices gas, not a call.
    */
   ethUsd(now?: number | null): number | null {
-    const p = this.latest.get(ETH_USD_FEED);
-    if (p === undefined || p.price <= 0n) return null;
+    const p = this.ethUsdPrint;
+    if (p === null || p.price <= 0n) return null;
     if ((now ?? this.clock()) - p.publishTime > this.ethUsdMaxAge) return null;
     const v = p.expo < 0 ? Number(p.price) / 10 ** -p.expo : Number(p.price) * 10 ** p.expo;
     const [min, max] = this.ethUsdBounds;
