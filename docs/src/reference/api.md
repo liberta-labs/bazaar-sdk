@@ -882,6 +882,10 @@ UMA assertions, disputes and settlement, and the shared helpers the costed build
 | [`uma.disputeAssertion`](../sdk/governance.md) | function, bz | Dispute an assertion: you match its bond, and UMA's DVM votes on the claim. |
 | [`uma.settleAssertion`](../sdk/governance.md) | function, bz | Settle an assertion on the oracle directly. |
 | [`uma.requireSettleable`](../sdk/governance.md) | function | Throws the InputError a settle attempt deserves when the assertion cannot settle yet. |
+| [`uma.earlySettler`](../sdk/governance.md#settling-early-on-a-testnet) | function, bz | Who can settle the deployment's claims before their liveness ends: the owner of a testnet's stand-in oracle, or null when the oracle has no owner. |
+| [`uma.settleEarly`](../sdk/governance.md#settling-early-on-a-testnet) | function, bz | Settle a claim now, without waiting for its liveness, with the verdict `result` (true by default); only the stand-in oracle's owner can send it. |
+| [`uma.earlySettleCodec`](../sdk/governance.md#settling-early-on-a-testnet) | function | Codec for `EARLY_SETTLE_ABI`. |
+| [`uma.EARLY_SETTLE_ABI`](../sdk/governance.md#settling-early-on-a-testnet) | const | The owner-only override of the oracle a Bazaar testnet uses where UMA runs no OOv3. |
 | [`uma.optimisticOracleV3Abi`](../sdk/governance.md) | const | The slice of UMA's OptimisticOracleV3Interface these flows need. |
 | [`uma.isZero32`](../sdk/governance.md) | const | True for the all-zero bytes32 the contracts use as "none". |
 | [`uma.ContractRead`](../sdk/governance.md) | interface | One read for `readMany`. |

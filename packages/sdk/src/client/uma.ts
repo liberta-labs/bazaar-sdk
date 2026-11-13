@@ -848,3 +848,103 @@ export function requireSettleable(st: AssertionStatus, field: string): void {
       return;
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Early settlement on a testnet's stand-in oracle
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The owner-only override of the oracle a Bazaar testnet uses where UMA runs no OOv3
+ * (`OwnedMockOptimisticOracleV3`, in the protocol repository's test/mocks), hand-written: it is a test
+ * contract, not part of UMA's interface. UMA's own OOv3 has neither function, so on a mainnet
+ * deployment {@link earlySettler} reports nobody and {@link settleEarly} refuses.
+ */
+export const EARLY_SETTLE_ABI = [
+  { type: "function", name: "owner", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] },
+  {
+    type: "function",
+    name: "mockForceSettle",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "assertionId", type: "bytes32" },
+      { name: "result", type: "bool" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+let earlyCache: ContractCodec | null = null;
+
+/** Codec for {@link EARLY_SETTLE_ABI}. */
+export function earlySettleCodec(): ContractCodec {
+  return (earlyCache ??= new ContractCodec(EARLY_SETTLE_ABI as unknown as Abi));
+}
+
+/**
+ * Who can settle the deployment's claims before their liveness ends: the owner of a testnet's
+ * stand-in oracle, or null when the oracle has no owner (UMA's own OOv3, on which nobody can).
+ * `oo` defaults to `factory.oo()`.
+ */
+export async function earlySettler(ctx: BazaarContext, opts: { oo?: Address } = {}): Promise<Address | null> {
+  const oo = opts.oo ?? (await optimisticOracle(ctx));
+  const c = earlySettleCodec();
+  const [res] = await ctx.chain.batch([{ to: oo, data: c.encode("owner") }]);
+  const [ok, data] = res!;
+  // An oracle without the function reverts, or answers empty data when it has a fallback.
+  if (!ok || data.length < 66) return null;
+  const owner = c.decode<Address>("owner", data);
+  return owner === ZERO_ADDRESS ? null : getAddress(owner);
+}
+
+/**
+ * Settle a claim now, without waiting for its liveness, with the verdict `result` (true, the default:
+ * the claim is accepted). Only the owner of a testnet's stand-in oracle can send it
+ * (`mockForceSettle`). The oracle pays out the bonds as UMA would for that verdict: an accepted
+ * undisputed claim returns the proposer's bond, a disputed one pays both bonds to the side that wins,
+ * and a rejected undisputed claim keeps the proposer's bond, with no disputer to receive it. Then it
+ * calls the Bazaar contract that made the claim, which applies the verdict as after any settle:
+ * deploys or refunds a listing, schedules or rejects a termination, queues or drops an identifier
+ * upgrade. Costs only gas.
+ *
+ * Refused up front: an oracle with no owner (UMA's own OOv3, which has no early settlement), a `from`
+ * that is not the owner, an unknown assertion, and one already settled. An `oo` passed is used only
+ * if it is `factory.oo()` or the oracle recorded for this assertion.
+ */
+export async function settleEarly(
+  ctx: BazaarContext,
+  args: { assertionId: Hex; from: Address; result?: boolean; home?: AssertionHome; oo?: Address },
+): Promise<CostedCall> {
+  const id = asBytes32("assertionId", args.assertionId);
+  const from = asAddress("from", args.from);
+  const result = args.result ?? true;
+  const oo = await oracleFor(ctx, id, args.home ?? "factory", args.oo);
+  const [owner, a, now] = await Promise.all([earlySettler(ctx, { oo }), getAssertion(ctx, oo, id), chainNow(ctx)]);
+  if (owner === null) throw new InputError("assertionId", "This deployment's oracle is UMA's own: a claim settles only once its liveness ends, and nobody can settle it early.");
+  if (owner !== from) throw new InputError("from", `Only the oracle's owner, ${owner}, can settle a claim early.`);
+  const st = statusOf(a, now);
+  if (st.phase === "notFound") throw new InputError("assertionId", "UMA's oracle has no such assertion.");
+  if (st.phase === "settledTrue" || st.phase === "settledFalse") throw new InputError("assertionId", "This claim is already settled.");
+  const notes: string[] = [];
+  if (st.phase === "liveness") {
+    notes.push(`Its dispute window closes ${timeText(a!.expirationTime)}: settling now ends it at once, and nobody can dispute the claim after that.`);
+    notes.push(result ? "Accepted, the proposer gets their bond back." : "Rejected undisputed, the proposer's bond stays in the oracle: there is no disputer to receive it.");
+  } else if (st.phase === "disputed") {
+    notes.push(`Disputed: this decides it in place of UMA's voters, and ${result ? "the proposer" : "the disputer"} receives both bonds.`);
+  } else if (result) {
+    notes.push("Its liveness has already ended: an ordinary settle, which anyone can send, accepts it the same way.");
+  } else {
+    notes.push("Its liveness has ended undisputed, so an ordinary settle would accept it: this rejects it instead, and the proposer's bond stays in the oracle.");
+  }
+  return {
+    action: "mockForceSettle",
+    to: oo,
+    data: earlySettleCodec().encode("mockForceSettle", id, result),
+    value: 0n,
+    from,
+    summary: `Settle UMA claim ${id.slice(0, 10)}… now, ${result ? "accepted" : "rejected"}, without waiting for its liveness (no cost but gas)`,
+    costs: [],
+    approvals: [],
+    requires: [],
+    notes,
+  };
+}

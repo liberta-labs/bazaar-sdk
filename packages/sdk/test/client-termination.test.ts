@@ -44,11 +44,14 @@ import {
   assertionPhase,
   assertionStatus,
   disputeAssertion,
+  earlySettleCodec,
+  earlySettler,
   erc20Codec,
   ethText,
   optimisticOracleCodec,
   previewSettlement,
   settleAssertion,
+  settleEarly,
   sharesText,
   statusOf,
   timeText,
@@ -1473,6 +1476,54 @@ describe("UMA assertions", () => {
     s.st.preview = new Revert(stringError("Assertion not expired"));
     const p = await previewSettlement(s.ctx, b32(1), { oo: ADDR.oo });
     expect([p.settleable, p.result, p.error?.message]).toEqual([false, null, "Assertion not expired"]);
+  });
+});
+
+describe("early settlement", () => {
+  /** A scene whose oracle is a testnet's stand-in, owned by `owner` (a revert: an oracle with no owner). */
+  function owned(owner: Address | Revert) {
+    const s = scene();
+    s.fake.on(ADDR.oo, earlySettleCodec(), "owner", () => {
+      if (owner instanceof Revert) throw owner;
+      return owner;
+    });
+    return s;
+  }
+
+  it("earlySettler names the stand-in oracle's owner, and nobody on an oracle without one", async () => {
+    expect(await earlySettler(owned(ADDR.alice).ctx)).toBe(ADDR.alice);
+    expect(await earlySettler(owned(new Revert("0x")).ctx)).toBeNull();
+    expect(await earlySettler(owned("0x0000000000000000000000000000000000000000").ctx)).toBeNull();
+  });
+
+  it("settleEarly force-settles on the claim's oracle with the verdict asked, for its owner alone", async () => {
+    const s = owned(ADDR.alice);
+    const id = b32(0xe1);
+    s.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1_000_000_000n });
+    const c = await settleEarly(s.ctx, { assertionId: id, from: ADDR.alice, home: "terminator" });
+    expect([c.action, c.to, c.from, c.value, c.costs, c.approvals]).toEqual(["mockForceSettle", ADDR.oo, ADDR.alice, 0n, [], []]);
+    expect(decodeCall(earlySettleCodec(), "mockForceSettle", c.data)).toEqual([id, true]);
+    expect(c.notes.join(" ")).toMatch(/dispute window closes .* the proposer gets their bond back/);
+    const no = await settleEarly(s.ctx, { assertionId: id, from: ADDR.alice, result: false });
+    expect(decodeCall(earlySettleCodec(), "mockForceSettle", no.data)).toEqual([id, false]);
+    expect(no.notes.join(" ")).toMatch(/bond stays in the oracle/);
+    // A disputed claim: the verdict decides who takes both bonds.
+    s.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1n, disputer: ADDR.alice });
+    expect((await settleEarly(s.ctx, { assertionId: id, from: ADDR.alice, result: false })).notes.join(" ")).toMatch(/the disputer receives both bonds/);
+    // Anyone else is refused before anything is built, and so is a settled or unknown claim.
+    expect((await inputError(settleEarly(s.ctx, { assertionId: id, from: ADDR.bob }), "from")).message).toContain(`Only the oracle's owner, ${ADDR.alice}`);
+    s.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1n, settled: true, settlementResolution: true });
+    expect((await inputError(settleEarly(s.ctx, { assertionId: id, from: ADDR.alice }), "assertionId")).message).toMatch(/already settled/);
+    await inputError(settleEarly(s.ctx, { assertionId: b32(0xe2), from: ADDR.alice }), "assertionId");
+  });
+
+  it("settleEarly refuses on UMA's own oracle, and on an oracle that is not the claim's", async () => {
+    const s = owned(new Revert("0x"));
+    const id = b32(0xe3);
+    s.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1n });
+    expect((await inputError(settleEarly(s.ctx, { assertionId: id, from: ADDR.alice }), "assertionId")).message).toMatch(/UMA's own/);
+    const EVIL = getAddress("0x000000000000000000000000000000000000e5e1");
+    await inputError(settleEarly(owned(ADDR.alice).ctx, { assertionId: id, from: ADDR.alice, oo: EVIL }), "oo");
   });
 });
 

@@ -177,6 +177,21 @@ still open (with the time it can be settled), and once it is settled. A disputed
 after the DVM has ruled; until then the call reverts, which the builder cannot see in advance. Simulate
 it, or call `previewSettlement` first.
 
+## Settling Early on a Testnet
+
+Where UMA runs no Optimistic Oracle (Arbitrum Sepolia), Bazaar's testnet uses a stand-in oracle that its
+deployer owns. Besides everything the real oracle does, its owner can settle a claim at once, without
+waiting for the liveness, with the verdict they choose. UMA's own oracle has no owner and no such call.
+
+`uma.earlySettler({ oo? })` returns that owner, or `null` on an oracle without one: a page can show an
+early-settle button only to the address it returns.
+
+`uma.settleEarly({ assertionId, from, result?, home?, oo? })` builds the call (`mockForceSettle`), with
+`result` defaulting to `true` (the claim is accepted). The oracle pays the bonds as UMA would for that
+verdict, then calls the Bazaar contract that made the claim, which applies it as after any settle. It
+throws an `InputError` on `assertionId` on an oracle with no owner, for an unknown assertion and once it
+is settled, and on `from` when the sender is not the owner. Costs only gas.
+
 ## Other Reads
 
 | Function | Returns |
