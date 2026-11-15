@@ -55,6 +55,7 @@ import {
   assertionOracle,
   bondApprovals,
   chainNow,
+  disputeRuler,
   durationText,
   ethText,
   sharesText,
@@ -67,7 +68,9 @@ import {
   readOne,
   requireBondFloor,
   requireSettleable,
+  rulerSubject,
   statusOf,
+  type DisputeRuler,
 } from "./uma.js";
 import { formatDecimal } from "./units.js";
 
@@ -297,8 +300,8 @@ function toRule(raw: { rule: number; firstTarget: bigint; latestPublishTs: bigin
 }
 
 /**
- * How `terminateScheduledPair` would settle the market if called now, and what it needs. A verdict
- * the DVM has reached but nobody has recorded reads here as no verdict (see {@link SETTLEMENT_RULE_TEXT}).
+ * How `terminateScheduledPair` would settle the market if called now, and what it needs. A ruling
+ * that is in but nobody has recorded reads here as no verdict (see {@link SETTLEMENT_RULE_TEXT}).
  */
 export async function settlementRule(ctx: BazaarContext, pair: Address): Promise<SettlementRuleInfo> {
   return toRule(await readOne(ctx, ctx.terminator, T(), "settlementRule", asAddress("pair", pair)));
@@ -754,7 +757,8 @@ const DEFAULT_SLACK = 60;
  * Propose ending a market through UMA. The terminator pulls the bond (`requiredTerminationBond()`,
  * at least 1,000 USDC) from the caller with `transferFrom` and posts it to UMA's oracle as the
  * assertion bond, with the caller as asserter: UMA returns it to the caller when the claim resolves
- * true, and pays it to the disputer if UMA's voters reject it. The USDC approval for the terminator
+ * true, and pays it to the disputer if a dispute is upheld (by UMA's voters, or on a testnet by the
+ * stand-in oracle's owner). The USDC approval for the terminator
  * is returned in `approvals` whenever the allowance is short.
  *
  * The claim names the market by its pair id and feed ids, declares `category`, proposes
@@ -790,7 +794,7 @@ export async function proposeTermination(
   if (why) throw new InputError("reason", why);
   const slack = args.slackSeconds ?? DEFAULT_SLACK;
 
-  const [r, now] = await Promise.all([
+  const [r, now, ruler] = await Promise.all([
     readMany(ctx, [
       { to: ctx.terminator, codec: T(), fn: "isPair", args: [pair] },
       { to: pair, codec: P(), fn: "isPairTerminated" },
@@ -803,6 +807,7 @@ export async function proposeTermination(
       { to: ctx.terminator, codec: T(), fn: "requiredTerminationBond" },
     ]),
     chainNow(ctx),
+    disputeRuler(ctx),
   ]);
   if (!(r[0] as boolean)) throw new InputError("pair", "This market is not registered with Bazaar's terminator.");
   if (r[1] as boolean) throw new InputError("pair", "This market has already ended.");
@@ -849,7 +854,7 @@ export async function proposeTermination(
       unit: "USDC",
       token: ctx.usdc,
       payee: ctx.terminator,
-      returned: "Returned to you by UMA when the claim is accepted; paid to the disputer if UMA's voters reject it.",
+      returned: `Returned to you by UMA when the claim is accepted; paid to the disputer if it is rejected by ${rulerSubject(ruler).who}.`,
       contingent: false,
     },
   ];
@@ -875,7 +880,7 @@ export async function proposeTermination(
  * schedule's prints), a rejected one leaves it alone and ends the claim's vote. Costs only gas.
  *
  * Refused up front: an unknown or resolved claim, and one still inside UMA's liveness. A disputed
- * claim settles only after UMA's voters have ruled; until then the call reverts.
+ * claim settles only after it is ruled on (`uma.DisputeRuler`); until then the call reverts.
  */
 export async function settleTerminationProposal(ctx: BazaarContext, args: { assertionId: Hex; from?: Address }): Promise<CostedCall> {
   const id = asBytes32("assertionId", args.assertionId);
@@ -886,10 +891,10 @@ export async function settleTerminationProposal(ctx: BazaarContext, args: { asse
   const [a, now] = await Promise.all([getAssertion(ctx, oo, id), chainNow(ctx)]);
   const st = statusOf(a, now);
   requireSettleable(st, "assertionId");
-  const notes =
-    st.phase === "disputed"
-      ? ["The claim was disputed: this succeeds only once UMA's voters have ruled."]
-      : ["Undisputed past its liveness: UMA accepts the claim, returns the bond to the proposer, and the terminator schedules the market."];
+  const ruled = st.phase === "disputed" ? rulerSubject(await disputeRuler(ctx, { oo })) : null;
+  const notes = ruled
+    ? [`The claim was disputed: this succeeds only once ${ruled.who} ${ruled.have} ruled.`]
+    : ["Undisputed past its liveness: UMA accepts the claim, returns the bond to the proposer, and the terminator schedules the market."];
   return {
     action: "settleTerminationProposal",
     to: ctx.terminator,
@@ -1683,9 +1688,9 @@ async function archiveAnswers(fetch: TickFetcher, now: number): Promise<boolean>
  *   at or after its target, the next target 600 s past the sample's second (the later leg's), every
  *   sample stamped no later than `latestPublishTs` (the UMA cap, when there is one).
  * - A claim-backed vote whose verdict nobody has recorded may settle under either rule, because the
- *   call records the verdict itself (UMA's rule if the DVM upheld the claim, the chain rule if not).
+ *   call records the verdict itself (UMA's rule if the claim was upheld, the chain rule if not).
  *   The builder first simulates OOv3's `settleAndGetAssertionResult` (uma's `previewSettlement`) to
- *   see whether and how the DVM ruled, and builds that rule's set (an upheld claim's UMA rule has no
+ *   see whether and how it was ruled on, and builds that rule's set (an upheld claim's UMA rule has no
  *   stored-price fallback yet: its grace starts at this recording). When the verdict cannot be
  *   previewed, both sets are built and each is simulated, and the one the contract accepts is
  *   returned. Building the cutoff's set here, rather than first recording an upheld verdict on its
@@ -1799,7 +1804,7 @@ export async function terminateScheduledPair(
           storedPriceWithheld: null,
         };
       }
-      // A disputed claim: simulate settling it to see whether, and how, the DVM has ruled.
+      // A disputed claim: simulate settling it to see whether, and how, it has been ruled on.
       const pv = st.phase === "disputed" ? await previewSettlementOn(ctx, oo, scheduleId, from) : null;
       const capped = cap;
       if (pv?.result === true) {
@@ -2095,7 +2100,7 @@ export function decodeTerminatorLog(log: RawLog): DecodedLog | null {
   return T().decodeLog(log);
 }
 
-/** What each terminator event means, for an activity feed. */
+/** What each terminator event means, for an activity feed, on UMA's own OOv3 ({@link terminatorEventText} words it for either ruler). */
 export const TERMINATOR_EVENT_TEXT: Readonly<Record<string, string>> = {
   TerminationProposalSubmitted: "A UMA termination claim was filed; its insurer vote opened with it.",
   TerminationProposalDisputed: "The termination claim was disputed: UMA's voters will decide it.",
@@ -2117,6 +2122,12 @@ export const TERMINATOR_EVENT_TEXT: Readonly<Record<string, string>> = {
   InsurerTerminationOutcome: "The vote's outcome was stamped as the settlement price was fixed.",
   InsurerLevyCharged: "A yes-voter's redemption forfeited part of their voted shares to the bug bounty address.",
 };
+
+/** {@link TERMINATOR_EVENT_TEXT}'s sentence for the event `name`, with a dispute's naming who rules on it; null for an event it does not cover. */
+export function terminatorEventText(name: string, ruler: DisputeRuler = "uma"): string | null {
+  if (name === "TerminationProposalDisputed" && ruler === "owner") return "The termination claim was disputed: on this testnet the oracle's owner will decide it.";
+  return TERMINATOR_EVENT_TEXT[name] ?? null;
+}
 
 /** The proposal ids a proposeTermination or proposeInsurerTermination receipt created. */
 export function proposalIdsFromReceipt(ctx: BazaarContext, receipt: Receipt): { assertionId: Hex | null; insurerProposalId: Hex | null } {

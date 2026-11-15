@@ -252,8 +252,10 @@ describe("proposePairDeployment", () => {
       expect(c.data).toBe(byHex.data);
       expect(c.pairId).toBe(FEED);
     }
-    // only the factory, the oracle's composite registry and the token are read
-    expect(new Set(s.fake.calls.map((c) => c.fn))).toEqual(new Set(["composites", "requiredDeploymentBond", "umaIdentifierIsLive", "pairAddressById", "pairAddressByBaseFeed", "pendingDeploymentByBaseFeed", "allowance", "balanceOf"]));
+    // only the factory (its UMA oracle too, to word who rules on a dispute), the oracle's composite registry and the token are read
+    expect(new Set(s.fake.calls.map((c) => c.fn))).toEqual(
+      new Set(["composites", "requiredDeploymentBond", "umaIdentifierIsLive", "pairAddressById", "pairAddressByBaseFeed", "pendingDeploymentByBaseFeed", "oo", "allowance", "balanceOf"]),
+    );
     expect(byHex.legFeeds).toEqual([null]); // no registry at hand: not checked, and nothing said
     expect(byHex.notes.join(" ")).not.toMatch(/registry/);
   });

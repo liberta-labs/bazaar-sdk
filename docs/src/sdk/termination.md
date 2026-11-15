@@ -505,7 +505,8 @@ proposer's reward are separate, in the fee balance (`claimFees`). Insurance LPs 
 
 `termination.decodeTerminatorLog(log)` decodes a terminator log (or returns `null` for another
 contract's), and `termination.TERMINATOR_EVENT_TEXT` has a sentence for each event, for an activity
-feed. Every UMA claim ends in exactly one of `TerminationProposalAccepted`,
+feed (`termination.terminatorEventText(name, ruler)` words a dispute for whoever rules on it, see
+[Settling Early on a Testnet](governance.md#settling-early-on-a-testnet)). Every UMA claim ends in exactly one of `TerminationProposalAccepted`,
 `TerminationScheduleRefused`, `TerminationProposalSuperseded` or `TerminationProposalRejected`. For
 indexed history (`terminationProposals`, `insurerProposals`, `insurerVotes`, `insurerLevies`,
 `pairTerminations`, `terminalRatioUpdates`) see [History](history.md). [Live Updates](live-updates.md)

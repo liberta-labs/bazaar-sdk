@@ -37,6 +37,7 @@ import {
   assertionOracle,
   bondApprovals,
   chainNow,
+  disputeRuler,
   durationText,
   sharesText,
   timeText,
@@ -49,7 +50,9 @@ import {
   readOne,
   requireBondFloor,
   requireSettleable,
+  rulerSubject,
   statusOf,
+  type DisputeRuler,
 } from "./uma.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -81,7 +84,7 @@ export const MAX_DESCRIPTION_LENGTH = 200;
 export const PAIR_DEPLOYMENT_PROPOSAL_VOIDED =
   "UMA approved this listing without a dispute, but the identifier it was asserted under has since left UMA's whitelist, so it was released instead of deployed. No market was created; the seed was credited back to the proposer (claimSeedRefund), UMA returned the bond, and the asset can be proposed again.";
 
-/** What each factory listing event means, for an activity feed. */
+/** What each factory listing event means, for an activity feed, on UMA's own OOv3 ({@link listingEventText} words it for either ruler). */
 export const LISTING_EVENT_TEXT: Readonly<Record<string, string>> = {
   PairDeploymentProposed: "A listing was proposed: its UMA liveness started and its seed is escrowed.",
   PairDeploymentProposalDisputed: "The listing was disputed: UMA's voters will decide it.",
@@ -92,6 +95,12 @@ export const LISTING_EVENT_TEXT: Readonly<Record<string, string>> = {
   SeedRefundCredited: "A listing's seed was credited back to its proposer, to collect with claimSeedRefund.",
   SeedRefundClaimed: "A proposer collected a seed refund.",
 };
+
+/** {@link LISTING_EVENT_TEXT}'s sentence for the event `name`, with a dispute's naming who rules on it; null for an event it does not cover. */
+export function listingEventText(name: string, ruler: DisputeRuler = "uma"): string | null {
+  if (name === "PairDeploymentProposalDisputed" && ruler === "owner") return "The listing was disputed: on this testnet the oracle's owner will decide it.";
+  return LISTING_EVENT_TEXT[name] ?? null;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -256,7 +265,7 @@ export async function requiredDeploymentBond(ctx: BazaarContext): Promise<bigint
  * - `inReview`: in UMA's liveness; disputable until it ends;
  * - `settleable`: past liveness undisputed: settling it deploys the market (or voids it, if UMA has
  *   since removed its identifier);
- * - `disputed`: UMA's voters decide it;
+ * - `disputed`: waiting on a ruling: UMA's voters, or a testnet stand-in oracle's owner (`uma.DisputeRuler`);
  * - `deployed`: the market exists;
  * - `notDeployed`: rejected, voided or released; the seed was credited to `seedRefundOwed`.
  */
@@ -463,8 +472,8 @@ export async function seedRefundOwed(ctx: BazaarContext, account: Address): Prom
  * allowance is short), posts the bond (`requiredDeploymentBond()`) to UMA with the caller as
  * asserter, and escrows the rest as the insurance seed. After 48 hours undisputed, anyone may settle
  * it: the pair is deployed with the seed as its insurance fund (the caller receives it as insurance
- * shares) and UMA returns the bond. If UMA's voters reject it after a dispute, the bond goes to the
- * disputer and the seed is credited back for `claimSeedRefund`; the same credit follows a voided or
+ * shares) and UMA returns the bond. If a dispute is upheld (by UMA's voters, or on a testnet by the
+ * stand-in oracle's owner), the bond goes to the disputer and the seed is credited back for `claimSeedRefund`; the same credit follows a voided or
  * released listing.
  *
  * Refused up front: `totalAmount` below $4,000 or a seed below $3,000 once the live bond is taken; an
@@ -514,7 +523,7 @@ export async function proposePairDeployment(
   }
   const raw = comp ? comp.baseId : baseFeedId;
   const legs = comp ? [comp.baseId.toLowerCase() as Hex, comp.quoteId.toLowerCase() as Hex] : [baseFeedId];
-  const [r, registry] = await Promise.all([
+  const [r, registry, ruler] = await Promise.all([
     readMany(ctx, [
       { to: ctx.factory, codec: F(), fn: "requiredDeploymentBond" },
       { to: ctx.factory, codec: F(), fn: "umaIdentifierIsLive" },
@@ -523,6 +532,7 @@ export async function proposePairDeployment(
       { to: ctx.factory, codec: F(), fn: "pendingDeploymentByBaseFeed", args: [raw] },
     ]),
     registryEntries(ctx, legs, args.registry),
+    disputeRuler(ctx),
   ]);
   const [bond, live, existing, holder, pendingId] = r as [bigint, boolean, Address, Address, Hex];
   const registryNotes: string[] = [];
@@ -539,7 +549,7 @@ export async function proposePairDeployment(
         );
       }
       legFeeds[i] = entry;
-      registryNotes.push(feedNote(entry));
+      registryNotes.push(feedNote(entry, ruler));
     });
   }
   requireBondFloor("a listing bond", bond, DEPLOYMENT_BOND_USDC);
@@ -580,14 +590,15 @@ export async function proposePairDeployment(
         }
         notes.push("Another listing of this asset passed review under an identifier UMA has since removed: your call voids it first.");
       } else {
-        const pv = await previewSettlementOn(ctx, oo, pendingId, from);
+        const [pv, pendingRuler] = await Promise.all([previewSettlementOn(ctx, oo, pendingId, from), disputeRuler(ctx, { oo })]);
+        const { who, have } = rulerSubject(pendingRuler);
         if (pv.result === true) {
-          throw new InputError("baseFeedId", "Another listing of this asset was disputed and UMA's voters approved it: it deploys when settled (settleDeploymentProposal).");
+          throw new InputError("baseFeedId", `Another listing of this asset was disputed and ${who} approved it: it deploys when settled (settleDeploymentProposal).`);
         }
         if (!pv.settleable) {
-          throw new InputError("baseFeedId", "Another listing of this asset is disputed and UMA's voters have not ruled yet: one listing per asset at a time.");
+          throw new InputError("baseFeedId", `Another listing of this asset is disputed and ${who} ${have} not ruled yet: one listing per asset at a time.`);
         }
-        notes.push("Another listing of this asset was disputed and UMA's voters rejected it: your call settles it first.");
+        notes.push(`Another listing of this asset was disputed and ${who} rejected it: your call settles it first.`);
       }
     }
   }
@@ -617,7 +628,7 @@ export async function proposePairDeployment(
         unit: "USDC",
         token: ctx.usdc,
         payee: ctx.factory,
-        returned: "Returned to you by UMA when the listing is approved (deployed or voided); paid to the disputer if UMA's voters reject it.",
+        returned: `Returned to you by UMA when the listing is approved (deployed or voided); paid to the disputer if it is rejected by ${rulerSubject(ruler).who}.`,
         contingent: false,
       },
       {
@@ -663,11 +674,11 @@ async function registryEntries(ctx: BazaarContext, legs: readonly Hex[], opt: st
 }
 
 /** What the registry lists a feed as, for a builder's notes: its text made printable and bounded, whatever source listed it. */
-function feedNote(e: ProSymbol): string {
+function feedNote(e: ProSymbol, ruler: DisputeRuler): string {
   const t = (s: string) => printable(typeof s === "string" ? s : "", 100);
   const [symbol, name, assetType, state, minChannel, schedule] = [e.symbol, e.name, e.assetType, e.state, e.minChannel, e.schedule].map(t);
   const facts = [assetType, state && `state ${state}`, minChannel && `fastest channel ${minChannel}`, schedule && `schedule ${schedule}`].filter(Boolean);
-  return `Pyth Pro's registry lists feed ${e.id} as ${symbol || name || "an unnamed feed"}${facts.length ? ` (${facts.join(", ")})` : ""}: UMA's voters check it against the description.`;
+  return `Pyth Pro's registry lists feed ${e.id} as ${symbol || name || "an unnamed feed"}${facts.length ? ` (${facts.join(", ")})` : ""}: ${ruler === "owner" ? "the testnet oracle's owner checks" : "UMA's voters check"} it against the description.`;
 }
 
 /**
@@ -677,7 +688,7 @@ function feedNote(e: ProSymbol): string {
  * rejected, it credits the seed back. Costs only gas.
  *
  * Refused up front: an unknown or resolved listing, and one still in UMA's liveness. A disputed
- * listing settles only after UMA's voters have ruled.
+ * listing settles only after it is ruled on (`uma.DisputeRuler`).
  */
 export async function settleDeploymentProposal(ctx: BazaarContext, args: { assertionId: Hex; from?: Address }): Promise<CostedCall> {
   const id = asBytes32("assertionId", args.assertionId);
@@ -689,7 +700,10 @@ export async function settleDeploymentProposal(ctx: BazaarContext, args: { asser
   const st = statusOf(a, now);
   requireSettleable(st, "assertionId");
   const notes: string[] = [];
-  if (st.phase === "disputed") notes.push("The listing was disputed: this succeeds only once UMA's voters have ruled.");
+  if (st.phase === "disputed") {
+    const { who, have } = rulerSubject(await disputeRuler(ctx, { oo }));
+    notes.push(`The listing was disputed: this succeeds only once ${who} ${have} ruled.`);
+  }
   else if (a && (await identifierWhitelisted(ctx, a.identifier, { oo })) === false) notes.push(PAIR_DEPLOYMENT_PROPOSAL_VOIDED);
   else notes.push("Undisputed past its liveness: the market is deployed and seeded, and UMA returns the bond to the proposer.");
   return {
@@ -708,7 +722,7 @@ export async function settleDeploymentProposal(ctx: BazaarContext, args: { asser
 
 /**
  * Release an asset's listing slot when its assertion cannot settle on UMA's oracle (a blacklisted
- * payee, a dispute the DVM never resolves). The factory first tries to settle it, so a listing that
+ * payee, a dispute never ruled on). The factory first tries to settle it, so a listing that
  * can still resolve simply resolves. Otherwise an undisputed listing past its liveness is approved
  * (deployed, or voided if its identifier was removed), and a disputed one past the 14-day grace is
  * discarded with its seed credited back for `claimSeedRefund`. The assertion stays on the oracle, so

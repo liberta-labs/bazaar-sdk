@@ -323,7 +323,8 @@ single proposal's current state with `deploymentProposal`.
 
 From the chain's own events, `listings.decodeFactoryLog(log)` decodes any factory log (or returns `null`
 for another contract's), and `listings.LISTING_EVENT_TEXT` has one sentence per listing event for an
-activity feed:
+activity feed (`listings.listingEventText(name, ruler)` words a dispute for whoever rules on it, see
+[Settling Early on a Testnet](governance.md#settling-early-on-a-testnet)):
 
 ```ts
 {{#include ../../examples/protocol/listings-settle.ts:events}}

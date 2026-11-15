@@ -4,7 +4,8 @@
  *
  * Every UMA-gated action in Bazaar is an *assertion*: a claim posted with a USDC bond that anyone may
  * dispute during its liveness window. Undisputed, it resolves true once the liveness ends; disputed,
- * UMA's DVM votes on it (days, up to about 12) and the losing side forfeits its bond. Bazaar never
+ * UMA's DVM votes on it (days, up to about 12; on a testnet's stand-in oracle its owner rules
+ * instead, see {@link DisputeRuler}) and the losing side forfeits its bond. Bazaar never
  * holds the verdict itself: the factory and the terminator learn it through OOv3's callbacks when
  * someone settles the assertion.
  *
@@ -529,7 +530,8 @@ export interface UmaAssertion {
  * Where an assertion stands, for a UI:
  * - `liveness`: undisputed and inside its liveness; disputable until `expirationTime`, settleable from it;
  * - `settleable`: undisputed and past its liveness: it can only resolve true, and anyone may settle it now;
- * - `disputed`: waiting on UMA's DVM vote; it settles once the DVM has ruled, which this view cannot see;
+ * - `disputed`: waiting on a ruling ({@link DisputeRuler}): UMA's DVM vote, or on a testnet's stand-in
+ *   oracle its owner's; it settles once that ruling is in, which this view cannot see;
  * - `settledTrue` / `settledFalse`: resolved;
  * - `notFound`: no such assertion on this oracle.
  */
@@ -546,7 +548,7 @@ export interface AssertionStatus {
   readonly now: number;
 }
 
-/** Text for each assertion phase. */
+/** Text for each assertion phase, on UMA's own OOv3 ({@link assertionPhaseText} words it for either ruler). */
 export const ASSERTION_PHASE_TEXT: Readonly<Record<AssertionPhase, string>> = {
   notFound: "No such assertion on UMA's oracle.",
   liveness: "In UMA's liveness window: anyone may dispute it until the window ends; undisputed, it is accepted then.",
@@ -555,6 +557,45 @@ export const ASSERTION_PHASE_TEXT: Readonly<Record<AssertionPhase, string>> = {
   settledTrue: "Settled: UMA accepted the claim.",
   settledFalse: "Settled: UMA rejected the claim.",
 };
+
+/**
+ * Who rules on a disputed claim:
+ * - `uma`: UMA's voters (the DVM), on UMA's own OOv3. The winner gets both bonds less the share UMA
+ *   burns as its fee ({@link burnedBondPercentage}).
+ * - `owner`: the owner of a testnet's stand-in oracle (`OwnedMockOptimisticOracleV3`), which rules in
+ *   their place with `mockDvmResolve` or `mockForceSettle` ({@link settleEarly}). It takes no fee, so
+ *   the winner gets both bonds in full, and it rules whether or not the claim's identifier is still on
+ *   the whitelist.
+ */
+export type DisputeRuler = "uma" | "owner";
+
+/**
+ * Who rules on disputes on `oo` (`factory.oo()` by default): the owner of an oracle that has one
+ * ({@link earlySettler}), else UMA's voters. Builders use it only to word their notes, so a read that
+ * fails answers `uma` rather than failing the build.
+ */
+export async function disputeRuler(ctx: BazaarContext, opts: { oo?: Address } = {}): Promise<DisputeRuler> {
+  try {
+    return (await earlySettler(ctx, opts)) === null ? "uma" : "owner";
+  } catch {
+    return "uma";
+  }
+}
+
+/**
+ * Who rules on a dispute, as the subject of a builder's sentence, with the form of "have" that agrees
+ * with it: "UMA's voters have ruled", "the testnet oracle's owner has ruled".
+ * @internal
+ */
+export function rulerSubject(ruler: DisputeRuler): { readonly who: string; readonly have: string } {
+  return ruler === "owner" ? { who: "the testnet oracle's owner", have: "has" } : { who: "UMA's voters", have: "have" };
+}
+
+/** {@link ASSERTION_PHASE_TEXT}'s sentence for `phase`, with a disputed claim's naming who rules on it. */
+export function assertionPhaseText(phase: AssertionPhase, ruler: DisputeRuler = "uma"): string {
+  if (phase === "disputed" && ruler === "owner") return "Disputed: on this testnet the oracle's owner rules on it in place of UMA's voters. It can be settled once they have ruled.";
+  return ASSERTION_PHASE_TEXT[phase];
+}
 
 function toAssertion(id: Hex, oo: Address, raw: Record<string, unknown>): UmaAssertion | null {
   const asserter = raw.asserter as Address;
@@ -607,7 +648,7 @@ export function statusOf(a: UmaAssertion | null, now: number): AssertionStatus {
 
 /**
  * Where an assertion stands: pending its liveness (with the time it can settle), settleable,
- * disputed (waiting on the DVM), or settled true or false. `home` says which Bazaar contract made
+ * disputed (waiting on a ruling), or settled true or false. `home` says which Bazaar contract made
  * it, which names the oracle it lives on. An `oo` passed is used only if it is `factory.oo()` or
  * the oracle recorded for this assertion; any other is refused (InputError on "oo").
  */
@@ -665,13 +706,13 @@ export interface SettlementPreview {
   readonly settleable: boolean;
   /** The verdict a settle would apply (true = the claim is accepted), or null when it cannot settle yet. */
   readonly result: boolean | null;
-  /** Why it cannot settle, decoded (a disputed assertion the DVM has not ruled on reverts in UMA's oracle). */
+  /** Why it cannot settle, decoded (a disputed assertion not yet ruled on reverts in the oracle). */
   readonly error: DecodedError | null;
 }
 
 /**
  * Simulate OOv3's `settleAndGetAssertionResult(assertionId)` without sending it. For a disputed
- * assertion this is the one way to see whether UMA's DVM has ruled, and how, before anyone records
+ * assertion this is the one way to see whether its ruler ({@link DisputeRuler}) has ruled, and how, before anyone records
  * the verdict on chain: Bazaar's own views read a disputed claim as pending until it is settled.
  * The simulation runs the Bazaar callback too, so a callback that would revert shows up here.
  * An `oo` passed is used only if it is `factory.oo()` or the oracle recorded for this assertion.
@@ -708,26 +749,34 @@ export function decodeAssertionLog(log: RawLog): DecodedLog | null {
   return optimisticOracleCodec().decodeLog(log);
 }
 
-/** What each OOv3 event means, for an activity feed. */
+/** What each OOv3 event means, for an activity feed, on UMA's own OOv3 ({@link assertionEventText} words it for either ruler). */
 export const ASSERTION_EVENT_TEXT: Readonly<Record<string, string>> = {
   AssertionMade: "A claim was posted to UMA with its bond; its liveness window started.",
   AssertionDisputed: "Someone disputed the claim and matched its bond; UMA's voters will decide it.",
   AssertionSettled: "The claim was settled: the bond went to the winning side and Bazaar applied the verdict.",
 };
 
+/** {@link ASSERTION_EVENT_TEXT}'s sentence for the event `name`, with a dispute's naming who rules on it; null for an event it does not cover. */
+export function assertionEventText(name: string, ruler: DisputeRuler = "uma"): string | null {
+  if (name === "AssertionDisputed" && ruler === "owner") return "Someone disputed the claim and matched its bond; on this testnet the oracle's owner will decide it.";
+  return ASSERTION_EVENT_TEXT[name] ?? null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Dispute an assertion: you match its bond, and UMA's DVM votes on the claim.
+ * Dispute an assertion: you match its bond, and UMA's DVM votes on the claim (on a testnet's
+ * stand-in oracle, its owner rules instead: {@link DisputeRuler}).
  *
  * OOv3 pulls the bond (in the assertion's currency, USDC for Bazaar) from the caller with
  * `transferFrom`, so the bond needs an approval for the oracle first; it is returned in `approvals`
  * whenever the allowance is short. `disputer` (default: the caller) is who is paid if the dispute
- * wins: their bond back plus the asserter's, less the share UMA burns as its fee. A dispute that
- * loses forfeits the bond. Bazaar's contracts learn of the dispute through OOv3's callback: a listing
- * or identifier upgrade waits on the DVM, a termination claim's insurer vote keeps running.
+ * wins: their bond back plus the asserter's, less the share UMA burns as its fee (in full on a
+ * stand-in oracle). A dispute that loses forfeits the bond. Bazaar's contracts learn of the dispute
+ * through OOv3's callback: a listing or identifier upgrade waits on the ruling, a termination claim's
+ * insurer vote keeps running.
  *
  * Refused up front: an unknown assertion, one already disputed or settled, and one past its liveness
  * (OOv3 accepts disputes only while `expirationTime > block.timestamp`); an `oo` that is neither
@@ -744,10 +793,13 @@ export async function disputeAssertion(
   const disputer = args.disputer ? asAddress("disputer", args.disputer) : from;
   if (disputer === ZERO_ADDRESS) throw new InputError("disputer", "cannot be the zero address");
   const oo = await oracleFor(ctx, id, args.home ?? "factory", args.oo);
-  const [a, now, burned] = await Promise.all([getAssertion(ctx, oo, id), chainNow(ctx), burnedBondPercentage(ctx, { oo })]);
+  const [a, now, burned, ruler] = await Promise.all([getAssertion(ctx, oo, id), chainNow(ctx), burnedBondPercentage(ctx, { oo }), disputeRuler(ctx, { oo })]);
+  const owner = ruler === "owner";
   const st = statusOf(a, now);
   if (!a) throw new InputError("assertionId", "UMA's oracle has no such assertion.");
-  if (st.phase === "disputed") throw new InputError("assertionId", "This claim has already been disputed: UMA's voters are deciding it.");
+  if (st.phase === "disputed") {
+    throw new InputError("assertionId", owner ? "This claim has already been disputed: the testnet oracle's owner rules on it." : "This claim has already been disputed: UMA's voters are deciding it.");
+  }
   if (st.phase === "settledTrue" || st.phase === "settledFalse") throw new InputError("assertionId", "This claim is already settled.");
   if (st.phase === "settleable") {
     throw new InputError("assertionId", `UMA's dispute window closed at ${timeText(a.expirationTime)}: the claim can no longer be disputed.`);
@@ -757,15 +809,18 @@ export async function disputeAssertion(
   else if (a.bond <= 0n) throw new BondQuoteError("The node reports a zero dispute bond for this claim: that answer cannot be right, so nothing was built. Check the RPC connection and try again.");
   const decimals = usdc ? 6 : await tokenDecimals(ctx, a.currency);
   const bondText = await formatToken(ctx, a.currency, a.bond);
-  const won = burned === null ? null : a.bond * 2n - (a.bond * burned) / 10n ** 18n;
+  // A stand-in oracle reports no burn share and takes no fee: the winner gets both bonds.
+  const won = owner ? a.bond * 2n : burned === null ? null : a.bond * 2n - (a.bond * burned) / 10n ** 18n;
   const notes: string[] = [
-    `You can dispute until ${timeText(a.expirationTime)}. UMA's voters then decide the claim, which takes days.`,
+    owner
+      ? `You can dispute until ${timeText(a.expirationTime)}. On this testnet the oracle's owner then rules on the claim in place of UMA's voters.`
+      : `You can dispute until ${timeText(a.expirationTime)}. UMA's voters then decide the claim, which takes days.`,
     won === null
       ? "If the dispute wins, the disputer receives both bonds less UMA's fee; if it loses, the bond is gone."
-      : `If the dispute wins, ${disputer} receives ${await formatToken(ctx, a.currency, won)} (both bonds less UMA's fee); if it loses, the bond is gone.`,
+      : `If the dispute wins, ${disputer} receives ${await formatToken(ctx, a.currency, won)} (${owner ? "both bonds in full" : "both bonds less UMA's fee"}); if it loses, the bond is gone.`,
   ];
-  const live = await identifierWhitelisted(ctx, a.identifier, { oo });
-  if (live === false) {
+  // A stand-in oracle's owner rules whatever the whitelist says, so only UMA's voters can be shut out.
+  if (!owner && (await identifierWhitelisted(ctx, a.identifier, { oo })) === false) {
     notes.push(
       "Warning: this claim's identifier is no longer on UMA's whitelist, so UMA's voters can never rule on a dispute: the bond would stay locked in the oracle for good.",
     );
@@ -783,7 +838,7 @@ export async function disputeAssertion(
     data: optimisticOracleCodec().encode("disputeAssertion", id, disputer),
     value: 0n,
     from,
-    summary: `Dispute UMA claim ${id.slice(0, 10)}…: posts a ${bondText} bond, lost if UMA's voters uphold the claim`,
+    summary: `Dispute UMA claim ${id.slice(0, 10)}…: posts a ${bondText} bond, lost if ${owner ? "the testnet oracle's owner upholds" : "UMA's voters uphold"} the claim`,
     pullsUsdc: usdc ? a.bond * 10n ** 12n : undefined,
     costs: [
       {
@@ -794,7 +849,9 @@ export async function disputeAssertion(
         token: a.currency,
         ...(usdc ? {} : { decimals }),
         payee: oo,
-        returned: "Returned with the asserter's bond (less UMA's fee) if UMA's voters reject the claim; forfeited if they uphold it.",
+        returned: owner
+          ? "Returned with the asserter's bond, in full, if the testnet oracle's owner rejects the claim; forfeited if they uphold it."
+          : "Returned with the asserter's bond (less UMA's fee) if UMA's voters reject the claim; forfeited if they uphold it.",
         contingent: false,
       },
     ],
@@ -811,7 +868,7 @@ export async function disputeAssertion(
  * do the same through the contract; either works.
  *
  * Refused up front while the assertion is still in its liveness (OOv3 requires the liveness to have
- * ended), and once it is settled. A disputed assertion settles only after the DVM has ruled; until
+ * ended), and once it is settled. A disputed assertion settles only after it is ruled on; until
  * then the call reverts, which this cannot see in advance. An `oo` passed is used only if it is
  * `factory.oo()` or the oracle recorded for this assertion.
  */

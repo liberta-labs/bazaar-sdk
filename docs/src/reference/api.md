@@ -777,6 +777,7 @@ Ending a market, fixing its settlement price, finalizing it and withdrawing afte
 | [`termination.StoredPricePolicy`](../sdk/termination.md) | type | When `terminateScheduledPair` offers the irreversible stored-price call once its last resort is open: `whenAbsent` (every proven set failed as absent and the archive answered a control request), `always`, or `never`. |
 | [`termination.ScheduledSettlementPlan`](../sdk/termination.md) | interface | What terminateScheduledPair needs now. |
 | [`termination.TERMINATOR_EVENT_TEXT`](../sdk/termination.md) | const | What each terminator event means, for an activity feed. |
+| [`termination.terminatorEventText`](../sdk/termination.md) | function | A terminator event's sentence, with a dispute worded for whoever rules on it (`uma.DisputeRuler`). |
 
 ### `listings`
 
@@ -811,6 +812,7 @@ Proposing and settling new markets.
 | [`listings.MAX_DESCRIPTION_LENGTH`](../sdk/listings.md) | const | Longest listing description, in bytes. |
 | [`listings.PAIR_DEPLOYMENT_PROPOSAL_VOIDED`](../sdk/listings.md) | const | What `PairDeploymentProposalVoided` means. |
 | [`listings.LISTING_EVENT_TEXT`](../sdk/listings.md) | const | What each factory listing event means, for an activity feed. |
+| [`listings.listingEventText`](../sdk/listings.md) | function | A listing event's sentence, with a dispute worded for whoever rules on it (`uma.DisputeRuler`). |
 | [`listings.CompositeFeed`](../sdk/listings.md) | interface | A composite feed's legs. |
 | [`listings.DeploymentConstants`](../sdk/listings.md) | interface | The factory's listing constants, read from the chain, plus the live bond. |
 | [`listings.DeploymentStatus`](../sdk/listings.md) | type | Where a listing stands. |
@@ -848,6 +850,7 @@ UMA identifier upgrades.
 | [`governance.QueuedIdentifierUpgrade`](../sdk/governance.md) | interface | An approved upgrade waiting out its timelock. |
 | [`governance.IdentifierGovernanceStatus`](../sdk/governance.md) | interface | The governance track in one call. |
 | [`governance.IDENTIFIER_UPGRADE_EVENT_TEXT`](../sdk/governance.md) | const | What each governance event means, for an activity feed (decode them with listings' decodeFactoryLog). |
+| [`governance.identifierUpgradeEventText`](../sdk/governance.md) | function | A governance event's sentence, with a dispute worded for whoever rules on it (`uma.DisputeRuler`). |
 
 ### `uma`
 
@@ -888,6 +891,8 @@ UMA assertions, disputes and settlement, and the shared helpers the costed build
 | [`uma.disputeAssertion`](../sdk/governance.md) | function, bz | Dispute an assertion: you match its bond, and UMA's DVM votes on the claim. |
 | [`uma.settleAssertion`](../sdk/governance.md) | function, bz | Settle an assertion on the oracle directly. |
 | [`uma.requireSettleable`](../sdk/governance.md) | function | Throws the InputError a settle attempt deserves when the assertion cannot settle yet. |
+| [`uma.disputeRuler`](../sdk/governance.md#settling-early-on-a-testnet) | function, bz | Who rules on disputes on an oracle: its owner on a testnet's stand-in oracle (no fee), else UMA's voters. |
+| [`uma.DisputeRuler`](../sdk/governance.md#settling-early-on-a-testnet) | type | `"uma"` or `"owner"`: who rules on a disputed claim. |
 | [`uma.earlySettler`](../sdk/governance.md#settling-early-on-a-testnet) | function, bz | Who can settle the deployment's claims before their liveness ends: the owner of a testnet's stand-in oracle, or null when the oracle has no owner. |
 | [`uma.settleEarly`](../sdk/governance.md#settling-early-on-a-testnet) | function, bz | Settle a claim now, without waiting for its liveness, with the verdict `result` (true by default); only the stand-in oracle's owner can send it. |
 | [`uma.earlySettleCodec`](../sdk/governance.md#settling-early-on-a-testnet) | function | Codec for `EARLY_SETTLE_ABI`. |
@@ -907,8 +912,10 @@ UMA assertions, disputes and settlement, and the shared helpers the costed build
 | [`uma.AssertionPhase`](../sdk/governance.md) | type | Where an assertion stands, for a UI. |
 | [`uma.AssertionStatus`](../sdk/governance.md) | interface | What `assertionStatus` returns: the phase, the assertion record, and when it can be settled. |
 | [`uma.ASSERTION_PHASE_TEXT`](../sdk/governance.md) | const | Text for each assertion phase. |
+| [`uma.assertionPhaseText`](../sdk/governance.md) | function | A phase's text, with a disputed claim worded for whoever rules on it. |
 | [`uma.SettlementPreview`](../sdk/governance.md) | interface | What settling an assertion would do right now. |
 | [`uma.ASSERTION_EVENT_TEXT`](../sdk/governance.md) | const | What each OOv3 event means, for an activity feed. |
+| [`uma.assertionEventText`](../sdk/governance.md) | function | An OOv3 event's sentence, with a dispute worded for whoever rules on it. |
 
 ### `format`
 

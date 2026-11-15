@@ -27,6 +27,7 @@ import {
   assertionOracle,
   bondApprovals,
   chainNow,
+  disputeRuler,
   durationText,
   timeText,
   usdcText,
@@ -41,7 +42,9 @@ import {
   readOne,
   requireBondFloor,
   requireSettleable,
+  rulerSubject,
   statusOf,
+  type DisputeRuler,
 } from "./uma.js";
 
 /** The identifier-upgrade bond's floor (USDC units); the bond posted is `requiredIdentifierUpgradeBond()`. */
@@ -248,9 +251,10 @@ async function queuedInfo(ctx: BazaarContext, q: { assertionId: Hex; newIdentifi
  * Propose switching Bazaar to `newIdentifier`. The factory pulls the bond
  * (`requiredIdentifierUpgradeBond()`, at least 5,000 USDC) from the caller with `transferFrom`
  * (approval for the factory returned in `approvals` when short) and posts it to UMA as the
- * assertion bond: returned by UMA if the proposal is approved, paid to the disputer if UMA's voters
- * reject it. Approved, the upgrade is queued for 7 days (4 once the incumbent is off UMA's
- * whitelist) and then needs {@link activateIdentifierUpgrade}.
+ * assertion bond: returned by UMA if the proposal is approved, paid to the disputer if a dispute is
+ * upheld (by UMA's voters, or on a testnet by the stand-in oracle's owner). Approved, the upgrade
+ * is queued for 7 days (4 once the incumbent is off UMA's whitelist) and then needs
+ * {@link activateIdentifierUpgrade}.
  *
  * Before taking a new proposal the factory settles a pending one and activates a queued one that
  * may activate; it refuses while either still blocks. Refused up front: an empty identifier, one not
@@ -276,15 +280,16 @@ export async function proposeUmaIdentifierUpgrade(ctx: BazaarContext, args: { ne
     if (ph === "settleable") {
       throw new InputError("newIdentifier", "Another upgrade proposal has passed UMA's review: settling it queues it for the timelock, and no new proposal is taken until it activates.");
     }
-    // Disputed: the factory settles it first, which works only once UMA's voters have ruled, and an approval then blocks behind its timelock.
-    const pv = await previewSettlement(ctx, g.pending.assertionId, { home: "factory", from });
+    // Disputed: the factory settles it first, which works only once it is ruled on, and an approval then blocks behind its timelock.
+    const [pv, pendingRuler] = await Promise.all([previewSettlement(ctx, g.pending.assertionId, { home: "factory", from }), disputeRuler(ctx)]);
+    const { who, have } = rulerSubject(pendingRuler);
     if (pv.result === true) {
-      throw new InputError("newIdentifier", "Another upgrade proposal was disputed and UMA's voters approved it: settling it queues it for the timelock, and no new proposal is taken until it activates.");
+      throw new InputError("newIdentifier", `Another upgrade proposal was disputed and ${who} approved it: settling it queues it for the timelock, and no new proposal is taken until it activates.`);
     }
     if (!pv.settleable) {
-      throw new InputError("newIdentifier", "Another upgrade proposal is disputed and UMA's voters have not ruled yet: one at a time (expireStuckIdentifierUpgradeProposal releases it after the dispute grace).");
+      throw new InputError("newIdentifier", `Another upgrade proposal is disputed and ${who} ${have} not ruled yet: one at a time (expireStuckIdentifierUpgradeProposal releases it after the dispute grace).`);
     }
-    notes.push("Another upgrade proposal was disputed and UMA's voters rejected it: your call settles it first.");
+    notes.push(`Another upgrade proposal was disputed and ${who} rejected it: your call settles it first.`);
   }
   if (g.queued) {
     if (!g.queued.canActivate) {
@@ -295,7 +300,7 @@ export async function proposeUmaIdentifierUpgrade(ctx: BazaarContext, args: { ne
   }
   if (newId === current.toLowerCase()) throw new InputError("newIdentifier", "That identifier is already the one in force.");
   const oo = await optimisticOracle(ctx);
-  const wl = await identifierWhitelisted(ctx, newId, { oo });
+  const [wl, ruler] = await Promise.all([identifierWhitelisted(ctx, newId, { oo }), disputeRuler(ctx, { oo })]);
   if (wl === false) throw new InputError("newIdentifier", "That identifier is not on UMA's live whitelist.");
   if (wl === null) notes.push("UMA's whitelist could not be read: the factory checks it itself and refuses an identifier it cannot confirm.");
   const bond = await requiredIdentifierUpgradeBond(ctx);
@@ -325,7 +330,7 @@ export async function proposeUmaIdentifierUpgrade(ctx: BazaarContext, args: { ne
         unit: "USDC",
         token: ctx.usdc,
         payee: ctx.factory,
-        returned: "Returned to you by UMA when the proposal is approved; paid to the disputer if UMA's voters reject it.",
+        returned: `Returned to you by UMA when the proposal is approved; paid to the disputer if it is rejected by ${rulerSubject(ruler).who}.`,
         contingent: false,
       },
     ],
@@ -339,7 +344,7 @@ export async function proposeUmaIdentifierUpgrade(ctx: BazaarContext, args: { ne
  * Settle an identifier-upgrade proposal once UMA can resolve it: UMA pays the bond to the winning
  * side, and an approved upgrade is queued behind the timelock. Costs only gas. Refused up front: an
  * unknown or resolved proposal, and one still in UMA's liveness; a disputed one settles only after
- * UMA's voters have ruled.
+ * it is ruled on (`uma.DisputeRuler`).
  */
 export async function settleIdentifierUpgradeProposal(ctx: BazaarContext, args: { assertionId: Hex; from?: Address }): Promise<CostedCall> {
   const id = asBytes32("assertionId", args.assertionId);
@@ -350,6 +355,7 @@ export async function settleIdentifierUpgradeProposal(ctx: BazaarContext, args: 
   const [a, now] = await Promise.all([getAssertion(ctx, oo, id), chainNow(ctx)]);
   const st = statusOf(a, now);
   requireSettleable(st, "assertionId");
+  const ruled = st.phase === "disputed" ? rulerSubject(await disputeRuler(ctx, { oo })) : null;
   return {
     action: "settleIdentifierUpgradeProposal",
     to: ctx.factory,
@@ -361,8 +367,8 @@ export async function settleIdentifierUpgradeProposal(ctx: BazaarContext, args: 
     approvals: [],
     requires: [],
     notes: [
-      st.phase === "disputed"
-        ? "The proposal was disputed: this succeeds only once UMA's voters have ruled."
+      ruled
+        ? `The proposal was disputed: this succeeds only once ${ruled.who} ${ruled.have} ruled.`
         : `Undisputed past its liveness: the upgrade is approved and queued for ${durationText(IDENTIFIER_UPGRADE_TIMELOCK)}.`,
     ],
   };
@@ -445,7 +451,10 @@ export async function activateIdentifierUpgrade(ctx: BazaarContext, args: { from
   };
 }
 
-/** What each governance event means, for an activity feed (decode them with listings' decodeFactoryLog). */
+/**
+ * What each governance event means, for an activity feed (decode them with listings' decodeFactoryLog),
+ * on UMA's own OOv3 ({@link identifierUpgradeEventText} words it for either ruler).
+ */
 export const IDENTIFIER_UPGRADE_EVENT_TEXT: Readonly<Record<string, string>> = {
   UmaIdentifierUpgradeProposed: "An identifier upgrade was proposed: its UMA liveness started.",
   UmaIdentifierUpgradeDisputed: "The identifier upgrade was disputed: UMA's voters will decide it.",
@@ -454,3 +463,9 @@ export const IDENTIFIER_UPGRADE_EVENT_TEXT: Readonly<Record<string, string>> = {
   UmaIdentifierUpgradeCanceled: "The queued upgrade was canceled at activation: UMA had removed the incoming identifier.",
   UmaIdentifierUpgradeExpired: "A disputed upgrade proposal that could not settle was discarded.",
 };
+
+/** {@link IDENTIFIER_UPGRADE_EVENT_TEXT}'s sentence for the event `name`, with a dispute's naming who rules on it; null for an event it does not cover. */
+export function identifierUpgradeEventText(name: string, ruler: DisputeRuler = "uma"): string | null {
+  if (name === "UmaIdentifierUpgradeDisputed" && ruler === "owner") return "The identifier upgrade was disputed: on this testnet the oracle's owner will decide it.";
+  return IDENTIFIER_UPGRADE_EVENT_TEXT[name] ?? null;
+}

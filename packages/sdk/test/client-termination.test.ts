@@ -36,14 +36,19 @@ import {
   terminatorConstants,
   tickFetcher,
   tickPrints,
+  terminatorEventText,
   unjudgedLevyBp,
   voteForInsurerTermination,
 } from "../src/client/termination.js";
 import {
+  ASSERTION_PHASE_TEXT,
   BondQuoteError,
+  assertionEventText,
   assertionPhase,
+  assertionPhaseText,
   assertionStatus,
   disputeAssertion,
+  disputeRuler,
   earlySettleCodec,
   earlySettler,
   erc20Codec,
@@ -1515,6 +1520,33 @@ describe("early settlement", () => {
     s.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1n, settled: true, settlementResolution: true });
     expect((await inputError(settleEarly(s.ctx, { assertionId: id, from: ADDR.alice }), "assertionId")).message).toMatch(/already settled/);
     await inputError(settleEarly(s.ctx, { assertionId: b32(0xe2), from: ADDR.alice }), "assertionId");
+  });
+
+  it("words a dispute for whoever rules on it: the stand-in oracle's owner, or UMA's voters", async () => {
+    expect(await disputeRuler(owned(ADDR.alice).ctx)).toBe("owner");
+    expect(await disputeRuler(owned(new Revert("0x")).ctx)).toBe("uma");
+    expect(await disputeRuler(scene().ctx)).toBe("uma"); // the owner read fails: worded for UMA, not thrown
+    const s = owned(ADDR.alice);
+    const id = b32(0xe4);
+    s.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1_000_000_000n });
+    const c = await disputeAssertion(s.ctx, { assertionId: id, from: ADDR.alice });
+    const notes = c.notes.join(" ");
+    expect(notes).toMatch(/the oracle's owner then rules on the claim in place of UMA's voters/);
+    expect(notes).toMatch(/receives 2,000 USDC \(both bonds in full\)/);
+    expect(notes).not.toMatch(/UMA's fee|takes days/);
+    expect(c.summary).toMatch(/lost if the testnet oracle's owner upholds the claim/);
+    expect(c.costs[0]!.returned).toMatch(/in full, if the testnet oracle's owner rejects the claim/);
+    const uma = owned(new Revert("0x"));
+    uma.st.assertions.set(id, { asserter: ADDR.bob, expirationTime: BigInt(NOW + 100), currency: ADDR.usdc, bond: 1_000_000_000n });
+    expect((await disputeAssertion(uma.ctx, { assertionId: id, from: ADDR.alice })).notes.join(" ")).toMatch(/UMA's voters then decide the claim, which takes days/);
+    // The text tables keep UMA's wording; their lookups swap in the owner's for a dispute alone.
+    expect(assertionPhaseText("disputed", "owner")).toMatch(/the oracle's owner rules on it in place of UMA's voters/);
+    expect(assertionPhaseText("disputed")).toBe(ASSERTION_PHASE_TEXT.disputed);
+    expect(assertionPhaseText("liveness", "owner")).toBe(ASSERTION_PHASE_TEXT.liveness);
+    expect(assertionEventText("AssertionDisputed", "owner")).toMatch(/the oracle's owner will decide it/);
+    expect(terminatorEventText("TerminationProposalDisputed", "owner")).toMatch(/the oracle's owner will decide it/);
+    expect(terminatorEventText("TerminationProposalDisputed")).toMatch(/UMA's voters will decide it/);
+    expect(terminatorEventText("NoSuchEvent", "owner")).toBeNull();
   });
 
   it("settleEarly refuses on UMA's own oracle, and on an oracle that is not the claim's", async () => {

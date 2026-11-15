@@ -67,7 +67,9 @@ returns an `AssertionStatus`:
 | `settledTrue` | Settled: UMA accepted the claim. |
 | `settledFalse` | Settled: UMA rejected the claim. |
 
-`uma.ASSERTION_PHASE_TEXT` has one sentence per phase for a UI. Times are judged against the chain's
+`uma.ASSERTION_PHASE_TEXT` has one sentence per phase for a UI, and `uma.assertionPhaseText(phase, ruler)`
+words a disputed claim for whoever rules on it (see [Settling Early on a Testnet](#settling-early-on-a-testnet)).
+Times are judged against the chain's
 latest block, not the user's clock, since that is what the contracts compare against.
 
 The `UmaAssertion` record has `assertionId`, `oo`, `asserter`, `assertionTime`, `settled`, `currency`
@@ -85,7 +87,8 @@ The flows' own reads (`listings.deploymentProposal`, `governance.identifierGover
 
 A dispute matches the assertion's bond and sends the claim to UMA's voters. If they reject the claim, the
 disputer receives both bonds less the share UMA burns as its fee. If they uphold it, the dispute bond is
-gone.
+gone. On a testnet's stand-in oracle its owner rules instead, and the winner receives both bonds in full
+(see [Settling Early on a Testnet](#settling-early-on-a-testnet)).
 
 ```ts
 {{#include ../../examples/protocol/governance-uma.ts:dispute}}
@@ -106,16 +109,18 @@ It returns a `CostedCall` (see [CostedCall](listings.md#costedcall)) whose one c
 an exact-amount approval for the oracle whenever the allowance is short; send it first, then simulate
 and send the dispute. `notes` says:
 
-- until when the claim can be disputed, and that UMA's voters then take days;
+- until when the claim can be disputed, and that UMA's voters then take days (on a stand-in oracle, that
+  its owner rules instead);
 - what the disputer receives if the dispute wins, computed from the oracle's `burnedBondPercentage()`
   (both bonds less UMA's fee; 50% of one bond is burned on the live oracle), or in words when the oracle
-  does not report it;
+  does not report it; both bonds in full on a stand-in oracle;
 - a warning when the claim's identifier is no longer on UMA's whitelist: UMA's voters can then never
-  rule on a dispute, and the bond would stay locked in the oracle for good;
+  rule on a dispute, and the bond would stay locked in the oracle for good (not on a stand-in oracle, whose
+  owner rules whatever the whitelist says);
 - a warning when the bond is not in USDC, since then it is not a claim Bazaar made;
 - a warning when the wallet already allows the oracle more than the bond.
 
-How a dispute affects each flow: a listing or identifier upgrade waits on UMA's voters. A termination
+How a dispute affects each flow: a listing or identifier upgrade waits on the ruling. A termination
 claim's insurer vote keeps running (see [Termination & Settlement](termination.md)).
 
 ### What `disputeAssertion` Refuses
@@ -192,6 +197,14 @@ verdict, then calls the Bazaar contract that made the claim, which applies it as
 throws an `InputError` on `assertionId` on an oracle with no owner, for an unknown assertion and once it
 is settled, and on `from` when the sender is not the owner. Costs only gas.
 
+The same owner rules on disputes, in place of UMA's voters, and the oracle takes no fee: the winning side
+receives both bonds in full. `uma.disputeRuler({ oo? })` says who rules on an oracle: `"owner"` when it
+has an owner, `"uma"` otherwise (also when the read fails, since it only words text). The builders word
+their notes and bond lines for it themselves. For a UI's own text, `uma.assertionPhaseText`,
+`uma.assertionEventText`, `listings.listingEventText`, `termination.terminatorEventText` and
+`governance.identifierUpgradeEventText` take it as their second argument: they word a dispute for it,
+and otherwise return the matching `*_TEXT` table's sentence.
+
 ## Other Reads
 
 | Function | Returns |
@@ -205,7 +218,7 @@ is settled, and on `from` when the sender is not the owner. Costs only gas.
 
 `uma.decodeAssertionLog(log)` decodes the oracle's `AssertionMade`, `AssertionDisputed` and
 `AssertionSettled` events (or returns `null` for another contract's log), and `uma.ASSERTION_EVENT_TEXT`
-has a sentence for each:
+has a sentence for each (`uma.assertionEventText(name, ruler)` words a dispute for whoever rules on it):
 
 ```ts
 {{#include ../../examples/protocol/governance-uma.ts:logs}}
@@ -375,7 +388,8 @@ field `assertionId`, although neither function takes one.
 | `uma.identifierText(id)` | bytes32 to its text, or `null` when it is not printable ASCII. |
 
 The factory's governance events are decoded with `listings.decodeFactoryLog`, and
-`governance.IDENTIFIER_UPGRADE_EVENT_TEXT` has a sentence for each: `UmaIdentifierUpgradeProposed`,
+`governance.IDENTIFIER_UPGRADE_EVENT_TEXT` (or `governance.identifierUpgradeEventText(name, ruler)`, which
+words a dispute for whoever rules on it) has a sentence for each: `UmaIdentifierUpgradeProposed`,
 `UmaIdentifierUpgradeDisputed`, `UmaIdentifierUpgradeQueued`, `UmaIdentifierUpgraded`,
 `UmaIdentifierUpgradeCanceled` and `UmaIdentifierUpgradeExpired`. Past proposals are listed by
 `history.identifierUpgradeProposals`, filtered by `proposer` and `status` (`"Pending"`, `"Disputed"`,
